@@ -719,6 +719,7 @@ def get_available_dimensions() -> Dict[str, str]:
     """
     return {
         'Attribute Combination': 'attribute_combination',
+        'Individual Attribute': 'individual_attribute',
         'Number of Words': 'n_words_grouped',
         'Query Volume Segment': 'query_volume_segment',
         'Channel': 'channel',
@@ -1232,13 +1233,46 @@ def build_filter_clause(
     """
     conditions = []
 
-    # Date filters
+    # Date filters - handle multiple ranges and exclusions
+    date_conditions = []
+
+    # Main date range
     if base_filters.get('date_start') and base_filters.get('date_end'):
-        conditions.append(f"date BETWEEN '{base_filters['date_start']}' AND '{base_filters['date_end']}'")
+        date_conditions.append(f"date BETWEEN '{base_filters['date_start']}' AND '{base_filters['date_end']}'")
     elif base_filters.get('date_start'):
-        conditions.append(f"date >= '{base_filters['date_start']}'")
+        date_conditions.append(f"date >= '{base_filters['date_start']}'")
     elif base_filters.get('date_end'):
-        conditions.append(f"date <= '{base_filters['date_end']}'")
+        date_conditions.append(f"date <= '{base_filters['date_end']}'")
+
+    # Additional include ranges
+    if base_filters.get('additional_date_ranges'):
+        for start, end in base_filters['additional_date_ranges']:
+            date_conditions.append(f"date BETWEEN '{start}' AND '{end}'")
+
+    # Combine include conditions with OR
+    if date_conditions:
+        if len(date_conditions) > 1:
+            include_clause = f"({' OR '.join(date_conditions)})"
+        else:
+            include_clause = date_conditions[0]
+
+        # Add exclusion logic
+        if base_filters.get('excluded_date_ranges'):
+            exclude_conditions = []
+            for start, end in base_filters['excluded_date_ranges']:
+                exclude_conditions.append(f"date BETWEEN '{start}' AND '{end}'")
+            exclude_clause = ' OR '.join(exclude_conditions)
+            # Final: (include conditions) AND NOT (exclude conditions)
+            conditions.append(f"({include_clause}) AND NOT ({exclude_clause})")
+        else:
+            conditions.append(include_clause)
+    elif base_filters.get('excluded_date_ranges'):
+        # Only exclusions, no inclusions - exclude from all dates
+        exclude_conditions = []
+        for start, end in base_filters['excluded_date_ranges']:
+            exclude_conditions.append(f"date BETWEEN '{start}' AND '{end}'")
+        exclude_clause = ' OR '.join(exclude_conditions)
+        conditions.append(f"NOT ({exclude_clause})")
 
     # Country filter
     if base_filters.get('countries'):
@@ -1275,9 +1309,21 @@ def build_filter_clause(
     # Parent dimension filters (for drill-down)
     if parent_filters:
         for dim, value in parent_filters.items():
-            # Escape single quotes in values
-            safe_value = value.replace("'", "\\'")
-            conditions.append(f"{dim} = '{safe_value}'")
+            # Special handling for derived dimensions
+            if dim == 'attribute_combination':
+                # Convert attribute combination to underlying attr_* conditions
+                attr_condition = convert_attribute_combination_to_condition(value)
+                conditions.append(attr_condition)
+            elif dim == 'n_words_grouped':
+                # Convert grouped word count to underlying n_words_normalized condition
+                if value == '4+':
+                    conditions.append("n_words_normalized >= 4")
+                else:
+                    conditions.append(f"n_words_normalized = {value}")
+            else:
+                # Escape single quotes in values
+                safe_value = value.replace("'", "\\'")
+                conditions.append(f"{dim} = '{safe_value}'")
 
     return "WHERE " + " AND ".join(conditions) if conditions else ""
 
@@ -1285,7 +1331,7 @@ def build_filter_clause(
 def execute_cached_query(
     client: bigquery.Client,
     query: str,
-    ttl: int = 300,
+    ttl: int = 600,
     show_progress: bool = False
 ) -> pd.DataFrame:
     """
@@ -1294,7 +1340,7 @@ def execute_cached_query(
     Args:
         client: BigQuery client
         query: SQL query string
-        ttl: Cache time-to-live in seconds (default 5 minutes)
+        ttl: Cache time-to-live in seconds (default 10 minutes, increased from 5 for better performance)
         show_progress: Show progress tracking UI
 
     Returns:
@@ -1401,6 +1447,99 @@ def build_timeseries_query(dataset_table: str, base_filters: Dict, freq: str = '
         SQL query string
     """
     where_clause = build_filter_clause(base_filters)
+
+    # Map frequency to BigQuery date functions
+    if freq == 'D':
+        date_expr = "date"
+    elif freq == 'W':
+        date_expr = "DATE_TRUNC(date, WEEK)"
+    elif freq == 'M':
+        date_expr = "DATE_TRUNC(date, MONTH)"
+    else:
+        date_expr = "date"
+
+    query = f"""
+        SELECT
+            {date_expr} as date,
+            SUM(queries) as queries,
+            SUM(queries_pdp) as queries_pdp,
+            SUM(queries_a2c) as queries_a2c,
+            SUM(purchases) as purchases,
+            SUM(gross_purchase) as gross_purchase
+        FROM `{dataset_table}`
+        {where_clause}
+        GROUP BY date
+        ORDER BY date
+    """
+    return query
+
+
+def build_timeseries_query_with_dimensions(
+    dataset_table: str,
+    base_filters: Dict,
+    dimension_filters: Dict,
+    freq: str = 'D'
+) -> str:
+    """
+    Build query for time-series trend analysis with additional dimension filters.
+
+    Args:
+        dataset_table: Full BigQuery table path
+        base_filters: Base filter dictionary (date_start, date_end, countries, etc.)
+        dimension_filters: Dictionary of dimension -> value filters to apply
+                          Keys are dimension column names (e.g., 'channel', 'n_words_grouped')
+                          Special keys: 'attribute_combination', 'search_term'
+        freq: Frequency ('D' for daily, 'W' for weekly, 'M' for monthly)
+
+    Returns:
+        SQL query string
+    """
+    # Start with base filters
+    where_clause = build_filter_clause(base_filters)
+
+    # Add dimension-specific filters
+    dimension_conditions = []
+
+    for dim_key, dim_value in dimension_filters.items():
+        if dim_value is None or dim_value == 'Other':
+            continue
+
+        safe_value = str(dim_value).replace("'", "\\'")
+
+        # Special handling for derived dimensions
+        if dim_key == 'attribute_combination':
+            # Convert attribute combination to underlying attr_* conditions
+            attr_condition = convert_attribute_combination_to_condition(dim_value)
+            dimension_conditions.append(attr_condition)
+
+        elif dim_key == 'n_words_grouped':
+            # Convert word count group to n_words_normalized condition
+            if dim_value == '4+':
+                word_condition = 'n_words_normalized >= 4'
+            else:
+                word_condition = f'n_words_normalized = {dim_value}'
+            dimension_conditions.append(word_condition)
+
+        elif dim_key == 'search_term':
+            # Filter by specific search term
+            dimension_conditions.append(f"search_term = '{safe_value}'")
+
+        else:
+            # Regular column filter
+            # Special handling for '-' to match NULL, empty, and '-' values
+            if safe_value == '-':
+                condition = f"({dim_key} IS NULL OR {dim_key} = '' OR {dim_key} = '-')"
+            else:
+                condition = f"{dim_key} = '{safe_value}'"
+            dimension_conditions.append(condition)
+
+    # Combine base filters with dimension filters
+    if dimension_conditions:
+        dim_filter_str = ' AND '.join(dimension_conditions)
+        if where_clause:
+            where_clause += f" AND {dim_filter_str}"
+        else:
+            where_clause = f"WHERE {dim_filter_str}"
 
     # Map frequency to BigQuery date functions
     if freq == 'D':
@@ -1669,6 +1808,28 @@ def build_dimension_level_query(
                 ], ' + ')
             END
         """
+    # For individual attribute (handled specially below with UNPIVOT)
+    elif dimension == 'individual_attribute':
+        dimension_expr = "attribute_name"  # Placeholder - actual handling is in special query below
+    # For attribute combination (computed from multiple attr_* columns)
+    elif dimension == 'attribute_combination':
+        dimension_expr = """
+            CASE
+                WHEN attr_categoria = 0 AND attr_tipo = 0 AND attr_genero = 0 AND
+                     attr_marca = 0 AND attr_color = 0 AND attr_material = 0 AND
+                     attr_talla = 0 AND attr_modelo = 0 THEN 'No attributes'
+                ELSE ARRAY_TO_STRING([
+                    IF(attr_categoria = 1, 'Categoria', NULL),
+                    IF(attr_tipo = 1, 'Tipo', NULL),
+                    IF(attr_genero = 1, 'Genero', NULL),
+                    IF(attr_marca = 1, 'Marca', NULL),
+                    IF(attr_color = 1, 'Color', NULL),
+                    IF(attr_material = 1, 'Material', NULL),
+                    IF(attr_talla = 1, 'Talla', NULL),
+                    IF(attr_modelo = 1, 'Modelo', NULL)
+                ], ' + ')
+            END
+        """
     # For query volume segment
     elif dimension == 'query_volume_segment':
         # Note: This is computed AFTER aggregation by search_term, so we need a subquery
@@ -1693,8 +1854,111 @@ def build_dimension_level_query(
 
     sort_direction = "ASC" if ascending else "DESC"
 
+    # Special handling for individual_attribute - needs UNPIVOT logic
+    if dimension == 'individual_attribute':
+        query = f"""
+            WITH base_data AS (
+                SELECT
+                    search_term,
+                    SUM(queries) as queries,
+                    SUM(queries_pdp) as queries_pdp,
+                    SUM(queries_a2c) as queries_a2c,
+                    SUM(purchases) as purchases,
+                    SUM(gross_purchase) as gross_purchase,
+                    MAX(attr_categoria) as attr_categoria,
+                    MAX(attr_tipo) as attr_tipo,
+                    MAX(attr_genero) as attr_genero,
+                    MAX(attr_marca) as attr_marca,
+                    MAX(attr_color) as attr_color,
+                    MAX(attr_material) as attr_material,
+                    MAX(attr_talla) as attr_talla,
+                    MAX(attr_modelo) as attr_modelo
+                FROM `{dataset_table}`
+                {where_clause}
+                GROUP BY search_term
+            ),
+            unpivoted_attributes AS (
+                SELECT 'Categoria' as attribute_name, search_term, queries, queries_pdp, queries_a2c, purchases, gross_purchase FROM base_data WHERE attr_categoria = 1
+                UNION ALL
+                SELECT 'Tipo' as attribute_name, search_term, queries, queries_pdp, queries_a2c, purchases, gross_purchase FROM base_data WHERE attr_tipo = 1
+                UNION ALL
+                SELECT 'Genero' as attribute_name, search_term, queries, queries_pdp, queries_a2c, purchases, gross_purchase FROM base_data WHERE attr_genero = 1
+                UNION ALL
+                SELECT 'Marca' as attribute_name, search_term, queries, queries_pdp, queries_a2c, purchases, gross_purchase FROM base_data WHERE attr_marca = 1
+                UNION ALL
+                SELECT 'Color' as attribute_name, search_term, queries, queries_pdp, queries_a2c, purchases, gross_purchase FROM base_data WHERE attr_color = 1
+                UNION ALL
+                SELECT 'Material' as attribute_name, search_term, queries, queries_pdp, queries_a2c, purchases, gross_purchase FROM base_data WHERE attr_material = 1
+                UNION ALL
+                SELECT 'Talla' as attribute_name, search_term, queries, queries_pdp, queries_a2c, purchases, gross_purchase FROM base_data WHERE attr_talla = 1
+                UNION ALL
+                SELECT 'Modelo' as attribute_name, search_term, queries, queries_pdp, queries_a2c, purchases, gross_purchase FROM base_data WHERE attr_modelo = 1
+            ),
+            dimension_totals AS (
+                SELECT
+                    attribute_name as dimension_value,
+                    SUM(queries) as queries,
+                    SUM(queries_pdp) as queries_pdp,
+                    SUM(queries_a2c) as queries_a2c,
+                    SUM(purchases) as purchases,
+                    SUM(gross_purchase) as gross_purchase,
+                    APPROX_COUNT_DISTINCT(search_term) as search_term_count,
+                    SAFE_DIVIDE(SUM(queries), {num_days}) as average_queries_per_day,
+                    SAFE_DIVIDE(SAFE_DIVIDE(SUM(queries), {num_days}), APPROX_COUNT_DISTINCT(search_term)) as average_queries_per_search_term_per_day
+                FROM unpivoted_attributes
+                GROUP BY attribute_name
+                ORDER BY {sort_expression} {sort_direction}
+            ),
+            ranked_data AS (
+                SELECT
+                    *,
+                    SUM(queries) OVER (ORDER BY queries DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) as cumulative_queries,
+                    SUM(queries) OVER () as total_queries
+                FROM dimension_totals
+            ),
+            with_prev_cumulative AS (
+                SELECT
+                    *,
+                    COALESCE(LAG(cumulative_queries) OVER (ORDER BY queries DESC), 0) as prev_cumulative_queries
+                FROM ranked_data
+            ),
+            within_threshold AS (
+                SELECT
+                    dimension_value,
+                    queries,
+                    queries_pdp,
+                    queries_a2c,
+                    purchases,
+                    gross_purchase,
+                    search_term_count,
+                    average_queries_per_day,
+                    average_queries_per_search_term_per_day
+                FROM with_prev_cumulative
+                WHERE prev_cumulative_queries / total_queries < {cumulative_threshold}
+            ),
+            beyond_threshold AS (
+                SELECT
+                    'Other' as dimension_value,
+                    SUM(queries) as queries,
+                    SUM(queries_pdp) as queries_pdp,
+                    SUM(queries_a2c) as queries_a2c,
+                    SUM(purchases) as purchases,
+                    SUM(gross_purchase) as gross_purchase,
+                    SUM(search_term_count) as search_term_count,
+                    SAFE_DIVIDE(SUM(queries), {num_days}) as average_queries_per_day,
+                    SAFE_DIVIDE(SAFE_DIVIDE(SUM(queries), {num_days}), SUM(search_term_count)) as average_queries_per_search_term_per_day
+                FROM with_prev_cumulative
+                WHERE prev_cumulative_queries / total_queries >= {cumulative_threshold}
+            )
+            SELECT * FROM within_threshold
+            UNION ALL
+            (SELECT * FROM beyond_threshold WHERE queries > 0)
+            ORDER BY
+                CASE WHEN dimension_value = 'Other' THEN 1 ELSE 0 END,
+                {sort_expression} {sort_direction}
+        """
     # Special handling for query_volume_segment - needs two-step aggregation
-    if dimension == 'query_volume_segment':
+    elif dimension == 'query_volume_segment':
         query = f"""
             WITH search_term_aggregation AS (
                 SELECT
@@ -1716,63 +1980,54 @@ def build_dimension_level_query(
                     SUM(queries_a2c) as queries_a2c,
                     SUM(purchases) as purchases,
                     SUM(gross_purchase) as gross_purchase,
-                    COUNT(DISTINCT search_term) as search_term_count,
+                    -- Use APPROX for faster counting (acceptable precision for UI)
+                    APPROX_COUNT_DISTINCT(search_term) as search_term_count,
                     SAFE_DIVIDE(SUM(queries), {num_days}) as average_queries_per_day,
-                    SAFE_DIVIDE(SAFE_DIVIDE(SUM(queries), {num_days}), COUNT(DISTINCT search_term)) as average_queries_per_search_term_per_day
+                    SAFE_DIVIDE(SAFE_DIVIDE(SUM(queries), {num_days}), APPROX_COUNT_DISTINCT(search_term)) as average_queries_per_search_term_per_day
                 FROM search_term_aggregation
                 GROUP BY dimension_value
                 ORDER BY {sort_expression} {sort_direction}
             ),
-            grand_total AS (
-                SELECT SUM(queries) as total_queries_all
-                FROM dimension_totals
-            ),
-            cumulative_by_queries AS (
+            ranked_data AS (
                 SELECT
                     *,
                     SUM(queries) OVER (ORDER BY queries DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) as cumulative_queries,
-                    SUM(queries) OVER () as total_queries,
-                    ROW_NUMBER() OVER (ORDER BY queries DESC) as row_num
+                    SUM(queries) OVER () as total_queries
                 FROM dimension_totals
             ),
-            with_cumulative AS (
+            with_prev_cumulative AS (
                 SELECT
                     *,
-                    COALESCE(LAG(cumulative_queries) OVER (ORDER BY row_num), 0) as prev_cumulative_queries
-                FROM cumulative_by_queries
-            ),
-            within_threshold_ids AS (
-                SELECT dimension_value
-                FROM with_cumulative
-                WHERE prev_cumulative_queries / total_queries < {cumulative_threshold}
+                    COALESCE(LAG(cumulative_queries) OVER (ORDER BY queries DESC), 0) as prev_cumulative_queries
+                FROM ranked_data
             ),
             within_threshold AS (
                 SELECT
-                    dt.dimension_value,
-                    dt.queries,
-                    dt.queries_pdp,
-                    dt.queries_a2c,
-                    dt.purchases,
-                    dt.gross_purchase,
-                    dt.search_term_count,
-                    dt.average_queries_per_day,
-                    dt.average_queries_per_search_term_per_day
-                FROM dimension_totals dt
-                WHERE dt.dimension_value IN (SELECT dimension_value FROM within_threshold_ids)
+                    dimension_value,
+                    queries,
+                    queries_pdp,
+                    queries_a2c,
+                    purchases,
+                    gross_purchase,
+                    search_term_count,
+                    average_queries_per_day,
+                    average_queries_per_search_term_per_day
+                FROM with_prev_cumulative
+                WHERE prev_cumulative_queries / total_queries < {cumulative_threshold}
             ),
             beyond_threshold AS (
                 SELECT
                     'Other' as dimension_value,
-                    SUM(dt.queries) as queries,
-                    SUM(dt.queries_pdp) as queries_pdp,
-                    SUM(dt.queries_a2c) as queries_a2c,
-                    SUM(dt.purchases) as purchases,
-                    SUM(dt.gross_purchase) as gross_purchase,
-                    SUM(dt.search_term_count) as search_term_count,
-                    SAFE_DIVIDE(SUM(dt.queries), {num_days}) as average_queries_per_day,
-                    SAFE_DIVIDE(SAFE_DIVIDE(SUM(dt.queries), {num_days}), SUM(dt.search_term_count)) as average_queries_per_search_term_per_day
-                FROM dimension_totals dt
-                WHERE dt.dimension_value NOT IN (SELECT dimension_value FROM within_threshold_ids)
+                    SUM(queries) as queries,
+                    SUM(queries_pdp) as queries_pdp,
+                    SUM(queries_a2c) as queries_a2c,
+                    SUM(purchases) as purchases,
+                    SUM(gross_purchase) as gross_purchase,
+                    SUM(search_term_count) as search_term_count,
+                    SAFE_DIVIDE(SUM(queries), {num_days}) as average_queries_per_day,
+                    SAFE_DIVIDE(SAFE_DIVIDE(SUM(queries), {num_days}), SUM(search_term_count)) as average_queries_per_search_term_per_day
+                FROM with_prev_cumulative
+                WHERE prev_cumulative_queries / total_queries >= {cumulative_threshold}
             )
             SELECT * FROM within_threshold
             UNION ALL
@@ -1782,7 +2037,7 @@ def build_dimension_level_query(
                 {sort_expression} {sort_direction}
         """
     else:
-        # Normal query for other dimensions
+        # Normal query for other dimensions (optimized with APPROX and simplified CTEs)
         query = f"""
             WITH search_term_aggregation AS (
                 SELECT
@@ -1805,63 +2060,54 @@ def build_dimension_level_query(
                     SUM(queries_a2c) as queries_a2c,
                     SUM(purchases) as purchases,
                     SUM(gross_purchase) as gross_purchase,
-                    COUNT(DISTINCT search_term) as search_term_count,
+                    -- Use APPROX for faster counting (acceptable precision for UI)
+                    APPROX_COUNT_DISTINCT(search_term) as search_term_count,
                     SAFE_DIVIDE(SUM(queries), {num_days}) as average_queries_per_day,
-                    SAFE_DIVIDE(SAFE_DIVIDE(SUM(queries), {num_days}), COUNT(DISTINCT search_term)) as average_queries_per_search_term_per_day
+                    SAFE_DIVIDE(SAFE_DIVIDE(SUM(queries), {num_days}), APPROX_COUNT_DISTINCT(search_term)) as average_queries_per_search_term_per_day
                 FROM search_term_aggregation
                 GROUP BY dimension_value
                 ORDER BY {sort_expression} {sort_direction}
             ),
-            grand_total AS (
-                SELECT SUM(queries) as total_queries_all
-                FROM dimension_totals
-            ),
-            cumulative_by_queries AS (
+            ranked_data AS (
                 SELECT
                     *,
                     SUM(queries) OVER (ORDER BY queries DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) as cumulative_queries,
-                    SUM(queries) OVER () as total_queries,
-                    ROW_NUMBER() OVER (ORDER BY queries DESC) as row_num
+                    SUM(queries) OVER () as total_queries
                 FROM dimension_totals
             ),
-            with_cumulative AS (
+            with_prev_cumulative AS (
                 SELECT
                     *,
-                    COALESCE(LAG(cumulative_queries) OVER (ORDER BY row_num), 0) as prev_cumulative_queries
-                FROM cumulative_by_queries
-            ),
-            within_threshold_ids AS (
-                SELECT dimension_value
-                FROM with_cumulative
-                WHERE prev_cumulative_queries / total_queries < {cumulative_threshold}
+                    COALESCE(LAG(cumulative_queries) OVER (ORDER BY queries DESC), 0) as prev_cumulative_queries
+                FROM ranked_data
             ),
             within_threshold AS (
                 SELECT
-                    dt.dimension_value,
-                    dt.queries,
-                    dt.queries_pdp,
-                    dt.queries_a2c,
-                    dt.purchases,
-                    dt.gross_purchase,
-                    dt.search_term_count,
-                    dt.average_queries_per_day,
-                    dt.average_queries_per_search_term_per_day
-                FROM dimension_totals dt
-                WHERE dt.dimension_value IN (SELECT dimension_value FROM within_threshold_ids)
+                    dimension_value,
+                    queries,
+                    queries_pdp,
+                    queries_a2c,
+                    purchases,
+                    gross_purchase,
+                    search_term_count,
+                    average_queries_per_day,
+                    average_queries_per_search_term_per_day
+                FROM with_prev_cumulative
+                WHERE prev_cumulative_queries / total_queries < {cumulative_threshold}
             ),
             beyond_threshold AS (
                 SELECT
                     'Other' as dimension_value,
-                    SUM(dt.queries) as queries,
-                    SUM(dt.queries_pdp) as queries_pdp,
-                    SUM(dt.queries_a2c) as queries_a2c,
-                    SUM(dt.purchases) as purchases,
-                    SUM(dt.gross_purchase) as gross_purchase,
-                    SUM(dt.search_term_count) as search_term_count,
-                    SAFE_DIVIDE(SUM(dt.queries), {num_days}) as average_queries_per_day,
-                    SAFE_DIVIDE(SAFE_DIVIDE(SUM(dt.queries), {num_days}), SUM(dt.search_term_count)) as average_queries_per_search_term_per_day
-                FROM dimension_totals dt
-                WHERE dt.dimension_value NOT IN (SELECT dimension_value FROM within_threshold_ids)
+                    SUM(queries) as queries,
+                    SUM(queries_pdp) as queries_pdp,
+                    SUM(queries_a2c) as queries_a2c,
+                    SUM(purchases) as purchases,
+                    SUM(gross_purchase) as gross_purchase,
+                    SUM(search_term_count) as search_term_count,
+                    SAFE_DIVIDE(SUM(queries), {num_days}) as average_queries_per_day,
+                    SAFE_DIVIDE(SAFE_DIVIDE(SUM(queries), {num_days}), SUM(search_term_count)) as average_queries_per_search_term_per_day
+                FROM with_prev_cumulative
+                WHERE prev_cumulative_queries / total_queries >= {cumulative_threshold}
             )
             SELECT * FROM within_threshold
             UNION ALL
@@ -2009,6 +2255,29 @@ def build_hierarchical_query(dataset_table: str, base_filters: Dict, dimension_k
     return query
 
 
+def convert_individual_attribute_to_column(attribute_name: str) -> str:
+    """
+    Convert individual attribute display name to column name.
+
+    Args:
+        attribute_name: String like "Categoria", "Marca", etc.
+
+    Returns:
+        Column name like "attr_categoria", "attr_marca", etc.
+    """
+    attr_map = {
+        'Categoria': 'attr_categoria',
+        'Tipo': 'attr_tipo',
+        'Genero': 'attr_genero',
+        'Marca': 'attr_marca',
+        'Color': 'attr_color',
+        'Material': 'attr_material',
+        'Talla': 'attr_talla',
+        'Modelo': 'attr_modelo'
+    }
+    return attr_map.get(attribute_name, f'attr_{attribute_name.lower()}')
+
+
 def convert_attribute_combination_to_condition(combination_value: str) -> str:
     """
     Convert an attribute combination value to SQL conditions on underlying attr_* columns.
@@ -2019,14 +2288,16 @@ def convert_attribute_combination_to_condition(combination_value: str) -> str:
     Returns:
         SQL condition string
     """
-    # Mapping of display names to column names
+    # Mapping of display names to column names (must match ALL 8 attributes)
     attr_map = {
         'Categoria': 'attr_categoria',
         'Tipo': 'attr_tipo',
         'Genero': 'attr_genero',
+        'Marca': 'attr_marca',
         'Color': 'attr_color',
+        'Material': 'attr_material',
         'Talla': 'attr_talla',
-        'Marca': 'attr_marca'
+        'Modelo': 'attr_modelo'
     }
 
     if combination_value == 'No attributes':
@@ -2051,6 +2322,422 @@ def convert_attribute_combination_to_condition(combination_value: str) -> str:
             conditions.append(f"{col_name} = 0")
 
     return '(' + ' AND '.join(conditions) + ')'
+
+
+def build_batch_search_terms_concentration_query(
+    dataset_table: str,
+    base_filters: Dict,
+    dimension_column: str,
+    dimension_values: List[str],
+    concentration_pct: int
+) -> str:
+    """
+    Build query to calculate search term concentration for multiple dimension values in a SINGLE query.
+    This replaces N separate queries with one optimized batch query.
+
+    Args:
+        dataset_table: Full BigQuery table path
+        base_filters: Base filter dictionary
+        dimension_column: Name of the dimension column
+        dimension_values: List of dimension values to calculate for
+        concentration_pct: Percentage threshold (e.g., 80 for 80%)
+
+    Returns:
+        SQL query string that returns dimension_value and terms_count for each value
+    """
+    from data_processing import build_filter_clause, convert_attribute_combination_to_condition
+
+    # Build base WHERE clause
+    where_clause = build_filter_clause(base_filters)
+
+    threshold_decimal = concentration_pct / 100.0
+
+    # Build dimension expression based on type
+    if dimension_column == 'attribute_combination':
+        dimension_expr = """
+            CASE
+                WHEN attr_categoria = 0 AND attr_tipo = 0 AND attr_genero = 0 AND
+                     attr_marca = 0 AND attr_color = 0 AND attr_material = 0 AND
+                     attr_talla = 0 AND attr_modelo = 0 THEN 'No attributes'
+                ELSE ARRAY_TO_STRING([
+                    IF(attr_categoria = 1, 'Categoria', NULL),
+                    IF(attr_tipo = 1, 'Tipo', NULL),
+                    IF(attr_genero = 1, 'Genero', NULL),
+                    IF(attr_marca = 1, 'Marca', NULL),
+                    IF(attr_color = 1, 'Color', NULL),
+                    IF(attr_material = 1, 'Material', NULL),
+                    IF(attr_talla = 1, 'Talla', NULL),
+                    IF(attr_modelo = 1, 'Modelo', NULL)
+                ], ' + ')
+            END
+        """
+    elif dimension_column == 'individual_attribute':
+        # For individual_attribute, use UNPIVOT logic - this is handled specially below
+        dimension_expr = "attribute_name"
+    elif dimension_column == 'n_words_grouped':
+        dimension_expr = """
+            CASE
+                WHEN n_words_normalized >= 4 THEN '4+'
+                ELSE CAST(CAST(n_words_normalized AS INT64) AS STRING)
+            END
+        """
+    else:
+        # Regular column - handle NULL values
+        dimension_expr = f"COALESCE({dimension_column}, '-')"
+
+    # Build filter for dimension values (exclude 'Other' and NULL)
+    value_filters = []
+    for val in dimension_values:
+        if val and val != 'Other':
+            # Escape single quotes
+            safe_val = str(val).replace("'", "\\'")
+            value_filters.append(f"'{safe_val}'")
+
+    if not value_filters:
+        # No valid values to query - return empty result
+        return f"""
+        SELECT
+            CAST(NULL AS STRING) as dimension_value,
+            0 as terms_count
+        WHERE FALSE
+        """
+
+    values_list = ', '.join(value_filters)
+
+    # Special handling for individual_attribute dimension with UNPIVOT
+    if dimension_column == 'individual_attribute':
+        query = f"""
+        WITH base_data AS (
+            SELECT
+                search_term,
+                SUM(queries) as queries,
+                MAX(attr_categoria) as attr_categoria,
+                MAX(attr_tipo) as attr_tipo,
+                MAX(attr_genero) as attr_genero,
+                MAX(attr_marca) as attr_marca,
+                MAX(attr_color) as attr_color,
+                MAX(attr_material) as attr_material,
+                MAX(attr_talla) as attr_talla,
+                MAX(attr_modelo) as attr_modelo
+            FROM `{dataset_table}`
+            {where_clause}
+            GROUP BY search_term
+        ),
+        dimension_data AS (
+            SELECT 'Categoria' as dimension_value, search_term, queries FROM base_data WHERE attr_categoria = 1
+            UNION ALL
+            SELECT 'Tipo' as dimension_value, search_term, queries FROM base_data WHERE attr_tipo = 1
+            UNION ALL
+            SELECT 'Genero' as dimension_value, search_term, queries FROM base_data WHERE attr_genero = 1
+            UNION ALL
+            SELECT 'Marca' as dimension_value, search_term, queries FROM base_data WHERE attr_marca = 1
+            UNION ALL
+            SELECT 'Color' as dimension_value, search_term, queries FROM base_data WHERE attr_color = 1
+            UNION ALL
+            SELECT 'Material' as dimension_value, search_term, queries FROM base_data WHERE attr_material = 1
+            UNION ALL
+            SELECT 'Talla' as dimension_value, search_term, queries FROM base_data WHERE attr_talla = 1
+            UNION ALL
+            SELECT 'Modelo' as dimension_value, search_term, queries FROM base_data WHERE attr_modelo = 1
+        ),
+        dimension_filter AS (
+            SELECT *
+            FROM dimension_data
+            WHERE dimension_value IN ({values_list})
+        ),
+        ranked_terms AS (
+            SELECT
+                dimension_value,
+                search_term,
+                queries,
+                SUM(queries) OVER (
+                    PARTITION BY dimension_value
+                    ORDER BY queries DESC
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                ) as cumulative_queries,
+                SUM(queries) OVER (PARTITION BY dimension_value) as total_queries
+            FROM dimension_filter
+        ),
+        terms_within_threshold AS (
+            SELECT
+                dimension_value,
+                COUNT(*) as terms_count
+            FROM ranked_terms
+            WHERE (cumulative_queries - queries) / total_queries < {threshold_decimal}
+            GROUP BY dimension_value
+        )
+        SELECT
+            dimension_value,
+            terms_count
+        FROM terms_within_threshold
+        ORDER BY dimension_value
+        """
+    else:
+        query = f"""
+        WITH dimension_data AS (
+            SELECT
+                {dimension_expr} as dimension_value,
+                search_term,
+                SUM(queries) as queries
+            FROM `{dataset_table}`
+            {where_clause}
+            GROUP BY dimension_value, search_term
+        ),
+    dimension_filter AS (
+        SELECT *
+        FROM dimension_data
+        WHERE dimension_value IN ({values_list})
+    ),
+    ranked_terms AS (
+        SELECT
+            dimension_value,
+            search_term,
+            queries,
+            SUM(queries) OVER (
+                PARTITION BY dimension_value
+                ORDER BY queries DESC
+                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            ) as cumulative_queries,
+            SUM(queries) OVER (PARTITION BY dimension_value) as total_queries
+        FROM dimension_filter
+    ),
+    terms_within_threshold AS (
+        SELECT
+            dimension_value,
+            COUNT(*) as terms_count
+        FROM ranked_terms
+        WHERE (cumulative_queries - queries) / total_queries < {threshold_decimal}
+        GROUP BY dimension_value
+    )
+    SELECT
+        dimension_value,
+        terms_count
+    FROM terms_within_threshold
+    ORDER BY dimension_value
+    """
+
+    return query
+
+
+def get_other_dimension_values(
+    client,
+    dataset_table: str,
+    base_filters: Dict,
+    dimension_column: str,
+    explicit_values: List[str]
+) -> List[str]:
+    """
+    Get the list of dimension values that are NOT in the explicit_values list.
+    These are the values that would be aggregated into "Other".
+
+    Args:
+        client: BigQuery client
+        dataset_table: Table name
+        base_filters: Base filter dict
+        dimension_column: Name of the dimension column
+        explicit_values: List of dimension values that are explicitly shown (not in Other)
+
+    Returns:
+        List of dimension values that are in "Other"
+    """
+    from data_processing import build_filter_clause
+
+    # Build base WHERE clause
+    where_clause = build_filter_clause(base_filters)
+
+    # Build dimension expression based on type
+    if dimension_column == 'attribute_combination':
+        dimension_expr = """
+            CASE
+                WHEN attr_categoria = 0 AND attr_tipo = 0 AND attr_genero = 0 AND
+                     attr_marca = 0 AND attr_color = 0 AND attr_material = 0 AND
+                     attr_talla = 0 AND attr_modelo = 0 THEN 'No attributes'
+                ELSE ARRAY_TO_STRING([
+                    IF(attr_categoria = 1, 'Categoria', NULL),
+                    IF(attr_tipo = 1, 'Tipo', NULL),
+                    IF(attr_genero = 1, 'Genero', NULL),
+                    IF(attr_marca = 1, 'Marca', NULL),
+                    IF(attr_color = 1, 'Color', NULL),
+                    IF(attr_material = 1, 'Material', NULL),
+                    IF(attr_talla = 1, 'Talla', NULL),
+                    IF(attr_modelo = 1, 'Modelo', NULL)
+                ], ' + ')
+            END
+        """
+    elif dimension_column == 'n_words_grouped':
+        dimension_expr = """
+            CASE
+                WHEN n_words_normalized >= 4 THEN '4+'
+                ELSE CAST(CAST(n_words_normalized AS INT64) AS STRING)
+            END
+        """
+    else:
+        # Regular column - handle NULL values
+        dimension_expr = f"COALESCE({dimension_column}, '-')"
+
+    # Build exclusion list (values that are NOT in Other)
+    exclusion_filters = []
+    for val in explicit_values:
+        if val and val != 'Other':
+            safe_val = str(val).replace("'", "\\'")
+            exclusion_filters.append(f"'{safe_val}'")
+
+    if not exclusion_filters:
+        # If no explicit values, return empty list
+        return []
+
+    exclusion_list = ', '.join(exclusion_filters)
+
+    # Query for dimension values NOT in the explicit list
+    # For attribute_combination and individual_attribute, we need a subquery
+    if dimension_column == 'individual_attribute':
+        # Special handling for UNPIVOT logic
+        query = f"""
+        WITH base_data AS (
+            SELECT
+                attr_categoria,
+                attr_tipo,
+                attr_genero,
+                attr_marca,
+                attr_color,
+                attr_material,
+                attr_talla,
+                attr_modelo
+            FROM `{dataset_table}`
+            {where_clause}
+            GROUP BY attr_categoria, attr_tipo, attr_genero, attr_marca, attr_color, attr_material, attr_talla, attr_modelo
+        ),
+        unpivoted AS (
+            SELECT 'Categoria' as dimension_value FROM base_data WHERE attr_categoria = 1
+            UNION DISTINCT
+            SELECT 'Tipo' FROM base_data WHERE attr_tipo = 1
+            UNION DISTINCT
+            SELECT 'Genero' FROM base_data WHERE attr_genero = 1
+            UNION DISTINCT
+            SELECT 'Marca' FROM base_data WHERE attr_marca = 1
+            UNION DISTINCT
+            SELECT 'Color' FROM base_data WHERE attr_color = 1
+            UNION DISTINCT
+            SELECT 'Material' FROM base_data WHERE attr_material = 1
+            UNION DISTINCT
+            SELECT 'Talla' FROM base_data WHERE attr_talla = 1
+            UNION DISTINCT
+            SELECT 'Modelo' FROM base_data WHERE attr_modelo = 1
+        )
+        SELECT dimension_value
+        FROM unpivoted
+        WHERE dimension_value NOT IN ({exclusion_list})
+        ORDER BY dimension_value
+        LIMIT 1000
+        """
+    else:
+        # For regular dimensions and attribute_combination
+        query = f"""
+        WITH all_values AS (
+            SELECT DISTINCT
+                {dimension_expr} as dimension_value
+            FROM `{dataset_table}`
+            {where_clause}
+        )
+        SELECT dimension_value
+        FROM all_values
+        WHERE dimension_value NOT IN ({exclusion_list})
+            AND dimension_value IS NOT NULL
+        ORDER BY dimension_value
+        LIMIT 1000
+        """
+
+    try:
+        result = execute_cached_query(client, query, ttl=600)
+        return result['dimension_value'].tolist()
+    except Exception as e:
+        # Return empty list on error
+        return []
+
+
+def calculate_batch_search_terms_concentration(
+    client,
+    dataset_table: str,
+    base_filters: Dict,
+    dimension_column: str,
+    dimension_values: List[str],
+    concentration_pct: int,
+    other_values_dict: Dict[str, List[str]] = None
+) -> Dict[str, int]:
+    """
+    Calculate search term concentration for multiple dimension values in ONE query.
+    This is a massive performance improvement over calling calculate_terms_for_top_pct N times.
+
+    Args:
+        client: BigQuery client
+        dataset_table: Table name
+        base_filters: Base filter dict
+        dimension_column: Name of the dimension column
+        dimension_values: List of dimension values to calculate for
+        concentration_pct: Percentage threshold (e.g., 80 for 80%)
+        other_values_dict: Optional dict mapping "Other" -> list of actual dimension values
+
+    Returns:
+        Dictionary mapping dimension_value -> terms_count
+    """
+    # Expand dimension_values to include constituent values for "Other"
+    expanded_values = []
+    other_mapping = {}  # Maps expanded values back to "Other"
+
+    for val in dimension_values:
+        if val == 'Other' and other_values_dict and 'Other' in other_values_dict:
+            # This is an "Other" row with constituent values
+            constituent_values = other_values_dict['Other']
+            expanded_values.extend(constituent_values)
+            # Map each constituent value back to "Other" for aggregation
+            for cv in constituent_values:
+                other_mapping[cv] = 'Other'
+        else:
+            expanded_values.append(val)
+
+    # Build and execute batch query with expanded values
+    query = build_batch_search_terms_concentration_query(
+        dataset_table,
+        base_filters,
+        dimension_column,
+        expanded_values,
+        concentration_pct
+    )
+
+    try:
+        result = execute_cached_query(client, query, ttl=600)  # Cache for 10 minutes
+
+        # Convert to dictionary and aggregate "Other" values if needed
+        result_dict = {}
+        other_total = 0
+
+        for _, row in result.iterrows():
+            dim_val = row['dimension_value']
+            count = int(row['terms_count'])
+
+            if dim_val in other_mapping:
+                # This value belongs to "Other", accumulate it
+                other_total += count
+            else:
+                # Regular value
+                result_dict[dim_val] = count
+
+        # Add the aggregated "Other" total if we have any
+        if other_total > 0:
+            result_dict['Other'] = other_total
+
+        return result_dict
+    except Exception as e:
+        # Log error and return empty dict
+        import streamlit as st
+        if 'calc_batch_errors' not in st.session_state:
+            st.session_state.calc_batch_errors = []
+        st.session_state.calc_batch_errors.append({
+            'dimension': dimension_column,
+            'values': dimension_values,
+            'error': str(e)
+        })
+        return {}
 
 
 def build_drill_down_query(dataset_table: str, base_filters: Dict, drill_filters: Dict, path_to_other_values: Dict = None) -> str:
@@ -2080,6 +2767,13 @@ def build_drill_down_query(dataset_table: str, base_filters: Dict, drill_filters
                 for val in path_to_other_values[dim_key]:
                     attr_conditions.append(convert_attribute_combination_to_condition(val))
                 drill_conditions.append(f"({' OR '.join(attr_conditions)})")
+            elif dim_key == 'individual_attribute':
+                # For individual_attribute, convert each attribute name to attr_* condition
+                attr_conditions = []
+                for val in path_to_other_values[dim_key]:
+                    attr_col = convert_individual_attribute_to_column(val)
+                    attr_conditions.append(f'{attr_col} = 1')
+                drill_conditions.append(f"({' OR '.join(attr_conditions)})")
             elif dim_key == 'n_words_grouped':
                 # For n_words_grouped, convert to n_words_normalized conditions
                 word_conditions = []
@@ -2098,6 +2792,10 @@ def build_drill_down_query(dataset_table: str, base_filters: Dict, drill_filters
             if dim_key == 'attribute_combination':
                 # Convert attribute combination to underlying attr_* conditions
                 drill_conditions.append(convert_attribute_combination_to_condition(dim_value))
+            elif dim_key == 'individual_attribute':
+                # Convert individual attribute name to attr_* column filter
+                attr_col = convert_individual_attribute_to_column(dim_value)
+                drill_conditions.append(f'{attr_col} = 1')
             elif dim_key == 'n_words_grouped':
                 # Convert word count group to n_words_normalized condition
                 if dim_value == '4+':

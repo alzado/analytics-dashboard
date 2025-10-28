@@ -129,6 +129,57 @@ def calculate_terms_for_top_pct(client, dataset_table, base_filters, dimension_c
         })
     return 0
 
+# Helper function to extract dimension filters from pivot row
+def extract_dimension_filters_from_row(row_data, dimension_keys, dimension_names):
+    """
+    Extract dimension filters from a selected pivot table row.
+
+    Args:
+        row_data: Series containing the selected row data
+        dimension_keys: List of dimension column keys (e.g., ['channel', 'n_words_grouped'])
+        dimension_names: List of dimension display names (e.g., ['Channel', 'Number of Words'])
+
+    Returns:
+        tuple: (dimension_filters dict, display_name string)
+    """
+    dimension_filters = {}
+    display_parts = []
+
+    # Check if this is a search term row
+    if 'Search Term' in row_data.index and pd.notna(row_data.get('Search Term')):
+        search_term = row_data['Search Term']
+        if search_term and search_term != '-':
+            # Clean the search term - remove streamlit display characters
+            if isinstance(search_term, str):
+                search_term = search_term.replace('▶', '').replace('▼', '').replace('►', '').strip()
+            dimension_filters['search_term'] = search_term
+            display_parts.append(f"'{search_term}'")
+
+    # Extract dimension values from the row
+    for dim_name in dimension_names:
+        if dim_name in row_data.index:
+            dim_value = row_data[dim_name]
+            if pd.notna(dim_value) and dim_value != '-' and dim_value != '':
+                # Clean the value - remove streamlit display characters (▶, ▼, etc.)
+                if isinstance(dim_value, str):
+                    # Remove common unicode display characters used by streamlit
+                    dim_value = dim_value.replace('▶', '').replace('▼', '').replace('►', '').strip()
+
+                # Find corresponding key
+                dim_key = None
+                for i, name in enumerate(dimension_names):
+                    if name == dim_name and i < len(dimension_keys):
+                        dim_key = dimension_keys[i]
+                        break
+
+                if dim_key:
+                    dimension_filters[dim_key] = dim_value
+                    display_parts.append(f"{dim_value}")
+
+    display_name = " > ".join(display_parts) if display_parts else "All Data"
+
+    return dimension_filters, display_name
+
 # Page configuration
 st.set_page_config(
     page_title="Search Analytics Dashboard",
@@ -176,11 +227,31 @@ def initialize_bigquery_connection(bq_params):
 
     # Query min/max dates from the table for date range widget
     try:
+        # Build WHERE clause to respect date filters
+        where_conditions = []
+        if bq_params.get('date_start') and bq_params.get('date_end'):
+            where_conditions.append(f"date BETWEEN '{bq_params['date_start']}' AND '{bq_params['date_end']}'")
+        elif bq_params.get('date_start'):
+            where_conditions.append(f"date >= '{bq_params['date_start']}'")
+        elif bq_params.get('date_end'):
+            where_conditions.append(f"date <= '{bq_params['date_end']}'")
+
+        if bq_params.get('countries'):
+            country_list = "', '".join(bq_params['countries'])
+            where_conditions.append(f"country IN ('{country_list}')")
+
+        if bq_params.get('channels'):
+            channel_list = "', '".join(bq_params['channels'])
+            where_conditions.append(f"channel IN ('{channel_list}')")
+
+        where_clause = f"WHERE {' AND '.join(where_conditions)}" if where_conditions else ""
+
         date_query = f"""
             SELECT
                 MIN(date) as min_date,
                 MAX(date) as max_date
             FROM `{bq_params['table']}`
+            {where_clause}
         """
         date_df = dp.execute_cached_query(st.session_state.bq_client, date_query, ttl=3600)
 
@@ -227,13 +298,13 @@ col1, col2 = st.sidebar.columns(2)
 with col1:
     bq_date_start = st.date_input(
         "Start Date",
-        value=date.today() - timedelta(days=90),
+        value=None,
         help="Filter data from this date (pushes filter to BigQuery)"
     )
 with col2:
     bq_date_end = st.date_input(
         "End Date",
-        value=date.today(),
+        value=None,
         help="Filter data until this date"
     )
 
@@ -309,10 +380,14 @@ bq_params = {
 }
 
 # Initialize connection when button is clicked
-if load_button or not st.session_state.get('bq_initialized', False):
-    with st.spinner('🔄 Connecting to BigQuery...'):
-        initialize_bigquery_connection(bq_params)
-        st.success(f"✅ Connected to BigQuery: {bq_params['table']}")
+if load_button:
+    # Validate that dates are selected
+    if not bq_date_start or not bq_date_end:
+        st.sidebar.error("⚠️ Please select both Start Date and End Date before connecting.")
+    else:
+        with st.spinner('🔄 Connecting to BigQuery...'):
+            initialize_bigquery_connection(bq_params)
+            st.success(f"✅ Connected to BigQuery: {bq_params['table']}")
 
 # Check if connection is initialized
 if not st.session_state.get('bq_initialized', False):
@@ -342,26 +417,161 @@ if not st.session_state.get('bq_initialized', False):
 # Sidebar filters
 st.sidebar.header("Filters")
 
+# Initialize advanced date filtering toggle
+if 'use_advanced_dates' not in st.session_state:
+    st.session_state.use_advanced_dates = False
+
 # Date range filter
 min_date = st.session_state.bq_min_date
 max_date = st.session_state.bq_max_date
 
-date_range = st.sidebar.date_input(
-    "Date Range",
-    value=(min_date, max_date),
-    min_value=min_date,
-    max_value=max_date,
-    key='date_range'
+# Toggle for advanced date filtering
+use_advanced = st.sidebar.checkbox(
+    "Use Advanced Date Filtering",
+    value=st.session_state.use_advanced_dates,
+    key='use_advanced_dates',
+    help="Enable to use multiple date ranges (includes/excludes). When enabled, the normal date range will be hidden."
 )
 
-# Convert to datetime
-if len(date_range) == 2:
-    start_date, end_date = date_range
-    start_date = pd.to_datetime(start_date)
-    end_date = pd.to_datetime(end_date)
+# Only show normal date range if advanced mode is NOT active
+if not use_advanced:
+    date_range = st.sidebar.date_input(
+        "Date Range",
+        value=(min_date, max_date),
+        min_value=min_date,
+        max_value=max_date,
+        key='date_range'
+    )
+
+    # Convert to datetime
+    if len(date_range) == 2:
+        start_date, end_date = date_range
+        start_date = pd.to_datetime(start_date)
+        end_date = pd.to_datetime(end_date)
+    else:
+        start_date = pd.to_datetime(date_range[0])
+        end_date = pd.to_datetime(date_range[0])
 else:
-    start_date = pd.to_datetime(date_range[0])
-    end_date = pd.to_datetime(date_range[0])
+    # When advanced mode is on, use full date range from BigQuery
+    start_date = pd.to_datetime(min_date)
+    end_date = pd.to_datetime(max_date)
+
+# Advanced Date Filtering
+with st.sidebar.expander("📅 Advanced Date Filtering", expanded=use_advanced):
+    st.caption("Add multiple date ranges to include or exclude specific periods")
+
+    # Initialize session state for date ranges
+    if 'additional_date_ranges' not in st.session_state:
+        st.session_state.additional_date_ranges = []
+    if 'excluded_date_ranges' not in st.session_state:
+        st.session_state.excluded_date_ranges = []
+
+    # Additional Include Ranges
+    st.subheader("➕ Additional Ranges to Include")
+    st.caption("Add more date ranges beyond the main range above")
+
+    # Display existing additional ranges
+    ranges_to_remove = []
+    for i, (r_start, r_end) in enumerate(st.session_state.additional_date_ranges):
+        col1, col2, col3 = st.columns([3, 3, 1])
+        with col1:
+            st.text(f"{r_start}")
+        with col2:
+            st.text(f"to {r_end}")
+        with col3:
+            if st.button("❌", key=f"remove_include_{i}"):
+                ranges_to_remove.append(i)
+
+    # Remove marked ranges
+    for idx in sorted(ranges_to_remove, reverse=True):
+        st.session_state.additional_date_ranges.pop(idx)
+        st.rerun()
+
+    # Add new include range
+    col1, col2 = st.columns(2)
+    with col1:
+        new_include_start = st.date_input(
+            "Start",
+            value=min_date,
+            min_value=min_date,
+            max_value=max_date,
+            key='new_include_start'
+        )
+    with col2:
+        new_include_end = st.date_input(
+            "End",
+            value=max_date,
+            min_value=min_date,
+            max_value=max_date,
+            key='new_include_end'
+        )
+
+    if st.button("➕ Add Include Range"):
+        if new_include_start <= new_include_end:
+            st.session_state.additional_date_ranges.append((
+                str(new_include_start),
+                str(new_include_end)
+            ))
+            st.rerun()
+        else:
+            st.error("Start date must be before end date")
+
+    st.markdown("---")
+
+    # Excluded Ranges
+    st.subheader("🚫 Ranges to Exclude")
+    st.caption("Exclude specific periods (e.g., holidays, promotions)")
+
+    # Display existing excluded ranges
+    excluded_to_remove = []
+    for i, (r_start, r_end) in enumerate(st.session_state.excluded_date_ranges):
+        col1, col2, col3 = st.columns([3, 3, 1])
+        with col1:
+            st.text(f"{r_start}")
+        with col2:
+            st.text(f"to {r_end}")
+        with col3:
+            if st.button("❌", key=f"remove_exclude_{i}"):
+                excluded_to_remove.append(i)
+
+    # Remove marked ranges
+    for idx in sorted(excluded_to_remove, reverse=True):
+        st.session_state.excluded_date_ranges.pop(idx)
+        st.rerun()
+
+    # Add new exclude range
+    col1, col2 = st.columns(2)
+    with col1:
+        new_exclude_start = st.date_input(
+            "Start",
+            value=min_date,
+            min_value=min_date,
+            max_value=max_date,
+            key='new_exclude_start'
+        )
+    with col2:
+        new_exclude_end = st.date_input(
+            "End",
+            value=max_date,
+            min_value=min_date,
+            max_value=max_date,
+            key='new_exclude_end'
+        )
+
+    if st.button("➕ Add Exclude Range"):
+        if new_exclude_start <= new_exclude_end:
+            st.session_state.excluded_date_ranges.append((
+                str(new_exclude_start),
+                str(new_exclude_end)
+            ))
+            st.rerun()
+        else:
+            st.error("Start date must be before end date")
+
+    # Summary
+    if st.session_state.additional_date_ranges or st.session_state.excluded_date_ranges:
+        st.markdown("---")
+        st.caption(f"**Active filters:** {len(st.session_state.additional_date_ranges) + 1} ranges included, {len(st.session_state.excluded_date_ranges)} ranges excluded")
 
 # Period comparison disabled in BigQuery mode
 enable_comparison = False
@@ -432,9 +642,12 @@ with st.sidebar.expander("Number of Attributes", expanded=False):
     )
 
 # Build base filters dictionary (used for BigQuery queries)
+# When advanced mode is active, don't include normal date_start/date_end
 base_filters = {
-    'date_start': str(start_date.date()),
-    'date_end': str(end_date.date()),
+    'date_start': None if use_advanced else str(start_date.date()),
+    'date_end': None if use_advanced else str(end_date.date()),
+    'additional_date_ranges': st.session_state.additional_date_ranges if st.session_state.additional_date_ranges else None,
+    'excluded_date_ranges': st.session_state.excluded_date_ranges if st.session_state.excluded_date_ranges else None,
     'countries': countries if countries else None,
     'channels': channels if channels else None,
     'categories': categories if categories else None,
@@ -468,14 +681,14 @@ FROM `{st.session_state.bq_params['table']}`
 count_result = dp.execute_cached_query(st.session_state.bq_client, count_query, ttl=300)
 search_term_count = int(count_result.iloc[0]['search_term_count']) if not count_result.empty else 0
 
-# Calculate search terms for top 50% (fixed concentration for KPI dashboard)
-search_terms_top_50_pct = calculate_terms_for_top_pct(
+# Calculate search terms for top 80% (fixed concentration for KPI dashboard)
+search_terms_top_80_pct = calculate_terms_for_top_pct(
     st.session_state.bq_client,
     st.session_state.bq_params['table'],
     base_filters,
     None,  # No dimension column
     None,  # No dimension value
-    50  # 50% concentration
+    80  # 80% concentration
 )
 
 # Calculate number of days
@@ -486,16 +699,17 @@ kpis = {
     'total_revenue': total_revenue,
     'avg_ctr': float(total_queries_pdp / total_queries) if total_queries > 0 else 0.0,
     'avg_conversion': float(total_purchases / total_queries) if total_queries > 0 else 0.0,
+    'avg_pdp_conversion': float(total_purchases / total_queries_pdp) if total_queries_pdp > 0 else 0.0,
     'revenue_per_query': float(total_revenue / total_queries) if total_queries > 0 else 0.0,
     'total_purchases': total_purchases,
     'avg_order_value': float(total_revenue / total_purchases) if total_purchases > 0 else 0.0,
     'search_term_count': search_term_count,
     'average_queries_per_day': (total_queries / num_days) if num_days > 0 else 0.0,
     'average_queries_per_search_term_per_day': (total_queries / num_days / search_term_count) if (num_days > 0 and search_term_count > 0) else 0.0,
-    'search_terms_for_top_50_pct': search_terms_top_50_pct
+    'search_terms_for_top_80_pct': search_terms_top_80_pct
 }
 
-col1, col2, col3, col4, col5, col6 = st.columns(6)
+col1, col2, col3, col4, col5, col6, col7 = st.columns(7)
 
 with col1:
     st.metric(
@@ -512,22 +726,28 @@ with col2:
 with col3:
     st.metric(
         "Avg Queries per ST per Day",
-        f"{format_number(kpis['average_queries_per_search_term_per_day'])}"
+        f"{kpis['average_queries_per_search_term_per_day']:.1f}"
     )
 
 with col4:
     st.metric(
-        "Search Terms for Top 50%",
-        format_number(kpis['search_terms_for_top_50_pct'])
+        "Search Terms for Top 80%",
+        format_number(kpis['search_terms_for_top_80_pct'])
     )
 
 with col5:
     st.metric(
-        "Conversion Rate",
-        f"{kpis['avg_conversion']*100:.2f}%"
+        "CTR",
+        f"{kpis['avg_ctr']*100:.2f}%"
     )
 
 with col6:
+    st.metric(
+        "PDP Conversion",
+        f"{kpis['avg_pdp_conversion']*100:.2f}%"
+    )
+
+with col7:
     st.metric(
         "Avg Order Value",
         f"${format_number(kpis['avg_order_value'])}"
@@ -535,363 +755,7 @@ with col6:
 
 st.divider()
 
-# Section 2: Trend Analysis
-st.header("Trend Analysis")
-
-# Frequency selector
-freq_options = {
-    'Daily': 'D',
-    'Weekly': 'W',
-    'Monthly': 'M'
-}
-freq_label = st.selectbox("Time Granularity", options=list(freq_options.keys()), index=0)
-freq = freq_options[freq_label]
-
-# Query BigQuery for time series
-query = dp.build_timeseries_query(st.session_state.bq_params['table'], base_filters, freq=freq)
-ts_data = dp.execute_cached_query(st.session_state.bq_client, query, ttl=300)
-
-# Calculate derived metrics
-ts_data['ctr'] = np.where(ts_data['queries'] > 0, ts_data['queries_pdp'] / ts_data['queries'], 0)
-ts_data['a2c_rate'] = np.where(ts_data['queries'] > 0, ts_data['queries_a2c'] / ts_data['queries'], 0)
-ts_data['conversion_rate'] = np.where(ts_data['queries'] > 0, ts_data['purchases'] / ts_data['queries'], 0)
-ts_data['revenue_per_query'] = np.where(ts_data['queries'] > 0, ts_data['gross_purchase'] / ts_data['queries'], 0)
-ts_data['avg_order_value'] = np.where(ts_data['purchases'] > 0, ts_data['gross_purchase'] / ts_data['purchases'], 0)
-
-ts_comparison = None  # Comparison not supported in BigQuery mode
-
-# Metric selector for trends
-trend_metrics = st.multiselect(
-    "Select Metrics to Display",
-    options=['queries', 'revenue_per_query', 'ctr', 'conversion_rate', 'a2c_rate'],
-    default=['queries', 'revenue_per_query']
-)
-
-if trend_metrics:
-    for metric in trend_metrics:
-        metric_names = {
-            'queries': 'Total Queries',
-            'revenue_per_query': 'Revenue per Query',
-            'ctr': 'Click-Through Rate',
-            'conversion_rate': 'Conversion Rate',
-            'a2c_rate': 'Add-to-Cart Rate'
-        }
-
-        fig = viz.create_trend_chart(
-            ts_data,
-            metric,
-            title=f"{metric_names.get(metric, metric)} Over Time",
-            yaxis_title=metric_names.get(metric, metric),
-            comparison_df=ts_comparison
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-st.divider()
-
-# Section 3: Channel Performance
-st.header("Channel Performance")
-
-# Query BigQuery for channel performance
-query = dp.build_channel_query(st.session_state.bq_params['table'], base_filters)
-channel_data = dp.execute_cached_query(st.session_state.bq_client, query, ttl=300)
-
-# Calculate derived metrics
-channel_data['ctr'] = np.where(channel_data['queries'] > 0, channel_data['queries_pdp'] / channel_data['queries'], 0)
-channel_data['a2c_rate'] = np.where(channel_data['queries'] > 0, channel_data['queries_a2c'] / channel_data['queries'], 0)
-channel_data['conversion_rate'] = np.where(channel_data['queries'] > 0, channel_data['purchases'] / channel_data['queries'], 0)
-channel_data['revenue_per_query'] = np.where(channel_data['queries'] > 0, channel_data['gross_purchase'] / channel_data['queries'], 0)
-channel_data['avg_order_value'] = np.where(channel_data['purchases'] > 0, channel_data['gross_purchase'] / channel_data['purchases'], 0)
-
-has_channel_data = len(channel_data) > 0
-
-if has_channel_data:
-    # Use BigQuery data for chart
-    fig_channel = viz.create_channel_comparison(channel_data)
-
-    st.plotly_chart(fig_channel, use_container_width=True)
-
-    # Detailed channel table
-    st.subheader("Channel Details")
-
-    channel_details = channel_data.copy()
-
-    # Sort by queries descending
-    channel_details = channel_details.sort_values('queries', ascending=False).reset_index(drop=True)
-
-    # Calculate % of total queries and cumulative %
-    total_queries = channel_details['queries'].sum()
-    channel_details['query_pct'] = (channel_details['queries'] / total_queries * 100)
-    channel_details['cumulative_queries'] = channel_details['queries'].cumsum()
-    channel_details['cumulative_pct'] = (channel_details['cumulative_queries'] / total_queries * 100)
-
-    # Select and reorder columns
-    channel_details = channel_details[[
-        'channel', 'queries', 'query_pct', 'cumulative_pct', 'ctr', 'a2c_rate', 'conversion_rate',
-        'revenue_per_query', 'purchases', 'gross_purchase'
-    ]]
-
-    # Format columns
-    channel_details['query_pct'] = channel_details['query_pct'].apply(lambda x: f"{x:.2f}%")
-    channel_details['cumulative_pct'] = channel_details['cumulative_pct'].apply(lambda x: f"{x:.2f}%")
-    channel_details['ctr'] = channel_details['ctr'].apply(lambda x: f"{x*100:.2f}%")
-    channel_details['a2c_rate'] = channel_details['a2c_rate'].apply(lambda x: f"{x*100:.2f}%")
-    channel_details['conversion_rate'] = channel_details['conversion_rate'].apply(lambda x: f"{x*100:.2f}%")
-    channel_details['revenue_per_query'] = channel_details['revenue_per_query'].apply(lambda x: f"${x:.2f}")
-    channel_details['gross_purchase'] = channel_details['gross_purchase'].apply(lambda x: f"${x:,.2f}")
-
-    # Rename columns for display
-    channel_details = channel_details.rename(columns={
-        'query_pct': '% of queries',
-        'cumulative_pct': 'cumulative %'
-    })
-
-    st.dataframe(channel_details, use_container_width=True, hide_index=True)
-else:
-    st.info("No channel data available with current filters.")
-
-st.divider()
-
-# Section 4: Search Query Length Analysis
-st.header("Search Query Length Analysis")
-
-# Query BigQuery for word count analysis
-query = dp.build_word_count_query(st.session_state.bq_params['table'], base_filters)
-n_words_grouped = dp.execute_cached_query(st.session_state.bq_client, query, ttl=300)
-
-# Calculate derived metrics
-n_words_grouped['ctr'] = np.where(n_words_grouped['queries'] > 0, n_words_grouped['queries_pdp'] / n_words_grouped['queries'], 0)
-n_words_grouped['a2c_rate'] = np.where(n_words_grouped['queries'] > 0, n_words_grouped['queries_a2c'] / n_words_grouped['queries'], 0)
-n_words_grouped['conversion_rate'] = np.where(n_words_grouped['queries'] > 0, n_words_grouped['purchases'] / n_words_grouped['queries'], 0)
-n_words_grouped['revenue_per_query'] = np.where(n_words_grouped['queries'] > 0, n_words_grouped['gross_purchase'] / n_words_grouped['queries'], 0)
-n_words_grouped['avg_order_value'] = np.where(n_words_grouped['purchases'] > 0, n_words_grouped['gross_purchase'] / n_words_grouped['purchases'], 0)
-
-has_word_count_data = len(n_words_grouped) > 0
-
-if has_word_count_data:
-    st.subheader("Performance by Number of Words (1, 2, 3, 4+)")
-
-    # Create visualization
-    fig_n_words = viz.create_n_words_chart(n_words_grouped, word_col='n_words_grouped')
-    st.plotly_chart(fig_n_words, use_container_width=True)
-
-    # Detailed table by grouped n_words
-    st.subheader("Details by Number of Words")
-
-    # Calculate % of total queries and cumulative %
-    total_queries = n_words_grouped['queries'].sum()
-    n_words_grouped['query_pct'] = (n_words_grouped['queries'] / total_queries * 100)
-    n_words_grouped['cumulative_queries'] = n_words_grouped['queries'].cumsum()
-    n_words_grouped['cumulative_pct'] = (n_words_grouped['cumulative_queries'] / total_queries * 100)
-
-    n_words_details = n_words_grouped[[
-        'n_words_grouped', 'queries', 'query_pct', 'cumulative_pct', 'ctr', 'a2c_rate', 'conversion_rate',
-        'revenue_per_query', 'purchases', 'gross_purchase'
-    ]].copy()
-
-    # Format columns
-    n_words_details['query_pct'] = n_words_details['query_pct'].apply(lambda x: f"{x:.2f}%")
-    n_words_details['cumulative_pct'] = n_words_details['cumulative_pct'].apply(lambda x: f"{x:.2f}%")
-    n_words_details['ctr'] = n_words_details['ctr'].apply(lambda x: f"{x*100:.2f}%")
-    n_words_details['a2c_rate'] = n_words_details['a2c_rate'].apply(lambda x: f"{x*100:.2f}%")
-    n_words_details['conversion_rate'] = n_words_details['conversion_rate'].apply(lambda x: f"{x*100:.2f}%")
-    n_words_details['revenue_per_query'] = n_words_details['revenue_per_query'].apply(lambda x: f"${x:.2f}")
-    n_words_details['gross_purchase'] = n_words_details['gross_purchase'].apply(lambda x: f"${x:,.2f}")
-
-    # Rename columns for clarity
-    n_words_details = n_words_details.rename(columns={
-        'n_words_grouped': 'num_words',
-        'query_pct': '% of queries',
-        'cumulative_pct': 'cumulative %'
-    })
-
-    st.dataframe(n_words_details, use_container_width=True, hide_index=True)
-
-    # Add info box about grouping
-    st.info("📊 Queries with 4 or more words are grouped together as '4+' for clearer visualization due to lower individual volumes.")
-else:
-    st.info("No word count data available with current filters.")
-
-st.divider()
-
-# Section 5: Attribute Analysis
-st.header("Attribute Analysis")
-
-st.subheader("Performance by Attribute Combinations")
-
-# Control for number of combinations to show
-top_n = st.slider("Number of top combinations to display", min_value=10, max_value=30, value=15, step=5)
-
-# Query BigQuery for attribute combinations
-query = dp.build_attribute_combination_query(st.session_state.bq_params['table'], base_filters, top_n=top_n)
-attr_combos = dp.execute_cached_query(st.session_state.bq_client, query, ttl=300)
-
-# Calculate derived metrics
-attr_combos['ctr'] = np.where(attr_combos['queries'] > 0, attr_combos['queries_pdp'] / attr_combos['queries'], 0)
-attr_combos['a2c_rate'] = np.where(attr_combos['queries'] > 0, attr_combos['queries_a2c'] / attr_combos['queries'], 0)
-attr_combos['conversion_rate'] = np.where(attr_combos['queries'] > 0, attr_combos['purchases'] / attr_combos['queries'], 0)
-attr_combos['revenue_per_query'] = np.where(attr_combos['queries'] > 0, attr_combos['gross_purchase'] / attr_combos['queries'], 0)
-attr_combos['avg_order_value'] = np.where(attr_combos['purchases'] > 0, attr_combos['gross_purchase'] / attr_combos['purchases'], 0)
-
-if not attr_combos.empty:
-    fig_attr_combos = viz.create_attribute_combination_chart(attr_combos)
-    st.plotly_chart(fig_attr_combos, use_container_width=True)
-
-    # Detailed table
-    st.subheader(f"Top {top_n} Attribute Combination Details")
-
-    # Calculate % of total queries and cumulative %
-    # Use the KPI total we already calculated for this filtered period
-    total_queries_all = kpis['total_queries']
-    attr_combos['query_pct'] = (attr_combos['queries'] / total_queries_all * 100)
-    attr_combos['cumulative_queries'] = attr_combos['queries'].cumsum()
-    attr_combos['cumulative_pct'] = (attr_combos['cumulative_queries'] / total_queries_all * 100)
-
-    attr_combo_display = attr_combos[[
-        'attribute_combination', 'queries', 'query_pct', 'cumulative_pct', 'ctr', 'a2c_rate', 'conversion_rate',
-        'revenue_per_query', 'purchases', 'gross_purchase'
-    ]].copy()
-
-    # Format columns
-    attr_combo_display['query_pct'] = attr_combo_display['query_pct'].apply(lambda x: f"{x:.2f}%")
-    attr_combo_display['cumulative_pct'] = attr_combo_display['cumulative_pct'].apply(lambda x: f"{x:.2f}%")
-    attr_combo_display['ctr'] = attr_combo_display['ctr'].apply(lambda x: f"{x*100:.2f}%")
-    attr_combo_display['a2c_rate'] = attr_combo_display['a2c_rate'].apply(lambda x: f"{x*100:.2f}%")
-    attr_combo_display['conversion_rate'] = attr_combo_display['conversion_rate'].apply(lambda x: f"{x*100:.2f}%")
-    attr_combo_display['revenue_per_query'] = attr_combo_display['revenue_per_query'].apply(lambda x: f"${x:.2f}")
-    attr_combo_display['gross_purchase'] = attr_combo_display['gross_purchase'].apply(lambda x: f"${x:,.2f}")
-
-    # Rename columns for clarity
-    attr_combo_display = attr_combo_display.rename(columns={
-        'attribute_combination': 'combination',
-        'query_pct': '% of queries',
-        'cumulative_pct': 'cumulative %'
-    })
-
-    st.dataframe(attr_combo_display, use_container_width=True, hide_index=True)
-
-    # Add insight box
-    st.info(f"💡 Showing top {top_n} attribute combinations by query volume. " +
-           "Combinations like 'Marca + Color' show how customers combine different attributes in their searches.")
-else:
-    st.info("No attribute combination data available with current filters.")
-
-st.divider()
-
-# Section 6: Search Term Explorer
-st.header("Search Term Explorer")
-
-# Top search terms chart
-st.subheader("Top Search Terms")
-
-col_metric, col_top_n = st.columns([3, 1])
-with col_metric:
-    top_metric = st.selectbox(
-        "Rank by",
-        options=['queries', 'gross_purchase', 'purchases', 'queries_pdp'],
-        index=0,
-        key='top_metric'
-    )
-with col_top_n:
-    top_n_chart = st.number_input("Show top", min_value=5, max_value=100, value=20, step=5)
-
-# Query BigQuery for search terms (get more than needed for local filtering/sorting)
-query = dp.build_search_terms_query(
-    st.session_state.bq_params['table'],
-    base_filters,
-    search_filter=None,  # Don't filter in query - do it in pandas for flexibility
-    sort_by='queries',
-    ascending=False,
-    limit=1000  # Get top 1000 for local manipulation
-)
-search_term_agg = dp.execute_cached_query(st.session_state.bq_client, query, ttl=300)
-
-# Calculate derived metrics
-search_term_agg['ctr'] = np.where(search_term_agg['queries'] > 0, search_term_agg['queries_pdp'] / search_term_agg['queries'], 0)
-search_term_agg['a2c_rate'] = np.where(search_term_agg['queries'] > 0, search_term_agg['queries_a2c'] / search_term_agg['queries'], 0)
-search_term_agg['conversion_rate'] = np.where(search_term_agg['queries'] > 0, search_term_agg['purchases'] / search_term_agg['queries'], 0)
-search_term_agg['revenue_per_query'] = np.where(search_term_agg['queries'] > 0, search_term_agg['gross_purchase'] / search_term_agg['queries'], 0)
-search_term_agg['avg_order_value'] = np.where(search_term_agg['purchases'] > 0, search_term_agg['gross_purchase'] / search_term_agg['purchases'], 0)
-
-if not search_term_agg.empty:
-    fig_top_searches = viz.create_top_searches_chart(search_term_agg, metric=top_metric, top_n=top_n_chart)
-    st.plotly_chart(fig_top_searches, use_container_width=True)
-
-    # Detailed search term table with multi-level drill-down
-    st.subheader("Search Term Details")
-
-    # Search box
-    search_filter = st.text_input("Filter search terms (contains)", value="")
-
-    # Apply search filter
-    if search_filter:
-        display_df = search_term_agg[search_term_agg['search_term'].str.contains(search_filter, case=False, na=False)]
-    else:
-        display_df = search_term_agg
-
-    # Sort options
-    sort_col, sort_order = st.columns([3, 1])
-    with sort_col:
-        sort_by = st.selectbox(
-            "Sort by",
-            options=['queries', 'ctr', 'a2c_rate', 'conversion_rate', 'revenue_per_query', 'gross_purchase', 'purchases'],
-            index=0,
-            key='sort_by'
-        )
-    with sort_order:
-        ascending = st.checkbox("Ascending", value=False, key='ascending')
-
-    display_df = display_df.sort_values(sort_by, ascending=ascending).reset_index(drop=True)
-
-    # Calculate cumulative % based on current sort (by queries)
-    total_queries_st = display_df['queries'].sum()
-    display_df['query_pct'] = (display_df['queries'] / total_queries_st * 100)
-    display_df['cumulative_queries'] = display_df['queries'].cumsum()
-    display_df['cumulative_pct'] = (display_df['cumulative_queries'] / total_queries_st * 100)
-
-    # Format for display
-    display_formatted = display_df.copy()
-    display_formatted['query_pct'] = display_formatted['query_pct'].apply(lambda x: f"{x:.2f}%")
-    display_formatted['cumulative_pct'] = display_formatted['cumulative_pct'].apply(lambda x: f"{x:.2f}%")
-    display_formatted['ctr'] = display_formatted['ctr'].apply(lambda x: f"{x*100:.2f}%")
-    display_formatted['a2c_rate'] = display_formatted['a2c_rate'].apply(lambda x: f"{x*100:.2f}%")
-    display_formatted['conversion_rate'] = display_formatted['conversion_rate'].apply(lambda x: f"{x*100:.2f}%")
-    display_formatted['revenue_per_query'] = display_formatted['revenue_per_query'].apply(lambda x: f"${x:.2f}")
-    display_formatted['gross_purchase'] = display_formatted['gross_purchase'].apply(lambda x: f"${format_number(x)}")
-    display_formatted['avg_order_value'] = display_formatted['avg_order_value'].apply(lambda x: f"${x:.2f}")
-
-    # Rename columns for display
-    display_formatted = display_formatted.rename(columns={
-        'query_pct': '% of queries',
-        'cumulative_pct': 'cumulative %'
-    })
-
-    # Select columns to display
-    display_cols = [
-        'search_term', 'queries', '% of queries', 'cumulative %', 'ctr', 'a2c_rate', 'conversion_rate',
-        'revenue_per_query', 'purchases', 'gross_purchase', 'avg_order_value'
-    ]
-
-    st.dataframe(
-        display_formatted[display_cols],
-        use_container_width=True,
-        hide_index=True,
-        height=600
-    )
-
-    # Download button
-    csv = display_df.to_csv(index=False)
-    st.download_button(
-        label="Download Search Term Data (CSV)",
-        data=csv,
-        file_name=f"search_terms_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.csv",
-        mime="text/csv"
-    )
-else:
-    st.info("No search term data available with current filters.")
-
-st.divider()
-
-# Section 7: Hierarchical Pivot Table
+# Hierarchical Pivot Table
 st.header("📊 Hierarchical Pivot Table")
 st.markdown("""
 <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 1rem 1.5rem; border-radius: 8px; margin-bottom: 1rem; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);">
@@ -905,6 +769,10 @@ st.markdown("""
 # Initialize session state for expanded rows
 if 'expanded_paths' not in st.session_state:
     st.session_state.expanded_paths = set()
+
+# Initialize session state for pivot row trend viewing
+if 'pivot_row_for_trend' not in st.session_state:
+    st.session_state.pivot_row_for_trend = None
 
 # Calculate number of days in selected period
 num_days = (end_date - start_date).days + 1
@@ -984,12 +852,15 @@ if len(st.session_state.dimension_order) > 0:
 selected_dimension_names = st.session_state.dimension_order
 
 # Column visibility configuration
-all_available_columns = ['queries', 'search_term_count', 'average_queries_per_day', 'average_queries_per_search_term_per_day', 'search_terms_for_top_x_pct', '% of queries', 'cumulative %', 'ctr', 'a2c_rate', 'conversion_rate', 'revenue_per_query', 'purchases', 'gross_purchase', 'avg_order_value']
+all_available_columns = ['queries', 'search_term_count', 'average_queries_per_day', 'average_queries_per_search_term_per_day', 'search_terms_for_top_x_pct', '% of queries', 'cumulative %', 'ctr', 'a2c_rate', 'conversion_rate', 'pdp_conversion', 'revenue_per_query', 'purchases', 'gross_purchase', 'avg_order_value']
+
+# Metrics that make sense for time-series trending (exclude counts, percentages, cumulative values)
+TRENDABLE_METRICS = ['queries', 'ctr', 'a2c_rate', 'conversion_rate', 'pdp_conversion', 'revenue_per_query', 'purchases', 'gross_purchase', 'avg_order_value']
 
 # Initialize or migrate visible_columns
 if 'visible_columns' not in st.session_state:
-    st.session_state.visible_columns = ['queries', 'search_term_count', 'average_queries_per_search_term_per_day', 'search_terms_for_top_x_pct', '% of queries', 'cumulative %', 'ctr', 'conversion_rate', 'revenue_per_query']
-else:
+    st.session_state.visible_columns = None  # None = show all columns by default
+elif st.session_state.visible_columns is not None:
     # Migrate old column names to new ones and filter out any invalid values
     migrated = []
     for col in st.session_state.visible_columns:
@@ -1007,22 +878,51 @@ else:
     st.session_state.visible_columns = [col for col in migrated if col in all_available_columns]
 
 # Ensure default only contains valid options
-valid_defaults = [col for col in st.session_state.visible_columns if col in all_available_columns]
+if st.session_state.visible_columns is None:
+    valid_defaults = all_available_columns  # None = all columns
+else:
+    valid_defaults = [col for col in st.session_state.visible_columns if col in all_available_columns]
+    # Force update session state if migration resulted in changes
+    if set(valid_defaults) != set(st.session_state.visible_columns):
+        st.session_state.visible_columns = valid_defaults
 
 visible_columns = st.multiselect(
     "Select columns to display",
     options=all_available_columns,
     default=valid_defaults,
-    key='column_selector'
+    help="Select specific columns to display. Leave empty to show only the dimension column."
 )
 
-# Update session state
-if visible_columns:
-    st.session_state.visible_columns = visible_columns
+# Update session state - allow empty list to persist
+st.session_state.visible_columns = visible_columns if visible_columns else []
 
 # Global settings
-col_thresh, col_search, col_concentration = st.columns([2, 2, 2])
-with col_thresh:
+# Check if search_terms_for_top_x_pct is visible (either None=all or explicitly selected)
+show_concentration = (st.session_state.visible_columns is None or
+                     'search_terms_for_top_x_pct' in st.session_state.visible_columns)
+if show_concentration:
+    col_thresh, col_concentration = st.columns([2, 2])
+    with col_thresh:
+        cumulative_threshold = st.slider(
+            "Cumulative threshold %",
+            min_value=50,
+            max_value=100,
+            value=80,
+            step=5,
+            key='cumulative_threshold_hierarchy',
+            help="Show rows until this cumulative % is reached, aggregate the rest as 'Other'"
+        )
+    with col_concentration:
+        search_term_concentration_pct = st.slider(
+            "Search term concentration %",
+            min_value=50,
+            max_value=100,
+            value=80,
+            step=5,
+            key='search_term_concentration',
+            help="Calculate how many search terms account for top X% of queries within each dimension value"
+        )
+else:
     cumulative_threshold = st.slider(
         "Cumulative threshold %",
         min_value=50,
@@ -1032,16 +932,7 @@ with col_thresh:
         key='cumulative_threshold_hierarchy',
         help="Show rows until this cumulative % is reached, aggregate the rest as 'Other'"
     )
-with col_concentration:
-    search_term_concentration_pct = st.slider(
-        "Search term concentration %",
-        min_value=50,
-        max_value=100,
-        value=80,
-        step=5,
-        key='search_term_concentration',
-        help="Calculate how many search terms account for top X% of queries within each dimension value"
-    )
+    search_term_concentration_pct = 80  # Default value when not visible
 
 # Search term aggregation threshold
 col_search1, col_search2 = st.columns([2, 3])
@@ -1061,7 +952,187 @@ sort_configs = [{'sort_by': 'queries', 'ascending': False} for _ in range(len(se
 
 if len(selected_dimension_names) == 0:
     # Show Grand Total when no dimensions selected
-    st.info("Select dimensions above to see detailed breakdowns by Attribute Combination, Number of Words, Channel, etc.")
+    st.subheader("📊 Total")
+
+    # Initialize session state for total row expansion
+    if 'pivot_expanded' not in st.session_state:
+        st.session_state.pivot_expanded = {}
+    if 'pivot_selected_row' not in st.session_state:
+        st.session_state.pivot_selected_row = None
+
+    # Create a single Total row using the KPI data already calculated
+    total_row = pd.DataFrame([{
+        'dimension_value': 'Total',
+        'queries': kpis['total_queries'],
+        'search_term_count': kpis['search_term_count'],
+        'average_queries_per_day': kpis['average_queries_per_day'],
+        'average_queries_per_search_term_per_day': kpis['average_queries_per_search_term_per_day'],
+        'search_terms_for_top_x_pct': kpis['search_terms_for_top_80_pct'],
+        'pct_of_total': 100.0,
+        'cumulative_pct': 100.0,
+        'ctr': kpis['avg_ctr'],
+        'a2c_rate': 0.0,  # Not in KPIs, set to 0
+        'conversion_rate': kpis['avg_conversion'],
+        'pdp_conversion': kpis['avg_pdp_conversion'],
+        'revenue_per_query': kpis['revenue_per_query'],
+        'purchases': kpis['total_purchases'],
+        'gross_purchase': kpis['total_revenue'],
+        'avg_order_value': kpis['avg_order_value']
+    }])
+
+    # Add tracking columns
+    total_row['_row_id'] = 'total_row'
+    total_row['_level'] = 0
+    total_row['_type'] = 'total'
+
+    # Rename for display
+    total_row = total_row.rename(columns={'pct_of_total': '% of queries', 'cumulative_pct': 'cumulative %'})
+
+    # Format the display dataframe
+    display_total = total_row.copy()
+    display_total['Total'] = '▶ ' + display_total['dimension_value']
+
+    # Format numeric columns
+    display_total['queries'] = display_total['queries'].apply(lambda x: format_number(x))
+    display_total['search_term_count'] = display_total['search_term_count'].apply(lambda x: format_number(x))
+    display_total['average_queries_per_day'] = display_total['average_queries_per_day'].apply(lambda x: f"{x:.1f}")
+    display_total['average_queries_per_search_term_per_day'] = display_total['average_queries_per_search_term_per_day'].apply(lambda x: f"{x:.2f}")
+    display_total['search_terms_for_top_x_pct'] = display_total['search_terms_for_top_x_pct'].apply(lambda x: format_number(x))
+    display_total['% of queries'] = display_total['% of queries'].apply(lambda x: f"{x:.2f}%")
+    display_total['cumulative %'] = display_total['cumulative %'].apply(lambda x: f"{x:.2f}%")
+    display_total['ctr'] = display_total['ctr'].apply(lambda x: f"{x*100:.2f}%")
+    display_total['a2c_rate'] = display_total['a2c_rate'].apply(lambda x: f"{x*100:.2f}%")
+    display_total['conversion_rate'] = display_total['conversion_rate'].apply(lambda x: f"{x*100:.2f}%")
+    display_total['pdp_conversion'] = display_total['pdp_conversion'].apply(lambda x: f"{x*100:.2f}%")
+    display_total['revenue_per_query'] = display_total['revenue_per_query'].apply(lambda x: f"${x:.2f}")
+    display_total['purchases'] = display_total['purchases'].apply(lambda x: format_number(x))
+    display_total['gross_purchase'] = display_total['gross_purchase'].apply(lambda x: f"${format_number(x)}")
+    display_total['avg_order_value'] = display_total['avg_order_value'].apply(lambda x: f"${format_number(x)}")
+
+    # Select columns to display based on visible_columns
+    display_cols = ['Total']
+    if st.session_state.visible_columns is None:
+        display_cols.extend(all_available_columns)
+    else:
+        display_cols.extend(st.session_state.visible_columns)
+
+    # Remove duplicates while preserving order and filter to only existing columns
+    display_cols = list(dict.fromkeys(display_cols))
+    display_cols = [col for col in display_cols if col in display_total.columns]
+
+    # Display the table
+    event = st.dataframe(
+        display_total[display_cols],
+        use_container_width=True,
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        key='total_pivot_table'
+    )
+
+    # Handle row selection and expansion
+    if event and event.selection and event.selection.rows:
+        selected_idx = event.selection.rows[0]
+        row_id = total_row.iloc[selected_idx]['_row_id']
+
+        # Toggle expansion
+        if row_id in st.session_state.pivot_expanded:
+            del st.session_state.pivot_expanded[row_id]
+            st.rerun()
+        else:
+            st.session_state.pivot_expanded[row_id] = {'type': 'search', 'page': 0}
+            st.rerun()
+
+    # Show expanded search terms if total row is expanded
+    if 'total_row' in st.session_state.pivot_expanded:
+        with st.spinner('Loading search terms...'):
+            # Query all search terms with base filters only
+            search_query = dp.build_drill_down_query(
+                st.session_state.bq_params['table'],
+                base_filters,
+                {},  # No dimension filters
+                None
+            )
+            search_terms = dp.execute_cached_query(st.session_state.bq_client, search_query, ttl=300)
+
+            if not search_terms.empty:
+                # Calculate derived metrics
+                search_terms['ctr'] = np.where(search_terms['queries'] > 0, search_terms['queries_pdp'] / search_terms['queries'], 0)
+                search_terms['a2c_rate'] = np.where(search_terms['queries'] > 0, search_terms['queries_a2c'] / search_terms['queries'], 0)
+                search_terms['conversion_rate'] = np.where(search_terms['queries'] > 0, search_terms['purchases'] / search_terms['queries'], 0)
+                search_terms['pdp_conversion'] = np.where(search_terms['queries_pdp'] > 0, search_terms['purchases'] / search_terms['queries_pdp'], 0)
+                search_terms['revenue_per_query'] = np.where(search_terms['queries'] > 0, search_terms['gross_purchase'] / search_terms['queries'], 0)
+                search_terms['avg_order_value'] = np.where(search_terms['purchases'] > 0, search_terms['gross_purchase'] / search_terms['purchases'], 0)
+
+                # Add calculated columns
+                search_terms['search_term_count'] = 1  # Each row is one search term
+                search_terms['average_queries_per_day'] = search_terms['queries'] / num_days
+                search_terms['average_queries_per_search_term_per_day'] = search_terms['queries'] / num_days
+                search_terms['search_terms_for_top_x_pct'] = 0  # Not applicable for individual search terms
+
+                # Calculate percentages
+                search_terms['pct_of_total'] = (search_terms['queries'] / kpis['total_queries'] * 100) if kpis['total_queries'] > 0 else 0
+                total_queries_search = search_terms['queries'].sum()
+                search_terms['cumulative_queries'] = search_terms['queries'].cumsum()
+                search_terms['cumulative_pct'] = (search_terms['cumulative_queries'] / total_queries_search * 100) if total_queries_search > 0 else 0
+
+                # Pagination
+                search_page_size = 10
+                expansion_info = st.session_state.pivot_expanded['total_row']
+                search_current_page = expansion_info['page']
+                search_total_pages = (len(search_terms) + search_page_size - 1) // search_page_size
+                search_start_idx = search_current_page * search_page_size
+                search_end_idx = min(search_start_idx + search_page_size, len(search_terms))
+                search_page = search_terms.iloc[search_start_idx:search_end_idx].copy()
+
+                # Format for display
+                search_display = search_page.copy()
+                search_display = search_display.rename(columns={'pct_of_total': '% of queries', 'cumulative_pct': 'cumulative %'})
+
+                # Format columns
+                search_display['queries'] = search_display['queries'].apply(lambda x: format_number(x))
+                search_display['search_term_count'] = search_display['search_term_count'].apply(lambda x: format_number(x))
+                search_display['average_queries_per_day'] = search_display['average_queries_per_day'].apply(lambda x: f"{x:.1f}")
+                search_display['average_queries_per_search_term_per_day'] = search_display['average_queries_per_search_term_per_day'].apply(lambda x: f"{x:.2f}")
+                search_display['search_terms_for_top_x_pct'] = search_display['search_terms_for_top_x_pct'].apply(lambda x: format_number(x))
+                search_display['% of queries'] = search_display['% of queries'].apply(lambda x: f"{x:.2f}%")
+                search_display['cumulative %'] = search_display['cumulative %'].apply(lambda x: f"{x:.2f}%")
+                search_display['ctr'] = search_display['ctr'].apply(lambda x: f"{x*100:.2f}%")
+                search_display['a2c_rate'] = search_display['a2c_rate'].apply(lambda x: f"{x*100:.2f}%")
+                search_display['conversion_rate'] = search_display['conversion_rate'].apply(lambda x: f"{x*100:.2f}%")
+                search_display['pdp_conversion'] = search_display['pdp_conversion'].apply(lambda x: f"{x*100:.2f}%")
+                search_display['revenue_per_query'] = search_display['revenue_per_query'].apply(lambda x: f"${x:.2f}")
+                search_display['purchases'] = search_display['purchases'].apply(lambda x: format_number(x))
+                search_display['gross_purchase'] = search_display['gross_purchase'].apply(lambda x: f"${format_number(x)}")
+                search_display['avg_order_value'] = search_display['avg_order_value'].apply(lambda x: f"${format_number(x)}")
+
+                # Select columns to display
+                search_cols = ['search_term']
+                if st.session_state.visible_columns is None:
+                    search_cols.extend(all_available_columns)
+                else:
+                    search_cols.extend(st.session_state.visible_columns)
+
+                st.dataframe(search_display[search_cols], use_container_width=True, hide_index=True)
+
+                # Pagination controls
+                if search_total_pages > 1:
+                    col1, col2, col3 = st.columns([1, 2, 1])
+                    with col1:
+                        if search_current_page > 0:
+                            if st.button("◀ Previous", key='total_search_prev'):
+                                st.session_state.pivot_expanded['total_row']['page'] -= 1
+                                st.rerun()
+                    with col2:
+                        st.write(f"Page {search_current_page + 1} of {search_total_pages} ({len(search_terms)} search terms)")
+                    with col3:
+                        if search_current_page < search_total_pages - 1:
+                            if st.button("Next ▶", key='total_search_next'):
+                                st.session_state.pivot_expanded['total_row']['page'] += 1
+                                st.rerun()
+            else:
+                st.info("No search terms found.")
+
 else:
     # Convert dimension names to keys
     selected_dimension_keys = [dimensions[name] for name in selected_dimension_names]
@@ -1074,6 +1145,82 @@ else:
 
     # Current level is always 0 for main table (no navigation)
     current_level = 0
+
+    # Date range visualization - show which dates are included/excluded
+    total_days = (max_date - min_date).days + 1
+    date_segments = []
+
+    # Create list of all dates with their status (included or excluded)
+    current_date = pd.to_datetime(min_date)
+    max_date_pd = pd.to_datetime(max_date)
+
+    while current_date <= max_date_pd:
+        is_included = False
+
+        # Check if date is in the main range (when not using advanced mode)
+        if not use_advanced and start_date <= current_date <= end_date:
+            is_included = True
+
+        # Check additional date ranges (when using advanced mode)
+        if use_advanced and st.session_state.additional_date_ranges:
+            for date_range in st.session_state.additional_date_ranges:
+                range_start = pd.to_datetime(date_range[0])
+                range_end = pd.to_datetime(date_range[1])
+                if range_start <= current_date <= range_end:
+                    is_included = True
+                    break
+
+        # Check excluded date ranges (always applies)
+        if is_included and st.session_state.excluded_date_ranges:
+            for date_range in st.session_state.excluded_date_ranges:
+                range_start = pd.to_datetime(date_range[0])
+                range_end = pd.to_datetime(date_range[1])
+                if range_start <= current_date <= range_end:
+                    is_included = False
+                    break
+
+        date_segments.append({
+            'date': current_date,
+            'included': is_included
+        })
+        current_date += pd.Timedelta(days=1)
+
+    # Group consecutive dates with same status into segments for efficient rendering
+    visual_segments = []
+    if date_segments:
+        current_segment = {'start': date_segments[0]['date'], 'included': date_segments[0]['included'], 'count': 1}
+
+        for segment in date_segments[1:]:
+            if segment['included'] == current_segment['included']:
+                current_segment['count'] += 1
+            else:
+                visual_segments.append(current_segment)
+                current_segment = {'start': segment['date'], 'included': segment['included'], 'count': 1}
+        visual_segments.append(current_segment)
+
+    # Create HTML segments
+    segment_html = ""
+    for seg in visual_segments:
+        width_pct = (seg['count'] / total_days) * 100
+        color = "#10b981" if seg['included'] else "#d1d5db"  # green-500 : gray-300
+        segment_html += f'<div style="width: {width_pct}%; background-color: {color}; height: 100%;"></div>'
+
+    # Render date range visualization
+    st.markdown(f"""
+    <div style="margin-bottom: 1rem;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
+            <span style="font-size: 0.875rem; font-weight: 600; color: #374151;">Date Range Coverage</span>
+            <span style="font-size: 0.75rem; color: #6b7280;">{min_date.strftime('%Y-%m-%d')} to {max_date.strftime('%Y-%m-%d')}</span>
+        </div>
+        <div style="display: flex; width: 100%; height: 24px; border-radius: 4px; overflow: hidden; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);">
+            {segment_html}
+        </div>
+        <div style="display: flex; justify-content: space-between; margin-top: 0.5rem; font-size: 0.75rem; color: #6b7280;">
+            <span><span style="display: inline-block; width: 12px; height: 12px; background-color: #10b981; border-radius: 2px; margin-right: 4px; vertical-align: middle;"></span>Included</span>
+            <span><span style="display: inline-block; width: 12px; height: 12px; background-color: #d1d5db; border-radius: 2px; margin-right: 4px; vertical-align: middle;"></span>Excluded</span>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
     # Query data for current level
     try:
@@ -1106,6 +1253,8 @@ else:
                                                   pivot_data['queries_a2c'] / pivot_data['queries'], 0)
                 pivot_data['conversion_rate'] = np.where(pivot_data['queries'] > 0,
                                                          pivot_data['purchases'] / pivot_data['queries'], 0)
+                pivot_data['pdp_conversion'] = np.where(pivot_data['queries_pdp'] > 0,
+                                                     pivot_data['purchases'] / pivot_data['queries_pdp'], 0)
                 pivot_data['revenue_per_query'] = np.where(pivot_data['queries'] > 0,
                                                            pivot_data['gross_purchase'] / pivot_data['queries'], 0)
                 pivot_data['avg_order_value'] = np.where(pivot_data['purchases'] > 0,
@@ -1127,26 +1276,70 @@ else:
                 # Calculate cumulative % based on current row order
                 pivot_data = add_cumulative_percentage(pivot_data, total_queries_all, 'queries')
 
-                # Calculate search terms for top X% for each dimension value
-                pivot_data['search_terms_for_top_x_pct'] = pivot_data['dimension_value'].apply(
-                    lambda val: calculate_terms_for_top_pct(
+                # Calculate search terms for top X% only if column is visible (batch optimization)
+                show_concentration_calc = (st.session_state.visible_columns is None or
+                                          'search_terms_for_top_x_pct' in st.session_state.visible_columns)
+                if show_concentration_calc:
+                    dimension_values_list = pivot_data['dimension_value'].tolist()
+
+                    # Check if there's an "Other" row and get its constituent values
+                    other_values_dict = None
+                    if 'Other' in dimension_values_list:
+                        # Get the values that are NOT in the explicit list (i.e., the "Other" values)
+                        explicit_values = [v for v in dimension_values_list if v != 'Other']
+                        other_values = dp.get_other_dimension_values(
+                            st.session_state.bq_client,
+                            st.session_state.bq_params['table'],
+                            base_filters,
+                            current_dimension_key,
+                            explicit_values
+                        )
+                        if other_values:
+                            other_values_dict = {'Other': other_values}
+
+                    concentration_dict = dp.calculate_batch_search_terms_concentration(
                         st.session_state.bq_client,
                         st.session_state.bq_params['table'],
                         base_filters,
                         current_dimension_key,
-                        val,
-                        search_term_concentration_pct
+                        dimension_values_list,
+                        search_term_concentration_pct,
+                        other_values_dict
                     )
-                )
+                    # Map the results to the dataframe
+                    pivot_data['search_terms_for_top_x_pct'] = pivot_data['dimension_value'].map(
+                        lambda val: concentration_dict.get(val, 0)
+                    )
+                else:
+                    # Set to 0 if column not visible (won't be displayed anyway)
+                    pivot_data['search_terms_for_top_x_pct'] = 0
 
                 # Display level header
                 st.subheader(f"📊 Level {current_level + 1}: {current_dimension_name}")
 
                 if not pivot_data.empty:
-                    # Format data for display
+                    # Format data for display with all dimension columns
                     display_data = pivot_data.copy()
+
+                    # Add row tracking column (hidden from display but used for selection)
+                    display_data['_row_id'] = display_data['dimension_value'].apply(lambda x: f"{current_dimension_key}_{x}")
+                    display_data['_level'] = current_level
+                    display_data['_type'] = 'dimension'
+
+                    # Add columns for all dimension levels + search term
+                    for i, dim_name in enumerate(selected_dimension_names):
+                        if i == current_level:
+                            # Current level - populate with data and add expansion indicator
+                            display_data[dim_name] = '▶ ' + display_data['dimension_value'].astype(str)
+                        else:
+                            # Other levels - empty for now
+                            display_data[dim_name] = ''
+
+                    # Add empty search term column
+                    display_data['Search Term'] = ''
+
+                    # Rename metric columns
                     display_data = display_data.rename(columns={
-                        'dimension_value': current_dimension_name,
                         'queries': 'queries',
                         'search_term_count': 'search_term_count',
                         'average_queries_per_day': 'average_queries_per_day',
@@ -1179,57 +1372,56 @@ else:
                     display_formatted['ctr'] = display_formatted['ctr'].apply(lambda x: f"{x*100:.2f}%")
                     display_formatted['a2c_rate'] = display_formatted['a2c_rate'].apply(lambda x: f"{x*100:.2f}%")
                     display_formatted['conversion_rate'] = display_formatted['conversion_rate'].apply(lambda x: f"{x*100:.2f}%")
+                    if 'pdp_conversion' in display_formatted.columns:
+                        display_formatted['pdp_conversion'] =display_formatted['pdp_conversion'].apply(lambda x: f"{x*100:.2f}%")
                     display_formatted['purchases'] = display_formatted['purchases'].apply(lambda x: f"{int(x):,}")
                     display_formatted['revenue_per_query'] = display_formatted['revenue_per_query'].apply(lambda x: f"${x:,.2f}")
                     display_formatted['gross_purchase'] = display_formatted['gross_purchase'].apply(lambda x: f"${format_number(x)}")
                     display_formatted['avg_order_value'] = display_formatted['avg_order_value'].apply(lambda x: f"${format_number(x)}")
 
-                    # Filter to only show selected columns + dimension column
-                    columns_to_show = [current_dimension_name] + [col for col in st.session_state.visible_columns if col in display_formatted.columns]
+                    # Filter to only show selected columns + all dimension columns
+                    # Dimension columns are always shown, tracking columns are hidden
+                    dimension_cols = selected_dimension_names + ['Search Term']
+                    tracking_cols = ['_row_id', '_level', '_type']
+
+                    if st.session_state.visible_columns is None:
+                        # None = show all columns (default) except tracking
+                        columns_to_show = [col for col in display_formatted.columns if col not in tracking_cols]
+                    elif len(st.session_state.visible_columns) == 0:
+                        # [] = show only dimension columns
+                        columns_to_show = [col for col in dimension_cols if col in display_formatted.columns]
+                    else:
+                        # Specific columns selected + dimension columns, exclude tracking
+                        columns_to_show = dimension_cols + [col for col in st.session_state.visible_columns if col in display_formatted.columns and col not in dimension_cols]
+                        columns_to_show = [col for col in columns_to_show if col not in tracking_cols]
+
                     # Remove duplicates while preserving order
                     seen = set()
-                    columns_to_show = [col for col in columns_to_show if not (col in seen or seen.add(col))]
-                    display_formatted = display_formatted[columns_to_show]
+                    columns_to_show = [col for col in columns_to_show if col in display_formatted.columns and not (col in seen or seen.add(col))]
 
-                    # Check if there's an expanded row and merge data
-                    expanded_row_idx = None
-                    expanded_value = None
-                    if st.session_state.pivot_selected_row:
-                        # Extract the selected value from row_id
-                        row_id = st.session_state.pivot_selected_row
-                        if row_id in st.session_state.pivot_expanded:
-                            # Extract value from row_id format: "dimension_key_value"
-                            expanded_value = row_id.replace(f"{current_dimension_key}_", "", 1)
-                            # Find the row in formatted display data by matching the dimension value
-                            for idx in range(len(display_formatted)):
-                                if pivot_data.iloc[idx]['dimension_value'] == expanded_value:
-                                    expanded_row_idx = idx
-                                    break
+                    # Create display version (without tracking columns) and keep full version for selection handling
+                    display_formatted_full = display_formatted.copy()  # Keep tracking columns for selection
+                    display_formatted = display_formatted[columns_to_show]  # Display without tracking
 
-                    # Build combined table with expanded rows
+                    # Check if we have any base-level expansions
+                    # Find ALL base rows that are expanded
+                    expanded_base_rows = []
+                    for idx in range(len(display_formatted)):
+                        base_value = pivot_data.iloc[idx]['dimension_value']
+                        base_row_id = f"{current_dimension_key}_{base_value}"
+                        if base_row_id in st.session_state.pivot_expanded:
+                            expanded_base_rows.append((idx, base_value, base_row_id))
+
+                    # For now, support only first expansion (single expansion mode)
+                    if len(expanded_base_rows) > 0:
+                        expanded_row_idx, selected_value, row_id = expanded_base_rows[0]
+                    else:
+                        expanded_row_idx = None
+
                     if expanded_row_idx is not None:
-                        selected_value = pivot_data.iloc[expanded_row_idx]['dimension_value']
-                        row_id = st.session_state.pivot_selected_row
                         expansion_info = st.session_state.pivot_expanded[row_id]
 
-                        # Expansion controls
-                        col1, col2, col3 = st.columns(3)
-                        with col1:
-                            if current_level < len(selected_dimension_keys) - 1:
-                                if st.button("🔽 Next Dimension", key='expand_dimension', use_container_width=True):
-                                    st.session_state.pivot_expanded[row_id] = {'type': 'dimension', 'page': 0}
-                                    st.rerun()
-                        with col2:
-                            if st.button("🔍 Search Terms", key='expand_search', use_container_width=True):
-                                st.session_state.pivot_expanded[row_id] = {'type': 'search', 'page': 0}
-                                st.rerun()
-                        with col3:
-                            if st.button("⬆ Collapse", key='collapse', use_container_width=True):
-                                del st.session_state.pivot_expanded[row_id]
-                                st.session_state.pivot_selected_row = None
-                                st.rerun()
-
-                        # Build combined dataframe with search terms inline
+                        # Build combined dataframe with expanded rows inline
                         if expansion_info['type'] == 'search':
                             # Query for search terms
                             drill_query = dp.build_drill_down_query(
@@ -1248,6 +1440,8 @@ else:
                                                                     search_terms['queries_a2c'] / search_terms['queries'], 0)
                                 search_terms['conversion_rate'] = np.where(search_terms['queries'] > 0,
                                                                            search_terms['purchases'] / search_terms['queries'], 0)
+                                search_terms['pdp_conversion'] = np.where(search_terms['queries_pdp'] > 0,
+                                                                       search_terms['purchases'] / search_terms['queries_pdp'], 0)
                                 search_terms['revenue_per_query'] = np.where(search_terms['queries'] > 0,
                                                                              search_terms['gross_purchase'] / search_terms['queries'], 0)
                                 search_terms['avg_order_value'] = np.where(search_terms['purchases'] > 0,
@@ -1279,11 +1473,23 @@ else:
                                 end_idx = min(start_idx + page_size, len(search_terms))
                                 search_page = search_terms.iloc[start_idx:end_idx].copy()
 
-                                # Format search terms for merging - rename search_term to match main table column
+                                # Format search terms with separate columns
                                 search_display = search_page.copy()
-                                search_display = search_display.rename(columns={'search_term': current_dimension_name})
+
+                                # Add row tracking columns (search terms aren't expandable, use unique ID)
+                                search_display['_row_id'] = search_display['search_term'].apply(lambda x: f"search_{current_dimension_key}_{selected_value}_{x}")
+                                search_display['_level'] = -1  # Special level for search terms
+                                search_display['_type'] = 'search'
+
+                                # Add columns for all dimension levels - all empty except Search Term
+                                for dim_name in selected_dimension_names:
+                                    search_display[dim_name] = ''
+
+                                # Populate Search Term column
+                                search_display['Search Term'] = search_display['search_term'].astype(str)
 
                                 # Format numbers exactly like main table
+                                search_display['queries'] = search_display['queries'].apply(lambda x: f"{int(x):,}")
                                 search_display['% of queries'] = search_display['pct_of_total'].apply(lambda x: f"{x:.2f}%")
                                 search_display['cumulative %'] = search_display['cumulative_pct'].apply(lambda x: f"{x:.2f}%")
                                 if 'average_queries_per_day' in search_display.columns:
@@ -1293,7 +1499,10 @@ else:
                                 search_display['ctr'] = search_display['ctr'].apply(lambda x: f"{x*100:.2f}%")
                                 search_display['a2c_rate'] = search_display['a2c_rate'].apply(lambda x: f"{x*100:.2f}%")
                                 search_display['conversion_rate'] = search_display['conversion_rate'].apply(lambda x: f"{x*100:.2f}%")
+                                if 'pdp_conversion' in search_display.columns:
+                                    search_display['pdp_conversion'] =search_display['pdp_conversion'].apply(lambda x: f"{x*100:.2f}%")
                                 search_display['revenue_per_query'] = search_display['revenue_per_query'].apply(lambda x: f"${x:.2f}")
+                                search_display['purchases'] = search_display['purchases'].apply(lambda x: f"{int(x):,}")
                                 search_display['gross_purchase'] = search_display['gross_purchase'].apply(lambda x: f"${format_number(x)}")
                                 search_display['avg_order_value'] = search_display['avg_order_value'].apply(lambda x: f"${format_number(x)}")
 
@@ -1303,26 +1512,100 @@ else:
                                 for col in main_cols:
                                     if col not in search_display.columns:
                                         search_display[col] = ''
-                                # Reorder to match main table exactly
+
+                                # Save full version with tracking columns BEFORE filtering
+                                search_display_full = search_display.copy()
+
+                                # Reorder to match main table exactly (removes tracking columns)
                                 search_display = search_display[main_cols]
 
-                                # Prepend indent to search terms
-                                search_display[current_dimension_name] = '    ↳ ' + search_display[current_dimension_name].astype(str)
+                                # Change parent row's ▶ to ▼ to show it's expanded
+                                parent_row = display_formatted.iloc[expanded_row_idx].copy()
+                                parent_row[current_dimension_name] = parent_row[current_dimension_name].replace('▶ ', '▼ ')
 
-                                # Build combined table: rows before + selected row + search terms + rows after
-                                combined_table = pd.concat([
-                                    display_formatted.iloc[:expanded_row_idx+1],
-                                    search_display,
-                                    display_formatted.iloc[expanded_row_idx+1:]
-                                ], ignore_index=True)
+                                # Also build full version with tracking columns for selection handling
+                                parent_row_full = display_formatted_full.iloc[expanded_row_idx].copy()
+                                parent_row_full[current_dimension_name] = parent_row_full[current_dimension_name].replace('▶ ', '▼ ')
 
-                                # Display combined table
-                                st.dataframe(
+                                # Build combined table with modified parent row
+                                if expanded_row_idx > 0:
+                                    combined_table = pd.concat([
+                                        display_formatted.iloc[:expanded_row_idx],
+                                        pd.DataFrame([parent_row]),
+                                        search_display,
+                                        display_formatted.iloc[expanded_row_idx+1:]
+                                    ], ignore_index=True)
+                                    combined_table_full = pd.concat([
+                                        display_formatted_full.iloc[:expanded_row_idx],
+                                        pd.DataFrame([parent_row_full]),
+                                        search_display_full,  # Use full version with tracking columns
+                                        display_formatted_full.iloc[expanded_row_idx+1:]
+                                    ], ignore_index=True)
+                                else:
+                                    combined_table = pd.concat([
+                                        pd.DataFrame([parent_row]),
+                                        search_display,
+                                        display_formatted.iloc[expanded_row_idx+1:]
+                                    ], ignore_index=True)
+                                    combined_table_full = pd.concat([
+                                        pd.DataFrame([parent_row_full]),
+                                        search_display_full,  # Use full version with tracking columns
+                                        display_formatted_full.iloc[expanded_row_idx+1:]
+                                    ], ignore_index=True)
+
+                                # Store full version for selection handling
+                                st.session_state.pivot_combined_full = combined_table_full
+
+                                # Display combined table with selection enabled
+                                selection = st.dataframe(
                                     combined_table,
                                     use_container_width=True,
                                     hide_index=True,
-                                    height=600
+                                    height=600,
+                                    on_select="rerun",
+                                    selection_mode="single-row"
                                 )
+
+                                # Handle row selection from combined table - search terms are not expandable
+                                # but we might click parent dimension rows to collapse
+                                if selection and len(selection.selection.rows) > 0:
+                                    selected_idx = selection.selection.rows[0]
+                                    selected_row = combined_table_full.iloc[selected_idx]
+
+                                    # Also store this row for trend viewing
+                                    selected_row_data = combined_table.iloc[selected_idx]
+                                    dimension_filters, display_name = extract_dimension_filters_from_row(
+                                        selected_row_data,
+                                        selected_dimension_keys,
+                                        selected_dimension_names
+                                    )
+                                    st.session_state.pivot_row_for_trend = {
+                                        'dimension_filters': dimension_filters,
+                                        'display_name': display_name
+                                    }
+
+                                    # Check row type from tracking columns
+                                    row_type = selected_row['_type']
+                                    row_id = selected_row['_row_id']
+
+                                    if row_type == 'dimension':
+                                        # Clicked on a dimension row - check if it's the expanded parent
+                                        if row_id in st.session_state.pivot_expanded:
+                                            # Clicking expanded row collapses it
+                                            del st.session_state.pivot_expanded[row_id]
+                                            st.session_state.pivot_selected_row = None
+                                            st.rerun()
+                                        else:
+                                            # Try to expand this dimension row
+                                            row_level = int(selected_row['_level'])
+                                            if row_level < len(selected_dimension_keys) - 1:
+                                                expansion_type = 'dimension'
+                                            else:
+                                                expansion_type = 'search'
+                                            st.session_state.pivot_expanded[row_id] = {'type': expansion_type, 'page': 0}
+                                            st.session_state.pivot_selected_row = row_id
+                                            st.rerun()
+                                    # If row_type == 'search', do nothing (search terms aren't expandable)
 
                                 # Pagination controls
                                 st.markdown(f"**Page {current_page + 1} of {total_pages}** (showing {start_idx + 1}-{end_idx} of {len(search_terms)} search terms)")
@@ -1346,14 +1629,546 @@ else:
                                     height=600
                                 )
                                 st.info("No search terms found")
-                        else:
-                            # Dimension expansion - keep original behavior for now
-                            st.dataframe(
-                                display_formatted,
-                                use_container_width=True,
-                                hide_index=True,
-                                height=600
+                        elif expansion_info['type'] == 'dimension':
+                            # Dimension expansion - query next dimension level
+                            next_level = current_level + 1
+
+                            # Check if next level is valid
+                            if next_level >= len(selected_dimension_keys):
+                                st.warning(f"Invalid expansion detected. Clearing and reloading...")
+                                # Clear invalid expansion from state
+                                del st.session_state.pivot_expanded[row_id]
+                                if row_id == st.session_state.pivot_selected_row:
+                                    st.session_state.pivot_selected_row = None
+                                st.rerun()
+
+                            next_dimension_key = selected_dimension_keys[next_level]
+                            next_dimension_name = selected_dimension_names[next_level]
+
+                            # Query next dimension filtered by parent
+                            next_sort_config = sort_configs[next_level] if next_level < len(sort_configs) else {'sort_by': 'queries', 'ascending': False}
+
+                            next_query = dp.build_dimension_level_query(
+                                st.session_state.bq_params['table'],
+                                base_filters,
+                                next_dimension_key,
+                                parent_filters={current_dimension_key: selected_value},
+                                cumulative_threshold=cumulative_threshold / 100.0,
+                                sort_by=next_sort_config['sort_by'],
+                                ascending=next_sort_config['ascending'],
+                                volume_threshold=volume_threshold,
+                                daily_volume_threshold=daily_volume_threshold
                             )
+                            dimension_data = dp.execute_cached_query(st.session_state.bq_client, next_query, ttl=300)
+
+                            if not dimension_data.empty:
+                                # Calculate derived metrics
+                                dimension_data['ctr'] = np.where(dimension_data['queries'] > 0,
+                                                                 dimension_data['queries_pdp'] / dimension_data['queries'], 0)
+                                dimension_data['a2c_rate'] = np.where(dimension_data['queries'] > 0,
+                                                                      dimension_data['queries_a2c'] / dimension_data['queries'], 0)
+                                dimension_data['conversion_rate'] = np.where(dimension_data['queries'] > 0,
+                                                                             dimension_data['purchases'] / dimension_data['queries'], 0)
+                                dimension_data['pdp_conversion'] = np.where(dimension_data['queries_pdp'] > 0,
+                                                                         dimension_data['purchases'] / dimension_data['queries_pdp'], 0)
+                                dimension_data['revenue_per_query'] = np.where(dimension_data['queries'] > 0,
+                                                                               dimension_data['gross_purchase'] / dimension_data['queries'], 0)
+                                dimension_data['avg_order_value'] = np.where(dimension_data['purchases'] > 0,
+                                                                             dimension_data['gross_purchase'] / dimension_data['purchases'], 0)
+                                if 'average_queries_per_day' not in dimension_data.columns:
+                                    dimension_data['average_queries_per_day'] = dimension_data['queries'] / num_days
+                                if 'average_queries_per_search_term_per_day' not in dimension_data.columns:
+                                    if 'search_term_count' in dimension_data.columns:
+                                        dimension_data['average_queries_per_search_term_per_day'] = dimension_data['queries'] / num_days / dimension_data['search_term_count']
+                                    else:
+                                        dimension_data['average_queries_per_search_term_per_day'] = 0
+
+                                # Calculate percentages
+                                dimension_data['pct_of_total'] = (dimension_data['queries'] / total_queries_all * 100) if total_queries_all > 0 else 0
+                                total_queries_dim = dimension_data['queries'].sum()
+                                dimension_data['cumulative_queries'] = dimension_data['queries'].cumsum()
+                                dimension_data['cumulative_pct'] = (dimension_data['cumulative_queries'] / total_queries_dim * 100) if total_queries_dim > 0 else 0
+
+                                # Paginate
+                                page_size = 5
+                                current_page = expansion_info['page']
+                                total_pages = (len(dimension_data) + page_size - 1) // page_size
+                                start_idx = current_page * page_size
+                                end_idx = min(start_idx + page_size, len(dimension_data))
+                                dimension_page = dimension_data.iloc[start_idx:end_idx].copy()
+
+                                # Format dimension data for display with separate columns
+                                dimension_display = dimension_page.copy()
+
+                                # Add row tracking columns
+                                dimension_display['_row_id'] = dimension_display['dimension_value'].apply(lambda x: f"{next_dimension_key}_{x}")
+                                dimension_display['_level'] = next_level
+                                dimension_display['_type'] = 'dimension'
+
+                                # Add columns for all dimension levels
+                                for i, dim_name in enumerate(selected_dimension_names):
+                                    if i < current_level:
+                                        # Parent dimensions - leave empty
+                                        dimension_display[dim_name] = ''
+                                    elif i == next_level:
+                                        # Current child dimension - populate with data and add indicator
+                                        # Check if this can be expanded further
+                                        if next_level < len(selected_dimension_keys) - 1:
+                                            dimension_display[dim_name] = '▶ ' + dimension_display['dimension_value'].astype(str)
+                                        else:
+                                            dimension_display[dim_name] = dimension_display['dimension_value'].astype(str)
+                                    else:
+                                        # Other dimensions - empty
+                                        dimension_display[dim_name] = ''
+
+                                # Add empty search term column
+                                dimension_display['Search Term'] = ''
+
+                                # Format numbers
+                                dimension_display['queries'] = dimension_display['queries'].apply(lambda x: f"{int(x):,}")
+                                if 'search_term_count' in dimension_display.columns:
+                                    dimension_display['search_term_count'] = dimension_display['search_term_count'].apply(lambda x: f"{int(x):,}")
+                                if 'average_queries_per_day' in dimension_display.columns:
+                                    dimension_display['average_queries_per_day'] = dimension_display['average_queries_per_day'].apply(lambda x: f"{int(x):,}")
+                                if 'average_queries_per_search_term_per_day' in dimension_display.columns:
+                                    dimension_display['average_queries_per_search_term_per_day'] = dimension_display['average_queries_per_search_term_per_day'].apply(lambda x: f"{x:.1f}")
+                                dimension_display['% of queries'] = dimension_display['pct_of_total'].apply(lambda x: f"{x:.2f}%")
+                                dimension_display['cumulative %'] = dimension_display['cumulative_pct'].apply(lambda x: f"{x:.2f}%")
+                                dimension_display['ctr'] = dimension_display['ctr'].apply(lambda x: f"{x*100:.2f}%")
+                                dimension_display['a2c_rate'] = dimension_display['a2c_rate'].apply(lambda x: f"{x*100:.2f}%")
+                                dimension_display['conversion_rate'] = dimension_display['conversion_rate'].apply(lambda x: f"{x*100:.2f}%")
+                                if 'pdp_conversion' in dimension_display.columns:
+                                    dimension_display['pdp_conversion'] =dimension_display['pdp_conversion'].apply(lambda x: f"{x*100:.2f}%")
+                                dimension_display['revenue_per_query'] = dimension_display['revenue_per_query'].apply(lambda x: f"${x:.2f}")
+                                dimension_display['purchases'] = dimension_display['purchases'].apply(lambda x: f"{int(x):,}")
+                                dimension_display['gross_purchase'] = dimension_display['gross_purchase'].apply(lambda x: f"${format_number(x)}")
+                                dimension_display['avg_order_value'] = dimension_display['avg_order_value'].apply(lambda x: f"${format_number(x)}")
+
+                                # Match columns from main table
+                                main_cols = display_formatted.columns.tolist()
+                                for col in main_cols:
+                                    if col not in dimension_display.columns:
+                                        dimension_display[col] = ''
+
+                                # Save full version with tracking columns BEFORE filtering
+                                dimension_display_full = dimension_display.copy()
+
+                                # Now filter for display (remove tracking columns)
+                                dimension_display = dimension_display[main_cols]
+
+                                # Change parent row's ▶ to ▼ to show it's expanded
+                                parent_row = display_formatted.iloc[expanded_row_idx].copy()
+                                parent_row[current_dimension_name] = parent_row[current_dimension_name].replace('▶ ', '▼ ')
+
+                                # Also build full version with tracking columns for selection handling
+                                parent_row_full = display_formatted_full.iloc[expanded_row_idx].copy()
+                                parent_row_full[current_dimension_name] = parent_row_full[current_dimension_name].replace('▶ ', '▼ ')
+
+                                # Build combined table with modified parent row
+                                if expanded_row_idx > 0:
+                                    combined_table = pd.concat([
+                                        display_formatted.iloc[:expanded_row_idx],
+                                        pd.DataFrame([parent_row]),
+                                        dimension_display,
+                                        display_formatted.iloc[expanded_row_idx+1:]
+                                    ], ignore_index=True)
+                                    combined_table_full = pd.concat([
+                                        display_formatted_full.iloc[:expanded_row_idx],
+                                        pd.DataFrame([parent_row_full]),
+                                        dimension_display_full,  # Use full version with tracking columns
+                                        display_formatted_full.iloc[expanded_row_idx+1:]
+                                    ], ignore_index=True)
+                                else:
+                                    combined_table = pd.concat([
+                                        pd.DataFrame([parent_row]),
+                                        dimension_display,
+                                        display_formatted.iloc[expanded_row_idx+1:]
+                                    ], ignore_index=True)
+                                    combined_table_full = pd.concat([
+                                        pd.DataFrame([parent_row_full]),
+                                        dimension_display_full,  # Use full version with tracking columns
+                                        display_formatted_full.iloc[expanded_row_idx+1:]
+                                    ], ignore_index=True)
+
+                                # Check if any of the child dimension rows are also expanded (nested expansion)
+                                # Look for any row_ids in dimension_display_full that are in pivot_expanded
+                                nested_expansion_idx = None
+                                nested_expansion_row_id = None
+                                for child_idx in range(len(dimension_display_full)):
+                                    child_row_id = dimension_display_full.iloc[child_idx]['_row_id']
+                                    if child_row_id in st.session_state.pivot_expanded:
+                                        nested_expansion_idx = child_idx
+                                        nested_expansion_row_id = child_row_id
+                                        break  # For now, support only one nested expansion
+
+                                if nested_expansion_idx is not None:
+                                    # Implement full nested expansion building
+                                    nested_expansion_info = st.session_state.pivot_expanded[nested_expansion_row_id]
+
+                                    # Parse the nested row_id to extract dimension info
+                                    # Format: {dimension_key}_{dimension_value}
+                                    nested_row = dimension_display_full.iloc[nested_expansion_idx]
+                                    child_dimension_value = nested_row['dimension_value']
+                                    child_level = int(nested_row['_level'])
+                                    child_dimension_key = selected_dimension_keys[child_level]
+
+                                    # Skip expansion for "Other" rows (they aggregate multiple values and cannot be drilled down)
+                                    if child_dimension_value != "Other":
+                                        # Build accumulated parent filters (both original parent and child)
+                                        accumulated_filters = {
+                                            current_dimension_key: selected_value,
+                                            child_dimension_key: child_dimension_value
+                                        }
+
+                                        # Determine what to expand (next dimension or search terms)
+                                        if child_level < len(selected_dimension_keys) - 1:
+                                            # Expand to next dimension level
+                                            grandchild_level = child_level + 1
+                                            grandchild_dimension_key = selected_dimension_keys[grandchild_level]
+                                            grandchild_dimension_name = selected_dimension_names[grandchild_level]
+
+                                            # Query for next dimension level
+                                            grandchild_sort_config = sort_configs[grandchild_level] if grandchild_level < len(sort_configs) else {'sort_by': 'queries', 'ascending': False}
+
+                                            grandchild_query = dp.build_dimension_level_query(
+                                                st.session_state.bq_params['table'],
+                                                base_filters,
+                                                grandchild_dimension_key,
+                                                parent_filters=accumulated_filters,
+                                                cumulative_threshold=cumulative_threshold / 100.0,
+                                                sort_by=grandchild_sort_config['sort_by'],
+                                                ascending=grandchild_sort_config['ascending'],
+                                                volume_threshold=volume_threshold,
+                                                daily_volume_threshold=daily_volume_threshold
+                                            )
+                                            grandchild_data = dp.execute_cached_query(st.session_state.bq_client, grandchild_query, ttl=300)
+
+                                            if not grandchild_data.empty:
+                                                # Calculate derived metrics
+                                                grandchild_data['ctr'] = np.where(grandchild_data['queries'] > 0,
+                                                                                 grandchild_data['queries_pdp'] / grandchild_data['queries'], 0)
+                                                grandchild_data['a2c_rate'] = np.where(grandchild_data['queries'] > 0,
+                                                                                      grandchild_data['queries_a2c'] / grandchild_data['queries'], 0)
+                                                grandchild_data['conversion_rate'] = np.where(grandchild_data['queries'] > 0,
+                                                                                             grandchild_data['purchases'] / grandchild_data['queries'], 0)
+                                                grandchild_data['pdp_conversion'] = np.where(grandchild_data['queries_pdp'] > 0,
+                                                                                         grandchild_data['purchases'] / grandchild_data['queries_pdp'], 0)
+                                                grandchild_data['revenue_per_query'] = np.where(grandchild_data['queries'] > 0,
+                                                                                               grandchild_data['gross_purchase'] / grandchild_data['queries'], 0)
+                                                grandchild_data['avg_order_value'] = np.where(grandchild_data['purchases'] > 0,
+                                                                                             grandchild_data['gross_purchase'] / grandchild_data['purchases'], 0)
+                                                if 'average_queries_per_day' not in grandchild_data.columns:
+                                                    grandchild_data['average_queries_per_day'] = grandchild_data['queries'] / num_days
+                                                if 'average_queries_per_search_term_per_day' not in grandchild_data.columns:
+                                                    if 'search_term_count' in grandchild_data.columns:
+                                                        grandchild_data['average_queries_per_search_term_per_day'] = grandchild_data['queries'] / num_days / grandchild_data['search_term_count']
+                                                    else:
+                                                        grandchild_data['average_queries_per_search_term_per_day'] = 0
+
+                                                # Calculate percentages
+                                                grandchild_data['pct_of_total'] = (grandchild_data['queries'] / total_queries_all * 100) if total_queries_all > 0 else 0
+                                                total_queries_grandchild = grandchild_data['queries'].sum()
+                                                grandchild_data['cumulative_queries'] = grandchild_data['queries'].cumsum()
+                                                grandchild_data['cumulative_pct'] = (grandchild_data['cumulative_queries'] / total_queries_grandchild * 100) if total_queries_grandchild > 0 else 0
+
+                                                # Paginate
+                                                grandchild_page_size = 5
+                                                grandchild_current_page = nested_expansion_info['page']
+                                                grandchild_total_pages = (len(grandchild_data) + grandchild_page_size - 1) // grandchild_page_size
+                                                grandchild_start_idx = grandchild_current_page * grandchild_page_size
+                                                grandchild_end_idx = min(grandchild_start_idx + grandchild_page_size, len(grandchild_data))
+                                                grandchild_page = grandchild_data.iloc[grandchild_start_idx:grandchild_end_idx].copy()
+
+                                                # Format grandchild dimension data
+                                                grandchild_display = grandchild_page.copy()
+
+                                                # Add row tracking columns
+                                                grandchild_display['_row_id'] = grandchild_display['dimension_value'].apply(lambda x: f"{grandchild_dimension_key}_{x}")
+                                                grandchild_display['_level'] = grandchild_level
+                                                grandchild_display['_type'] = 'dimension'
+
+                                                # Add columns for all dimension levels
+                                                for i, dim_name in enumerate(selected_dimension_names):
+                                                    if i < child_level:
+                                                        grandchild_display[dim_name] = ''
+                                                    elif i == grandchild_level:
+                                                        # Grandchild dimension - check if expandable
+                                                        if grandchild_level < len(selected_dimension_keys) - 1:
+                                                            grandchild_display[dim_name] = '▶ ' + grandchild_display['dimension_value'].astype(str)
+                                                        else:
+                                                            grandchild_display[dim_name] = grandchild_display['dimension_value'].astype(str)
+                                                    else:
+                                                        grandchild_display[dim_name] = ''
+
+                                                grandchild_display['Search Term'] = ''
+
+                                                # Format numbers
+                                                grandchild_display['queries'] = grandchild_display['queries'].apply(lambda x: f"{int(x):,}")
+                                                if 'search_term_count' in grandchild_display.columns:
+                                                    grandchild_display['search_term_count'] = grandchild_display['search_term_count'].apply(lambda x: f"{int(x):,}")
+                                                if 'average_queries_per_day' in grandchild_display.columns:
+                                                    grandchild_display['average_queries_per_day'] = grandchild_display['average_queries_per_day'].apply(lambda x: f"{int(x):,}")
+                                                if 'average_queries_per_search_term_per_day' in grandchild_display.columns:
+                                                    grandchild_display['average_queries_per_search_term_per_day'] = grandchild_display['average_queries_per_search_term_per_day'].apply(lambda x: f"{x:.1f}")
+                                                grandchild_display['% of queries'] = grandchild_display['pct_of_total'].apply(lambda x: f"{x:.2f}%")
+                                                grandchild_display['cumulative %'] = grandchild_display['cumulative_pct'].apply(lambda x: f"{x:.2f}%")
+                                                grandchild_display['ctr'] = grandchild_display['ctr'].apply(lambda x: f"{x*100:.2f}%")
+                                                grandchild_display['a2c_rate'] = grandchild_display['a2c_rate'].apply(lambda x: f"{x*100:.2f}%")
+                                                grandchild_display['conversion_rate'] = grandchild_display['conversion_rate'].apply(lambda x: f"{x*100:.2f}%")
+                                                if 'pdp_conversion' in grandchild_display.columns:
+                                                    grandchild_display['pdp_conversion'] =grandchild_display['pdp_conversion'].apply(lambda x: f"{x*100:.2f}%")
+                                                grandchild_display['revenue_per_query'] = grandchild_display['revenue_per_query'].apply(lambda x: f"${x:.2f}")
+                                                grandchild_display['purchases'] = grandchild_display['purchases'].apply(lambda x: f"{int(x):,}")
+                                                grandchild_display['gross_purchase'] = grandchild_display['gross_purchase'].apply(lambda x: f"${format_number(x)}")
+                                                grandchild_display['avg_order_value'] = grandchild_display['avg_order_value'].apply(lambda x: f"${format_number(x)}")
+
+                                                # Match columns from main table
+                                                for col in main_cols:
+                                                    if col not in grandchild_display.columns:
+                                                        grandchild_display[col] = ''
+
+                                                grandchild_display_full = grandchild_display.copy()
+                                                grandchild_display = grandchild_display[main_cols]
+
+                                                # Update child row to show it's expanded (▶ to ▼)
+                                                nested_child_row = dimension_display.iloc[nested_expansion_idx].copy()
+                                                nested_child_row[next_dimension_name] = nested_child_row[next_dimension_name].replace('▶ ', '▼ ')
+
+                                                nested_child_row_full = dimension_display_full.iloc[nested_expansion_idx].copy()
+                                                nested_child_row_full[next_dimension_name] = nested_child_row_full[next_dimension_name].replace('▶ ', '▼ ')
+
+                                                # Rebuild dimension_display with grandchildren inserted
+                                                if nested_expansion_idx > 0:
+                                                    dimension_display = pd.concat([
+                                                        dimension_display.iloc[:nested_expansion_idx],
+                                                        pd.DataFrame([nested_child_row]),
+                                                        grandchild_display,
+                                                        dimension_display.iloc[nested_expansion_idx+1:]
+                                                    ], ignore_index=True)
+                                                    dimension_display_full = pd.concat([
+                                                        dimension_display_full.iloc[:nested_expansion_idx],
+                                                        pd.DataFrame([nested_child_row_full]),
+                                                        grandchild_display_full,
+                                                        dimension_display_full.iloc[nested_expansion_idx+1:]
+                                                    ], ignore_index=True)
+                                                else:
+                                                    dimension_display = pd.concat([
+                                                        pd.DataFrame([nested_child_row]),
+                                                        grandchild_display,
+                                                        dimension_display.iloc[nested_expansion_idx+1:]
+                                                    ], ignore_index=True)
+                                                    dimension_display_full = pd.concat([
+                                                        pd.DataFrame([nested_child_row_full]),
+                                                        grandchild_display_full,
+                                                        dimension_display_full.iloc[nested_expansion_idx+1:]
+                                                    ], ignore_index=True)
+
+                                        else:
+                                            # Expand to search terms (leaf level)
+                                            search_query = dp.build_drill_down_query(
+                                                st.session_state.bq_params['table'],
+                                                base_filters,
+                                                accumulated_filters,
+                                                None
+                                            )
+                                            grandchild_search_terms = dp.execute_cached_query(st.session_state.bq_client, search_query, ttl=300)
+
+                                            if not grandchild_search_terms.empty:
+                                                # Calculate derived metrics
+                                                grandchild_search_terms['ctr'] = np.where(grandchild_search_terms['queries'] > 0,
+                                                                                         grandchild_search_terms['queries_pdp'] / grandchild_search_terms['queries'], 0)
+                                                grandchild_search_terms['a2c_rate'] = np.where(grandchild_search_terms['queries'] > 0,
+                                                                                              grandchild_search_terms['queries_a2c'] / grandchild_search_terms['queries'], 0)
+                                                grandchild_search_terms['conversion_rate'] = np.where(grandchild_search_terms['queries'] > 0,
+                                                                                                     grandchild_search_terms['purchases'] / grandchild_search_terms['queries'], 0)
+                                                grandchild_search_terms['pdp_conversion'] = np.where(grandchild_search_terms['queries_pdp'] > 0,
+                                                                                                 grandchild_search_terms['purchases'] / grandchild_search_terms['queries_pdp'], 0)
+                                                grandchild_search_terms['revenue_per_query'] = np.where(grandchild_search_terms['queries'] > 0,
+                                                                                                       grandchild_search_terms['gross_purchase'] / grandchild_search_terms['queries'], 0)
+                                                grandchild_search_terms['avg_order_value'] = np.where(grandchild_search_terms['purchases'] > 0,
+                                                                                                     grandchild_search_terms['gross_purchase'] / grandchild_search_terms['purchases'], 0)
+                                                if 'average_queries_per_day' not in grandchild_search_terms.columns:
+                                                    grandchild_search_terms['average_queries_per_day'] = grandchild_search_terms['queries'] / num_days
+                                                if 'average_queries_per_search_term_per_day' not in grandchild_search_terms.columns:
+                                                    grandchild_search_terms['average_queries_per_search_term_per_day'] = grandchild_search_terms['queries'] / num_days
+
+                                                # Calculate percentages
+                                                grandchild_search_terms['pct_of_total'] = (grandchild_search_terms['queries'] / total_queries_all * 100) if total_queries_all > 0 else 0
+                                                total_queries_search = grandchild_search_terms['queries'].sum()
+                                                grandchild_search_terms['cumulative_queries'] = grandchild_search_terms['queries'].cumsum()
+                                                grandchild_search_terms['cumulative_pct'] = (grandchild_search_terms['cumulative_queries'] / total_queries_search * 100) if total_queries_search > 0 else 0
+
+                                                # Paginate search terms
+                                                search_page_size = 5
+                                                search_current_page = nested_expansion_info['page']
+                                                search_total_pages = (len(grandchild_search_terms) + search_page_size - 1) // search_page_size
+                                                search_start_idx = search_current_page * search_page_size
+                                                search_end_idx = min(search_start_idx + search_page_size, len(grandchild_search_terms))
+                                                search_page = grandchild_search_terms.iloc[search_start_idx:search_end_idx].copy()
+
+                                                # Format search terms display
+                                                grandchild_search_display = search_page.copy()
+
+                                                # Add row tracking columns
+                                                grandchild_search_display['_row_id'] = grandchild_search_display['search_term'].apply(
+                                                    lambda x: f"search_{child_dimension_key}_{child_dimension_value}_{x}"
+                                                )
+                                                grandchild_search_display['_level'] = -1
+                                                grandchild_search_display['_type'] = 'search'
+
+                                                # Add columns for all dimension levels
+                                                for dim_name in selected_dimension_names:
+                                                    grandchild_search_display[dim_name] = ''
+
+                                                grandchild_search_display['Search Term'] = grandchild_search_display['search_term'].astype(str)
+
+                                                # Format numbers
+                                                grandchild_search_display['queries'] = grandchild_search_display['queries'].apply(lambda x: f"{int(x):,}")
+                                                grandchild_search_display['% of queries'] = grandchild_search_display['pct_of_total'].apply(lambda x: f"{x:.2f}%")
+                                                grandchild_search_display['cumulative %'] = grandchild_search_display['cumulative_pct'].apply(lambda x: f"{x:.2f}%")
+                                                if 'average_queries_per_day' in grandchild_search_display.columns:
+                                                    grandchild_search_display['average_queries_per_day'] = grandchild_search_display['average_queries_per_day'].apply(lambda x: f"{int(x):,}")
+                                                if 'average_queries_per_search_term_per_day' in grandchild_search_display.columns:
+                                                    grandchild_search_display['average_queries_per_search_term_per_day'] = grandchild_search_display['average_queries_per_search_term_per_day'].apply(lambda x: f"{x:.1f}")
+                                                grandchild_search_display['ctr'] = grandchild_search_display['ctr'].apply(lambda x: f"{x*100:.2f}%")
+                                                grandchild_search_display['a2c_rate'] = grandchild_search_display['a2c_rate'].apply(lambda x: f"{x*100:.2f}%")
+                                                grandchild_search_display['conversion_rate'] = grandchild_search_display['conversion_rate'].apply(lambda x: f"{x*100:.2f}%")
+                                                if 'pdp_conversion' in grandchild_search_display.columns:
+                                                    grandchild_search_display['pdp_conversion'] =grandchild_search_display['pdp_conversion'].apply(lambda x: f"{x*100:.2f}%")
+                                                grandchild_search_display['revenue_per_query'] = grandchild_search_display['revenue_per_query'].apply(lambda x: f"${x:.2f}")
+                                                grandchild_search_display['purchases'] = grandchild_search_display['purchases'].apply(lambda x: f"{int(x):,}")
+                                                grandchild_search_display['gross_purchase'] = grandchild_search_display['gross_purchase'].apply(lambda x: f"${format_number(x)}")
+                                                grandchild_search_display['avg_order_value'] = grandchild_search_display['avg_order_value'].apply(lambda x: f"${format_number(x)}")
+
+                                                # Match columns from main table
+                                                for col in main_cols:
+                                                    if col not in grandchild_search_display.columns:
+                                                        grandchild_search_display[col] = ''
+
+                                                grandchild_search_display_full = grandchild_search_display.copy()
+                                                grandchild_search_display = grandchild_search_display[main_cols]
+
+                                                # Update child row to show it's expanded
+                                                nested_child_row = dimension_display.iloc[nested_expansion_idx].copy()
+                                                nested_child_row[next_dimension_name] = nested_child_row[next_dimension_name].replace('▶ ', '▼ ')
+
+                                                nested_child_row_full = dimension_display_full.iloc[nested_expansion_idx].copy()
+                                                nested_child_row_full[next_dimension_name] = nested_child_row_full[next_dimension_name].replace('▶ ', '▼ ')
+
+                                                # Rebuild dimension_display with search terms inserted
+                                                if nested_expansion_idx > 0:
+                                                    dimension_display = pd.concat([
+                                                        dimension_display.iloc[:nested_expansion_idx],
+                                                        pd.DataFrame([nested_child_row]),
+                                                        grandchild_search_display,
+                                                        dimension_display.iloc[nested_expansion_idx+1:]
+                                                    ], ignore_index=True)
+                                                    dimension_display_full = pd.concat([
+                                                        dimension_display_full.iloc[:nested_expansion_idx],
+                                                        pd.DataFrame([nested_child_row_full]),
+                                                        grandchild_search_display_full,
+                                                        dimension_display_full.iloc[nested_expansion_idx+1:]
+                                                    ], ignore_index=True)
+                                                else:
+                                                    dimension_display = pd.concat([
+                                                        pd.DataFrame([nested_child_row]),
+                                                        grandchild_search_display,
+                                                        dimension_display.iloc[nested_expansion_idx+1:]
+                                                    ], ignore_index=True)
+                                                    dimension_display_full = pd.concat([
+                                                        pd.DataFrame([nested_child_row_full]),
+                                                        grandchild_search_display_full,
+                                                        dimension_display_full.iloc[nested_expansion_idx+1:]
+                                                    ], ignore_index=True)
+
+                                # Now rebuild combined_table with the updated dimension_display that includes nested expansions
+                                if expanded_row_idx > 0:
+                                    combined_table = pd.concat([
+                                        display_formatted.iloc[:expanded_row_idx],
+                                        pd.DataFrame([parent_row]),
+                                        dimension_display,
+                                        display_formatted.iloc[expanded_row_idx+1:]
+                                    ], ignore_index=True)
+                                    combined_table_full = pd.concat([
+                                        display_formatted_full.iloc[:expanded_row_idx],
+                                        pd.DataFrame([parent_row_full]),
+                                        dimension_display_full,
+                                        display_formatted_full.iloc[expanded_row_idx+1:]
+                                    ], ignore_index=True)
+                                else:
+                                    combined_table = pd.concat([
+                                        pd.DataFrame([parent_row]),
+                                        dimension_display,
+                                        display_formatted.iloc[expanded_row_idx+1:]
+                                    ], ignore_index=True)
+                                    combined_table_full = pd.concat([
+                                        pd.DataFrame([parent_row_full]),
+                                        dimension_display_full,
+                                        display_formatted_full.iloc[expanded_row_idx+1:]
+                                    ], ignore_index=True)
+
+                                # Store full version for selection handling
+                                st.session_state.pivot_combined_full = combined_table_full
+
+                                # Display combined table with selection enabled
+                                selection = st.dataframe(
+                                    combined_table,
+                                    use_container_width=True,
+                                    hide_index=True,
+                                    height=600,
+                                    on_select="rerun",
+                                    selection_mode="single-row"
+                                )
+
+                                # Handle row selection from combined table - child dimensions can be expanded further
+                                if selection and len(selection.selection.rows) > 0:
+                                    selected_idx = selection.selection.rows[0]
+                                    selected_row = combined_table_full.iloc[selected_idx]
+
+                                    # Check row type from tracking columns
+                                    row_type = selected_row['_type']
+                                    row_id = selected_row['_row_id']
+
+                                    if row_type == 'dimension':
+                                        # Clicked on a dimension row - check if it's already expanded
+                                        if row_id in st.session_state.pivot_expanded:
+                                            # Clicking expanded row collapses it
+                                            del st.session_state.pivot_expanded[row_id]
+                                            st.session_state.pivot_selected_row = None
+                                            st.rerun()
+                                        else:
+                                            # Try to expand this dimension row
+                                            row_level = int(selected_row['_level'])
+                                            if row_level < len(selected_dimension_keys) - 1:
+                                                expansion_type = 'dimension'
+                                            else:
+                                                expansion_type = 'search'
+                                            st.session_state.pivot_expanded[row_id] = {'type': expansion_type, 'page': 0}
+                                            st.session_state.pivot_selected_row = row_id
+                                            st.rerun()
+
+                                # Pagination controls
+                                st.markdown(f"**Page {current_page + 1} of {total_pages}** (showing {start_idx + 1}-{end_idx} of {len(dimension_data)} {next_dimension_name} values)")
+                                col_prev, col_next = st.columns(2)
+                                with col_prev:
+                                    if current_page > 0:
+                                        if st.button("← Previous", key='prev_page_dim', use_container_width=True):
+                                            st.session_state.pivot_expanded[row_id]['page'] = current_page - 1
+                                            st.rerun()
+                                with col_next:
+                                    if current_page < total_pages - 1:
+                                        if st.button("Next →", key='next_page_dim', use_container_width=True):
+                                            st.session_state.pivot_expanded[row_id]['page'] = current_page + 1
+                                            st.rerun()
+                            else:
+                                # No dimension data - show regular table
+                                st.dataframe(
+                                    display_formatted,
+                                    use_container_width=True,
+                                    hide_index=True,
+                                    height=600
+                                )
+                                st.info(f"No {next_dimension_name} data found for this selection")
 
                     else:
                         # No expansion - display full table with selection enabled
@@ -1366,33 +2181,42 @@ else:
                             selection_mode="single-row"
                         )
 
-                        # Handle row selection with contextual expansion buttons
+                        # Handle row selection - auto-expand/collapse on click
                         if selection and len(selection.selection.rows) > 0:
                             selected_idx = selection.selection.rows[0]
 
                             selected_value = pivot_data.iloc[selected_idx]['dimension_value']
                             row_id = f"{current_dimension_key}_{selected_value}"
 
-                            # Update selected row
-                            st.session_state.pivot_selected_row = row_id
+                            # Also store this row for trend viewing
+                            selected_row_data = display_formatted.iloc[selected_idx]
+                            dimension_filters, display_name = extract_dimension_filters_from_row(
+                                selected_row_data,
+                                selected_dimension_keys,
+                                selected_dimension_names
+                            )
+                            st.session_state.pivot_row_for_trend = {
+                                'dimension_filters': dimension_filters,
+                                'display_name': display_name
+                            }
 
-                            # Show expansion controls with column-aligned buttons
-                            st.markdown("---")
-                            st.markdown(f"**Selected:** {selected_value}")
-                            st.caption(f"Click **{current_dimension_name}** to expand dimensions, or **% of queries** to view search terms")
-
-                            col1, col2 = st.columns(2)
-                            with col1:
+                            # Check if this row is already expanded
+                            if row_id in st.session_state.pivot_expanded:
+                                # Already expanded - collapse it
+                                del st.session_state.pivot_expanded[row_id]
+                                st.session_state.pivot_selected_row = None
+                                st.rerun()
+                            else:
+                                # Not expanded - expand it
+                                # Default to dimension expansion if possible, otherwise search
                                 if current_level < len(selected_dimension_keys) - 1:
-                                    if st.button(f"📊 {current_dimension_name}", key='expand_dimension_init', use_container_width=True, help="Expand to next dimension level"):
-                                        st.session_state.pivot_expanded[row_id] = {'type': 'dimension', 'page': 0}
-                                        st.rerun()
+                                    expansion_type = 'dimension'
                                 else:
-                                    st.button(f"📊 {current_dimension_name}", key='expand_dimension_disabled', use_container_width=True, disabled=True, help="No more dimensions to expand")
-                            with col2:
-                                if st.button("🔍 % of queries", key='expand_search_init', use_container_width=True, help="View search terms for this value"):
-                                    st.session_state.pivot_expanded[row_id] = {'type': 'search', 'page': 0}
-                                    st.rerun()
+                                    expansion_type = 'search'
+
+                                st.session_state.pivot_expanded[row_id] = {'type': expansion_type, 'page': 0}
+                                st.session_state.pivot_selected_row = row_id
+                                st.rerun()
 
                 else:
                     st.info("No data available for this dimension with current filters.")
@@ -1404,6 +2228,126 @@ else:
         st.error(f"Error loading pivot table: {str(e)}")
         import traceback
         st.code(traceback.format_exc())
+
+# Section 8: Pivot Row Trend Analysis
+st.divider()
+if st.session_state.pivot_row_for_trend is not None:
+    st.header("📈 Trend Analysis for Selected Row")
+
+    trend_data = st.session_state.pivot_row_for_trend
+
+    # Display what's being analyzed
+    st.markdown(f"""
+    <div style="background: linear-gradient(135deg, #10b981 0%, #059669 100%); padding: 0.75rem 1rem; border-radius: 6px; margin-bottom: 1rem;">
+        <p style="margin: 0; color: white; font-weight: 600; font-size: 0.9rem;">Analyzing: {trend_data['display_name']}</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Clear selection button
+    if st.button("✕ Clear Selection", key='clear_trend_selection'):
+        st.session_state.pivot_row_for_trend = None
+        st.rerun()
+
+    # Time granularity selector for trend
+    col_freq, col_metrics = st.columns([1, 2])
+
+    with col_freq:
+        trend_freq_options = {
+            'Daily': 'D',
+            'Weekly': 'W',
+            'Monthly': 'M'
+        }
+        trend_freq_label = st.selectbox(
+            "Time Granularity",
+            options=list(trend_freq_options.keys()),
+            index=0,
+            key='trend_freq'
+        )
+        trend_freq = trend_freq_options[trend_freq_label]
+
+    with col_metrics:
+        # Metric selector for trends - filter to only show metrics that are visible in the pivot table
+        if st.session_state.visible_columns is None or len(st.session_state.visible_columns) == 0:
+            # If no columns selected or None, show all trendable metrics
+            available_trend_metrics = TRENDABLE_METRICS
+        else:
+            # Only show trendable metrics that are currently visible in the pivot
+            available_trend_metrics = [m for m in TRENDABLE_METRICS if m in st.session_state.visible_columns]
+
+        # Ensure default metrics are in the available list
+        default_metrics = ['queries', 'revenue_per_query']
+        default_metrics = [m for m in default_metrics if m in available_trend_metrics]
+        if not default_metrics and available_trend_metrics:
+            default_metrics = [available_trend_metrics[0]]
+
+        trend_metrics = st.multiselect(
+            "Select Metrics to Display",
+            options=available_trend_metrics,
+            default=default_metrics,
+            key='trend_metrics'
+        )
+
+    if trend_metrics:
+        # Build and execute query
+        with st.spinner('Loading trend data...'):
+            try:
+                query = dp.build_timeseries_query_with_dimensions(
+                    st.session_state.bq_params['table'],
+                    base_filters,
+                    trend_data['dimension_filters'],
+                    freq=trend_freq
+                )
+                ts_data = dp.execute_cached_query(st.session_state.bq_client, query, ttl=300)
+
+                if len(ts_data) > 0:
+                    # Calculate derived metrics
+                    ts_data['ctr'] = np.where(ts_data['queries'] > 0, ts_data['queries_pdp'] / ts_data['queries'], 0)
+                    ts_data['a2c_rate'] = np.where(ts_data['queries'] > 0, ts_data['queries_a2c'] / ts_data['queries'], 0)
+                    ts_data['conversion_rate'] = np.where(ts_data['queries'] > 0, ts_data['purchases'] / ts_data['queries'], 0)
+                    ts_data['pdp_conversion'] = np.where(ts_data['queries_pdp'] > 0, ts_data['purchases'] / ts_data['queries_pdp'], 0)
+                    ts_data['revenue_per_query'] = np.where(ts_data['queries'] > 0, ts_data['gross_purchase'] / ts_data['queries'], 0)
+                    ts_data['avg_order_value'] = np.where(ts_data['purchases'] > 0, ts_data['gross_purchase'] / ts_data['purchases'], 0)
+
+                    # Display trend charts
+                    for metric in trend_metrics:
+                        metric_names = {
+                            'queries': 'Total Queries',
+                            'revenue_per_query': 'Revenue per Query',
+                            'ctr': 'Click-Through Rate',
+                            'conversion_rate': 'Conversion Rate',
+                            'a2c_rate': 'Add-to-Cart Rate',
+                            'pdp_conversion': 'PDP Conversion Rate',
+                            'purchases': 'Total Purchases',
+                            'gross_purchase': 'Gross Revenue',
+                            'avg_order_value': 'Average Order Value'
+                        }
+
+                        fig = viz.create_trend_chart(
+                            ts_data,
+                            metric,
+                            title=f"{metric_names.get(metric, metric)} Over Time - {trend_data['display_name']}",
+                            yaxis_title=metric_names.get(metric, metric),
+                            comparison_df=None
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("No data available for the selected trend period.")
+
+            except Exception as e:
+                st.error(f"Error loading trend data: {str(e)}")
+                import traceback
+                st.code(traceback.format_exc())
+    else:
+        st.info("Select at least one metric to display trends.")
+else:
+    # Show instruction to select a row
+    st.markdown("""
+    <div style="background: #f3f4f6; padding: 1rem; border-radius: 6px; border-left: 4px solid #3b82f6;">
+        <p style="margin: 0; color: #374151; font-size: 0.9rem;">
+            💡 <strong>Tip:</strong> Select a row in the pivot table above and click "View Trend" to see how metrics change over time for that specific selection.
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
 
 # Footer
 st.divider()

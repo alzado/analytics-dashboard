@@ -32,7 +32,7 @@ def create_trend_chart(
     fig = go.Figure()
 
     # Check if metric is a rate (should be shown as percentage)
-    rate_metrics = ['ctr', 'a2c_rate', 'conversion_rate']
+    rate_metrics = ['ctr', 'a2c_rate', 'conversion_rate', 'pdp_conversion']
     is_rate = metric in rate_metrics
 
     # Convert to percentage if it's a rate metric
@@ -81,6 +81,7 @@ def create_trend_chart(
         title=title,
         xaxis_title='Date',
         yaxis_title=yaxis_title,
+        yaxis=dict(rangemode='tozero'),
         hovermode='x unified',
         template='plotly_white',
         height=400
