@@ -4,127 +4,163 @@ An interactive dashboard for analyzing customer search behavior in your ecommerc
 
 ## Overview
 
-This Streamlit-based dashboard provides comprehensive analytics on search queries, including:
+This modern React + Python dashboard provides comprehensive analytics on search queries, including:
 
 - **Overview KPIs**: Total queries, revenue, conversion rates, and key metrics
-- **Trend Analysis**: Time-series visualizations with period comparison capabilities
+- **Trend Analysis**: Time-series visualizations with interactive charts
 - **Channel Performance**: Compare metrics across different channels (App/Web)
 - **Search Query Length Analysis**: Performance breakdown by number of words in search queries
 - **Attribute Analysis**:
   - Aggregate view by number of attributes
   - Individual attribute breakdown (categoria, tipo, genero, marca, color, material, talla, modelo)
-- **Search Term Explorer**: Multi-level drill-down to individual search terms
+- **Hierarchical Pivot Table**: Multi-level drill-down with expandable rows
+- **Advanced Filtering**: Date range, countries, channels, and attribute filters
 
-## Currency Conversion
+## Architecture
 
-All monetary values are **automatically converted from CLP to USD** using daily exchange rates:
-- Fetches real-time exchange rates from Frankfurter API
-- Caches rates locally for better performance
-- Falls back to default rate (950 CLP/USD) when API is unavailable
-- All revenue metrics displayed with **$ symbol**
+**Frontend**: Next.js 14 + React + TypeScript
+**Backend**: Python FastAPI
+**Data Source**: Google BigQuery
+**Deployment**: Docker Compose
+
+## Quick Start
+
+### One-Command Start
+
+```bash
+docker-compose up --build
+```
+
+Then open:
+- **Dashboard**: http://localhost:3000
+- **API Docs**: http://localhost:8000/docs
+
+### Stopping the Application
+
+```bash
+docker-compose down
+```
 
 ## Key Metrics Calculated
 
-- **Click-Through Rate (CTR)**: queries_pdp / queries - **displayed as %**
-- **Add-to-Cart Rate**: queries_a2c / queries - **displayed as %**
-- **Conversion Rate**: purchases / queries - **displayed as %**
-- **Revenue per Query**: gross_purchase / queries - **displayed as $**
-- **Average Order Value**: gross_purchase / purchases - **displayed as $**
+- **Click-Through Rate (CTR)**: queries_pdp / queries
+- **Add-to-Cart Rate**: queries_a2c / queries
+- **Conversion Rate**: purchases / queries
+- **PDP Conversion**: purchases / queries_pdp
+- **Revenue per Query**: gross_purchase / queries
+- **Average Order Value**: gross_purchase / purchases
 
-## Installation
+## BigQuery Configuration
 
-1. Install required packages:
-```bash
-pip install -r requirements.txt
-```
-
-## Usage
-
-Run the dashboard with:
-```bash
-streamlit run dashboard.py
-```
-
-The dashboard will open in your default browser at `http://localhost:8501`
+On first run:
+1. Navigate to the "Info" tab in the dashboard
+2. Choose authentication method:
+   - **Application Default Credentials (ADC)**: Run `gcloud auth application-default login` first
+   - **Service Account JSON**: Paste your service account JSON
+3. Enter your BigQuery project ID, dataset, and table name
+4. (Optional) Set date range limits for access control
+5. Click "Connect to BigQuery"
 
 ## Data Format
 
-The dashboard expects a CSV file with the following columns:
+The dashboard expects a BigQuery table with the following columns:
 
-- `country`: Country code
-- `channel`: Channel (e.g., App, Web)
-- `date`: Date of the search
-- `search_term`: The actual search query
-- `n_words_normalized`: Number of words in the search term
-- `n_attributes`: Total number of attributes identified
-- `attr_categoria`, `attr_tipo`, `attr_genero`, `attr_marca`, `attr_color`, `attr_material`, `attr_talla`, `attr_modelo`: Binary flags for identified attributes
-- `visits`: Number of visits
-- `queries`: Number of queries
-- `visits_pdp`: Product detail page visits
-- `queries_pdp`: Queries that led to PDP
-- `visits_a2c`: Add-to-cart visits
-- `queries_a2c`: Queries that led to add-to-cart
-- `purchases`: Number of purchases
-- `gross_purchase`: Revenue generated
+- `date`: DATE - Date of the search
+- `country`: STRING - Country code
+- `channel`: STRING - Channel (e.g., App, Web)
+- `search_term`: STRING - The actual search query
+- `n_words_normalized`: INT64 - Number of words in the search term
+- `n_attributes`: INT64 - Total number of attributes identified
+- `attr_categoria`, `attr_tipo`, `attr_genero`, `attr_marca`, `attr_color`, `attr_material`, `attr_talla`, `attr_modelo`: BOOLEAN - Attribute flags
+- `queries`: INT64 - Number of queries
+- `queries_pdp`: INT64 - Queries that led to PDP
+- `queries_a2c`: INT64 - Queries that led to add-to-cart
+- `purchases`: INT64 - Number of purchases
+- `gross_purchase`: FLOAT64 - Revenue generated
 
 ## Features
 
-### Filters (Sidebar)
+### Filter Sidebar
+- Date range picker (start & end dates)
+- Country and channel dropdowns
+- Number of attributes range (min/max)
+- 8 individual attribute checkboxes
+- Apply/Reset buttons with global state management
 
-- **Date Range**: Select specific date ranges to analyze
-- **Period Comparison**: Compare metrics across different time periods
-- **Country**: Filter by country
-- **Channel**: Filter by channel (App/Web)
-- **Individual Attributes**: Toggle filters for specific attributes
-- **Number of Attributes**: Filter by attribute count range
+### Dashboard Sections
+1. **Overview**: 7 KPI cards with key performance indicators
+2. **Trends**: Time-series charts for queries, purchases, and conversion rates
+3. **Channels**: Channel comparison with 3 detailed charts
+4. **Attributes**: 8 charts analyzing performance by attributes and word count
+5. **Search Terms**: Sortable table with CSV export (top 100 terms)
+6. **Pivot Table**: Hierarchical drill-down with expandable rows
+7. **Info**: BigQuery configuration and connection management
 
-### Interactive Visualizations
+### Advanced Features
+- Column visibility management
+- CSV data export
+- Sortable tables (click column headers)
+- Responsive mobile design
+- Professional loading and error states
 
-- Time-series trend charts with customizable granularity (daily/weekly/monthly)
-- Channel performance comparison charts
-- Attribute performance analysis
-- Top search terms by various metrics
-- Sortable and filterable data tables
+## Development
 
-### Export Capabilities
+### Backend Development
+```bash
+cd backend
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+pip install -r requirements.txt
+uvicorn main:app --reload --port 8000
+```
 
-- Download filtered search term data as CSV
-- All tables support sorting and filtering
+### Frontend Development
+```bash
+cd frontend
+npm install
+npm run dev  # Runs on port 3000
+```
 
-## Dashboard Statistics
+## Project Structure
 
-Current dataset includes:
-- **66,190 data rows**
-- **51,152 unique search terms**
-- **284,884 total queries**
-- **$271,281.60 total revenue (USD)**
-- **1.65% overall conversion rate**
-- **48.68% average CTR**
-- **$0.95 revenue per query**
+```
+├── docker-compose.yml          # Orchestrates frontend + backend
+├── backend/                    # Python FastAPI service
+│   ├── main.py                # API endpoints
+│   ├── config.py              # Configuration management
+│   ├── models/
+│   │   └── schemas.py         # Pydantic models
+│   └── services/
+│       ├── bigquery_service.py  # BigQuery client
+│       └── data_service.py      # Business logic
+│
+└── frontend/                   # Next.js React app
+    ├── app/
+    │   └── page.tsx           # Main dashboard
+    ├── components/
+    │   ├── layout/            # Layout components
+    │   └── sections/          # Dashboard sections
+    └── lib/
+        ├── api.ts             # API client
+        └── contexts/          # React contexts
+```
 
-## File Structure
+## Documentation
 
-- `dashboard.py`: Main Streamlit application
-- `data_processing.py`: Data loading and metric calculation functions
-- `visualizations.py`: Chart creation and visualization functions
-- `requirements.txt`: Python dependencies
-- `bquxjob_6268ac9c_19a163e3339.csv`: Sample data file
+- `CLAUDE.md` - Comprehensive developer guide for working with this codebase
+- `QUICKSTART.md` - Quick start guide for running the application
+- `MIGRATION_README.md` - Architecture details and migration information
+- `FEATURES_COMPLETE.md` - Complete feature list
 
-## Tips for Analysis
+## Technical Stack
 
-1. **Use Period Comparison**: Enable period comparison to understand trends and changes over time
-2. **Filter by Attributes**: Analyze how searches with specific attributes (e.g., color, brand) perform differently
-3. **Explore Top Terms**: Use the search term explorer to identify high-value search queries
-4. **Channel Analysis**: Compare App vs Web performance to optimize channel-specific strategies
-5. **Drill Down**: Start with high-level metrics and drill down to individual search terms for detailed insights
-
-## Technical Details
-
-- **Framework**: Streamlit 1.31+
-- **Data Processing**: Pandas 2.0+
-- **Visualizations**: Plotly 5.18+
-- **Python Version**: 3.9+
+- **Frontend**: Next.js 14, React 18, TypeScript, Tailwind CSS, Recharts, React Query
+- **Backend**: Python 3.9+, FastAPI, Pydantic
+- **Data**: Google BigQuery, Pandas, NumPy
+- **Deployment**: Docker, Docker Compose
 
 ## Support
 
-For issues or questions, please refer to the Streamlit documentation at https://docs.streamlit.io
+For detailed architecture information and development guidance, see `CLAUDE.md`.
+
+For BigQuery setup and troubleshooting, visit the Info tab in the dashboard at http://localhost:3000.

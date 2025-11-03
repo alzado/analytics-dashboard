@@ -1,0 +1,45 @@
+services:
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=development
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+    depends_on:
+      - backend
+    command: npm run dev
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+      # BigQuery configuration (REQUIRED - update these values)
+      - BIGQUERY_PROJECT_ID=${BIGQUERY_PROJECT_ID}
+      - BIGQUERY_DATASET=${BIGQUERY_DATASET}
+      - BIGQUERY_TABLE=${BIGQUERY_TABLE}
+      - BIGQUERY_CREDENTIALS_PATH=${BIGQUERY_CREDENTIALS_PATH:-}
+      # Mount gcloud credentials for ADC
+      - GOOGLE_APPLICATION_CREDENTIALS=/root/.config/gcloud/application_default_credentials.json
+    volumes:
+      - ./backend:/app
+      - bigquery_config:/app/config  # Persist BigQuery configuration
+      # Mount gcloud credentials from host machine for ADC
+      - ${HOME}/.config/gcloud:/root/.config/gcloud:ro
+      # Mount BigQuery credentials if using service account JSON
+      # Uncomment and update path as needed:
+      # - ./path/to/service-account.json:/app/credentials/service-account.json:ro
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+volumes:
+  bigquery_config:
