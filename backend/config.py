@@ -7,6 +7,8 @@ from typing import Optional, Dict
 
 
 CONFIG_FILE = "/app/config/bigquery_config.json"
+CUSTOM_DIMENSIONS_FILE = "/app/config/custom_dimensions.json"
+QUERY_LOGS_DB_PATH = "/app/config/query_logs.db"
 
 
 class Config:

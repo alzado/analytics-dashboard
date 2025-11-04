@@ -1,16 +1,26 @@
 'use client'
 
 import { useState, useEffect, useMemo } from 'react'
-import { X, GripVertical, Settings, Database, Calendar, ChevronDown, ChevronRight } from 'lucide-react'
-import { useQuery } from '@tanstack/react-query'
-import { fetchBigQueryInfo, fetchTableDateRange } from '@/lib/api'
+import { X, GripVertical, Settings, Database, Calendar, ChevronDown, ChevronRight, Plus, Edit, Copy, Trash2 } from 'lucide-react'
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import {
+  fetchBigQueryInfo,
+  fetchTableDateRange,
+  fetchCustomDimensions,
+  createCustomDimension,
+  updateCustomDimension,
+  deleteCustomDimension,
+  duplicateCustomDimension
+} from '@/lib/api'
 import type { PivotConfig } from '@/hooks/use-pivot-config'
+import type { CustomDimension, CustomDimensionCreate, CustomDimensionUpdate } from '@/lib/types'
 import {
   AVAILABLE_METRICS,
   AVAILABLE_DIMENSIONS,
   getDimensionByValue,
   MetricDefinition,
 } from '@/lib/pivot-metrics'
+import CustomDimensionModal from '@/components/modals/custom-dimension-modal'
 
 interface PivotConfigPanelProps {
   isOpen: boolean
@@ -86,6 +96,86 @@ export function PivotConfigPanel({
   const [isMetricsExpanded, setIsMetricsExpanded] = useState(false)
   const [isFiltersExpanded, setIsFiltersExpanded] = useState(false)
 
+  // Custom Dimension Modal State
+  const [isModalOpen, setIsModalOpen] = useState(false)
+  const [modalMode, setModalMode] = useState<'create' | 'edit'>('create')
+  const [editingDimension, setEditingDimension] = useState<CustomDimension | null>(null)
+
+  const queryClient = useQueryClient()
+
+  // Fetch custom dimensions
+  const { data: customDimensions = [], isLoading: customDimensionsLoading } = useQuery({
+    queryKey: ['custom-dimensions'],
+    queryFn: fetchCustomDimensions,
+  })
+
+  // Create custom dimension mutation
+  const createMutation = useMutation({
+    mutationFn: (data: CustomDimensionCreate) => createCustomDimension(data),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['custom-dimensions'] })
+      setIsModalOpen(false)
+    },
+  })
+
+  // Update custom dimension mutation
+  const updateMutation = useMutation({
+    mutationFn: ({ id, data }: { id: string; data: CustomDimensionUpdate }) =>
+      updateCustomDimension(id, data),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['custom-dimensions'] })
+      setIsModalOpen(false)
+      setEditingDimension(null)
+    },
+  })
+
+  // Delete custom dimension mutation
+  const deleteMutation = useMutation({
+    mutationFn: (id: string) => deleteCustomDimension(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['custom-dimensions'] })
+    },
+  })
+
+  // Duplicate custom dimension mutation
+  const duplicateMutation = useMutation({
+    mutationFn: (id: string) => duplicateCustomDimension(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['custom-dimensions'] })
+    },
+  })
+
+  // Modal handlers
+  const handleCreateNewDimension = () => {
+    setModalMode('create')
+    setEditingDimension(null)
+    setIsModalOpen(true)
+  }
+
+  const handleEditDimension = (dimension: CustomDimension) => {
+    setModalMode('edit')
+    setEditingDimension(dimension)
+    setIsModalOpen(true)
+  }
+
+  const handleModalSave = (data: CustomDimensionCreate | { id: string; data: CustomDimensionUpdate }) => {
+    if (modalMode === 'create') {
+      createMutation.mutate(data as CustomDimensionCreate)
+    } else {
+      updateMutation.mutate(data as { id: string; data: CustomDimensionUpdate })
+    }
+  }
+
+  const handleDeleteDimension = (id: string) => {
+    if (confirm('Are you sure you want to delete this custom dimension?')) {
+      deleteMutation.mutate(id)
+    }
+  }
+
+  const handleDuplicateDimension = (id: string) => {
+    duplicateMutation.mutate(id)
+  }
+
   // Fetch BigQuery info to get the configured table
   const { data: bqInfo, isLoading: bqInfoLoading } = useQuery({
     queryKey: ['bigquery-info'],
@@ -125,10 +215,11 @@ export function PivotConfigPanel({
     (m) => !selectedMetrics.includes(m.id)
   )
 
-  // Filter out dimensions that are already selected
+  // Filter out dimensions that are already selected (either as row or table dimensions)
   const selectedDimensions = config.selectedDimensions || []
+  const selectedTableDimensions = config.selectedTableDimensions || []
   const availableDimensionsToAdd = AVAILABLE_DIMENSIONS.filter(
-    (d) => !selectedDimensions.includes(d.value)
+    (d) => !selectedDimensions.includes(d.value) && !selectedTableDimensions.includes(d.value)
   )
 
   // Group available metrics by category
@@ -331,7 +422,7 @@ export function PivotConfigPanel({
             className="w-full flex items-center justify-between mb-2 hover:opacity-70 transition-opacity"
           >
             <h4 className="text-xs font-semibold text-gray-700 uppercase">
-              Dimensions ({availableDimensionsToAdd.length} available)
+              Dimensions ({availableDimensionsToAdd.length + customDimensions.length} available)
             </h4>
             {isDimensionsExpanded ? (
               <ChevronDown className="h-3 w-3 text-gray-500" />
@@ -340,35 +431,120 @@ export function PivotConfigPanel({
             )}
           </button>
           {isDimensionsExpanded && (
-            <div className="space-y-2">
-              {availableDimensionsToAdd.length === 0 ? (
-                <div className="p-4 text-center bg-white border border-gray-200 rounded">
-                  <p className="text-xs text-gray-500">All dimensions added</p>
-                  <p className="text-xs text-gray-400 mt-1">Remove dimensions from table to add more</p>
-                </div>
-              ) : (
-                availableDimensionsToAdd.map((dimension) => (
-                  <div
-                    key={dimension.value}
-                    draggable
-                    onDragStart={(e) => {
-                      e.dataTransfer.setData('type', 'dimension')
-                      e.dataTransfer.setData('value', dimension.value)
-                      e.dataTransfer.setData('label', dimension.label)
-                    }}
-                    className="p-2 bg-green-50 border-2 border-green-300 rounded cursor-move hover:bg-green-100 transition-colors"
-                  >
-                    <div className="flex items-center gap-2">
-                      <GripVertical className="h-3 w-3 text-green-600" />
-                      <div className="flex-1">
-                        <div className="text-xs font-medium text-gray-900">
-                          {dimension.label}
+            <div className="space-y-3">
+              {/* Create Custom Dimension Button */}
+              <button
+                onClick={handleCreateNewDimension}
+                className="w-full p-2 bg-blue-50 border-2 border-dashed border-blue-300 rounded hover:bg-blue-100 transition-colors flex items-center justify-center gap-2 text-blue-600"
+              >
+                <Plus className="h-3 w-3" />
+                <span className="text-xs font-medium">Create Custom Dimension</span>
+              </button>
+
+              {/* Custom Dimensions */}
+              {customDimensions.length > 0 && (
+                <div className="space-y-2">
+                  <h6 className="text-xs font-medium text-gray-600">Custom Dimensions</h6>
+                  {customDimensions.map((dimension) => {
+                    const dimensionValue = `custom_${dimension.id}`
+                    const isSelected = selectedDimensions.includes(dimensionValue) ||
+                                      selectedTableDimensions.includes(dimensionValue)
+
+                    return (
+                      <div
+                        key={dimension.id}
+                        className={`p-2 bg-blue-50 border-2 rounded group ${
+                          isSelected
+                            ? 'border-gray-400 opacity-50 cursor-not-allowed'
+                            : 'border-blue-300 cursor-move hover:bg-blue-100'
+                        } transition-colors`}
+                        draggable={!isSelected}
+                        onDragStart={(e) => {
+                          if (!isSelected) {
+                            e.dataTransfer.setData('type', 'dimension')
+                            e.dataTransfer.setData('value', dimensionValue)
+                            e.dataTransfer.setData('label', dimension.name)
+                          }
+                        }}
+                      >
+                        <div className="flex items-center gap-2">
+                          <GripVertical className="h-3 w-3 text-blue-600" />
+                          <div className="flex-1">
+                            <div className="text-xs font-medium text-gray-900">
+                              {dimension.name}
+                            </div>
+                            <div className="text-xs text-blue-600">
+                              {dimension.type === 'date_range'
+                                ? `${dimension.values?.length || 0} date ranges`
+                                : `${dimension.metric_values?.length || 0} conditions`} • {isSelected ? 'In use' : 'Drag to table'}
+                            </div>
+                          </div>
+                          {!isSelected && (
+                            <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                              <button
+                                onClick={() => handleEditDimension(dimension)}
+                                className="p-1 hover:bg-blue-200 rounded transition-colors"
+                                title="Edit"
+                              >
+                                <Edit className="h-3 w-3 text-blue-700" />
+                              </button>
+                              <button
+                                onClick={() => handleDuplicateDimension(dimension.id)}
+                                className="p-1 hover:bg-blue-200 rounded transition-colors"
+                                title="Duplicate"
+                              >
+                                <Copy className="h-3 w-3 text-blue-700" />
+                              </button>
+                              <button
+                                onClick={() => handleDeleteDimension(dimension.id)}
+                                className="p-1 hover:bg-red-200 rounded transition-colors"
+                                title="Delete"
+                              >
+                                <Trash2 className="h-3 w-3 text-red-600" />
+                              </button>
+                            </div>
+                          )}
                         </div>
-                        <div className="text-xs text-green-600">Drag to table</div>
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
+
+              {/* Built-in Dimensions */}
+              {availableDimensionsToAdd.length > 0 && (
+                <div className="space-y-2">
+                  <h6 className="text-xs font-medium text-gray-600">Built-in Dimensions</h6>
+                  {availableDimensionsToAdd.map((dimension) => (
+                    <div
+                      key={dimension.value}
+                      draggable
+                      onDragStart={(e) => {
+                        e.dataTransfer.setData('type', 'dimension')
+                        e.dataTransfer.setData('value', dimension.value)
+                        e.dataTransfer.setData('label', dimension.label)
+                      }}
+                      className="p-2 bg-green-50 border-2 border-green-300 rounded cursor-move hover:bg-green-100 transition-colors"
+                    >
+                      <div className="flex items-center gap-2">
+                        <GripVertical className="h-3 w-3 text-green-600" />
+                        <div className="flex-1">
+                          <div className="text-xs font-medium text-gray-900">
+                            {dimension.label}
+                          </div>
+                          <div className="text-xs text-green-600">Drag to table</div>
+                        </div>
                       </div>
                     </div>
-                  </div>
-                ))
+                  ))}
+                </div>
+              )}
+
+              {availableDimensionsToAdd.length === 0 && customDimensions.length === 0 && (
+                <div className="p-4 text-center bg-white border border-gray-200 rounded">
+                  <p className="text-xs text-gray-500">All dimensions added</p>
+                  <p className="text-xs text-gray-400 mt-1">Remove dimensions from table or create a custom one</p>
+                </div>
               )}
             </div>
           )}
@@ -495,6 +671,18 @@ export function PivotConfigPanel({
           Reset to Defaults
         </button>
       </div>
+
+      {/* Custom Dimension Modal */}
+      <CustomDimensionModal
+        isOpen={isModalOpen}
+        onClose={() => {
+          setIsModalOpen(false)
+          setEditingDimension(null)
+        }}
+        onSave={handleModalSave}
+        editingDimension={editingDimension}
+        mode={modalMode}
+      />
     </div>
   )
 }

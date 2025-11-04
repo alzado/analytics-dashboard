@@ -6,6 +6,7 @@ import { fetchBigQueryInfo } from '@/lib/api'
 import { DashboardLayout } from '@/components/layout/dashboard-layout'
 import { PivotTableSection } from '@/components/sections/pivot-table-section'
 import { BigQueryInfoSection } from '@/components/sections/bigquery-info-section'
+import { UsageLogsSection } from '@/components/sections/usage-logs-section'
 
 export default function Home() {
   const [activeTab, setActiveTab] = useState('pivot')
@@ -49,6 +50,7 @@ export default function Home() {
   return (
     <DashboardLayout activeTab={activeTab} onTabChange={setActiveTab}>
       {activeTab === 'pivot' && <PivotTableSection />}
+      {activeTab === 'logs' && <UsageLogsSection />}
       {activeTab === 'info' && <BigQueryInfoSection />}
     </DashboardLayout>
   )

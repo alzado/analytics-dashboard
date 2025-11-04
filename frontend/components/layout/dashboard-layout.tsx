@@ -11,6 +11,7 @@ interface DashboardLayoutProps {
 export function DashboardLayout({ children, activeTab, onTabChange }: DashboardLayoutProps) {
   const tabs = [
     { id: 'pivot', label: 'Pivot Table' },
+    { id: 'logs', label: 'Usage Logs' },
     { id: 'info', label: 'BigQuery Info' },
   ]
 

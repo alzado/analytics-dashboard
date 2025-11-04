@@ -2,7 +2,6 @@ import type { Metadata } from 'next'
 import { Inter } from 'next/font/google'
 import './globals.css'
 import { QueryProvider } from '@/lib/providers/query-provider'
-import { FilterProvider } from '@/lib/contexts/filter-context'
 
 const inter = Inter({ subsets: ['latin'] })
 
@@ -20,9 +19,7 @@ export default function RootLayout({
     <html lang="en">
       <body className={inter.className}>
         <QueryProvider>
-          <FilterProvider>
-            {children}
-          </FilterProvider>
+          {children}
         </QueryProvider>
       </body>
     </html>

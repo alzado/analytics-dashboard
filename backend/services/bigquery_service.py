@@ -4,6 +4,7 @@ BigQuery service for querying search analytics data.
 import os
 import json
 import tempfile
+import time
 from typing import Optional, Dict, List
 from google.cloud import bigquery
 from google.oauth2 import service_account
@@ -56,6 +57,81 @@ class BigQueryService:
         self.allowed_min_date = min_date
         self.allowed_max_date = max_date
 
+    def _execute_and_log_query(
+        self,
+        query: str,
+        query_type: str,
+        endpoint: str = "unknown",
+        filters: Optional[Dict] = None
+    ) -> pd.DataFrame:
+        """
+        Execute a BigQuery query and log its metrics.
+
+        Args:
+            query: SQL query to execute
+            query_type: Type of query (kpi, trends, pivot, etc.)
+            endpoint: API endpoint that triggered the query
+            filters: Applied filters as dictionary
+
+        Returns:
+            DataFrame with query results
+        """
+        # Import here to avoid circular dependency
+        from services.query_logger import get_query_logger
+
+        print(f"[QUERY LOGGER DEBUG] _execute_and_log_query called: endpoint={endpoint}, type={query_type}")
+
+        start_time = time.time()
+        error_msg = None
+        bytes_processed = 0
+        bytes_billed = 0
+        row_count = 0
+
+        try:
+            # Execute query
+            query_job = self.client.query(query)
+            df = query_job.to_dataframe()
+
+            # Get query statistics
+            if query_job.total_bytes_processed:
+                bytes_processed = query_job.total_bytes_processed
+            if query_job.total_bytes_billed:
+                bytes_billed = query_job.total_bytes_billed
+
+            row_count = len(df)
+
+            print(f"[QUERY LOGGER DEBUG] Query executed: bytes_processed={bytes_processed}, bytes_billed={bytes_billed}, rows={row_count}")
+
+            return df
+
+        except Exception as e:
+            error_msg = str(e)
+            print(f"[QUERY LOGGER DEBUG] Query error: {error_msg}")
+            raise
+
+        finally:
+            # Log query execution
+            execution_time_ms = int((time.time() - start_time) * 1000)
+
+            logger = get_query_logger()
+            print(f"[QUERY LOGGER DEBUG] Logger instance: {logger}")
+            if logger:
+                try:
+                    logger.log_query(
+                        endpoint=endpoint,
+                        query_type=query_type,
+                        bytes_processed=bytes_processed,
+                        bytes_billed=bytes_billed,
+                        execution_time_ms=execution_time_ms,
+                        filters=filters,
+                        row_count=row_count,
+                        error=error_msg
+                    )
+                    print(f"[QUERY LOGGER DEBUG] Log written successfully")
+                except Exception as log_error:
+                    # Don't fail the query if logging fails
+                    print(f"[QUERY LOGGER DEBUG] Failed to log query: {log_error}")
+
     def _clamp_dates(
         self,
         start_date: Optional[str],
@@ -99,6 +175,9 @@ class BigQueryService:
         country: Optional[str] = None,
         channel: Optional[str] = None,
         gcategory: Optional[str] = None,
+        query_intent_classification: Optional[str] = None,
+        n_words_normalized: Optional[int] = None,
+        n_attributes: Optional[int] = None,
         n_attributes_min: Optional[int] = None,
         n_attributes_max: Optional[int] = None,
     ) -> str:
@@ -133,7 +212,19 @@ class BigQueryService:
         if gcategory:
             conditions.append(f"gcategory_name = '{gcategory}'")
 
-        # Attribute count filters
+        # Query intent classification filter
+        if query_intent_classification:
+            conditions.append(f"query_intent_classification = '{query_intent_classification}'")
+
+        # N_words exact filter
+        if n_words_normalized is not None:
+            conditions.append(f"n_words_normalized = {n_words_normalized}")
+
+        # N_attributes exact filter
+        if n_attributes is not None:
+            conditions.append(f"n_attributes = {n_attributes}")
+
+        # Attribute count range filters
         if n_attributes_min is not None:
             conditions.append(f"n_attributes >= {n_attributes_min}")
         if n_attributes_max is not None:
@@ -142,6 +233,47 @@ class BigQueryService:
         if conditions:
             return "WHERE " + " AND ".join(conditions)
         return ""
+
+    def build_metric_condition_sql(
+        self,
+        metric: str,
+        conditions: List[Dict]
+    ) -> str:
+        """
+        Build SQL expression from metric conditions.
+
+        Args:
+            metric: The metric column name (e.g., 'conversion_rate')
+            conditions: List of condition dicts with 'operator', 'value', and optionally 'value_max'
+
+        Returns:
+            SQL WHERE clause expression (e.g., "conversion_rate > 0.05 AND conversion_rate < 0.1")
+        """
+        condition_parts = []
+
+        for cond in conditions:
+            operator = cond['operator']
+            value = cond.get('value')
+            value_max = cond.get('value_max')
+
+            if operator == '>':
+                condition_parts.append(f"{metric} > {value}")
+            elif operator == '<':
+                condition_parts.append(f"{metric} < {value}")
+            elif operator == '>=':
+                condition_parts.append(f"{metric} >= {value}")
+            elif operator == '<=':
+                condition_parts.append(f"{metric} <= {value}")
+            elif operator == '=':
+                condition_parts.append(f"{metric} = {value}")
+            elif operator == 'between':
+                condition_parts.append(f"{metric} BETWEEN {value} AND {value_max}")
+            elif operator == 'is_null':
+                condition_parts.append(f"{metric} IS NULL")
+            elif operator == 'is_not_null':
+                condition_parts.append(f"{metric} IS NOT NULL")
+
+        return " AND ".join(condition_parts) if condition_parts else "TRUE"
 
     def query_all_data(
         self,
@@ -170,7 +302,22 @@ class BigQueryService:
             {where_clause}
         """
 
-        return self.client.query(query).to_dataframe()
+        filters_dict = {
+            'start_date': start_date,
+            'end_date': end_date,
+            'country': country,
+            'channel': channel,
+            'gcategory': gcategory,
+            'n_attributes_min': n_attributes_min,
+            'n_attributes_max': n_attributes_max
+        }
+
+        return self._execute_and_log_query(
+            query=query,
+            query_type='query_all',
+            endpoint='/api/query_all',
+            filters=filters_dict
+        )
 
     def query_kpi_metrics(
         self,
@@ -213,7 +360,23 @@ class BigQueryService:
             {where_clause}
         """
 
-        df = self.client.query(query).to_dataframe()
+        filters_dict = {
+            'start_date': start_date,
+            'end_date': end_date,
+            'country': country,
+            'channel': channel,
+            'gcategory': gcategory,
+            'n_attributes_min': n_attributes_min,
+            'n_attributes_max': n_attributes_max
+        }
+
+        df = self._execute_and_log_query(
+            query=query,
+            query_type='kpi',
+            endpoint='/api/overview',
+            filters=filters_dict
+        )
+
         if df.empty:
             return {}
 
@@ -282,7 +445,23 @@ class BigQueryService:
             ORDER BY date
         """
 
-        return self.client.query(query).to_dataframe()
+        filters_dict = {
+            'start_date': start_date,
+            'end_date': end_date,
+            'country': country,
+            'channel': channel,
+            'gcategory': gcategory,
+            'granularity': granularity,
+            'n_attributes_min': n_attributes_min,
+            'n_attributes_max': n_attributes_max
+        }
+
+        return self._execute_and_log_query(
+            query=query,
+            query_type='trends',
+            endpoint='/api/trends',
+            filters=filters_dict
+        )
 
     def query_dimension_breakdown(
         self,
@@ -312,7 +491,7 @@ class BigQueryService:
 
         # Map dimension names to column names
         dimension_map = {
-            'n_words': 'n_words',
+            'n_words_normalized': 'n_words_normalized',
             'n_attributes': 'n_attributes',
             'channel': 'channel',
             'country': 'country',
@@ -335,7 +514,24 @@ class BigQueryService:
             LIMIT {limit}
         """
 
-        return self.client.query(query).to_dataframe()
+        filters_dict = {
+            'start_date': start_date,
+            'end_date': end_date,
+            'country': country,
+            'channel': channel,
+            'gcategory': gcategory,
+            'dimension': dimension,
+            'limit': limit,
+            'n_attributes_min': n_attributes_min,
+            'n_attributes_max': n_attributes_max
+        }
+
+        return self._execute_and_log_query(
+            query=query,
+            query_type='breakdown',
+            endpoint=f'/api/breakdown/{dimension}',
+            filters=filters_dict
+        )
 
     def query_search_terms(
         self,
@@ -373,7 +569,7 @@ class BigQueryService:
                 SUM(queries_a2c) as queries_a2c,
                 SUM(purchases) as purchases,
                 SUM(gross_purchase) as revenue,
-                MAX(n_words) as n_words,
+                MAX(n_words_normalized) as n_words_normalized,
                 MAX(n_attributes) as n_attributes
             FROM `{self.table_path}`
             {where_clause}
@@ -382,7 +578,89 @@ class BigQueryService:
             LIMIT {limit}
         """
 
-        return self.client.query(query).to_dataframe()
+        filters_dict = {
+            'start_date': start_date,
+            'end_date': end_date,
+            'country': country,
+            'channel': channel,
+            'gcategory': gcategory,
+            'limit': limit,
+            'sort_by': sort_by,
+            'n_attributes_min': n_attributes_min,
+            'n_attributes_max': n_attributes_max
+        }
+
+        return self._execute_and_log_query(
+            query=query,
+            query_type='search_terms',
+            endpoint='/api/search-terms',
+            filters=filters_dict
+        )
+
+    def query_dimension_values(
+        self,
+        dimension: str,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        country: Optional[str] = None,
+        channel: Optional[str] = None,
+        gcategory: Optional[str] = None,
+        query_intent_classification: Optional[str] = None,
+        n_attributes_min: Optional[int] = None,
+        n_attributes_max: Optional[int] = None,
+    ) -> List[str]:
+        """
+        Get distinct values for a given dimension.
+
+        Args:
+            dimension: Column to get distinct values for (e.g., 'channel', 'country', 'n_words')
+
+        Returns:
+            List of distinct values for the dimension
+        """
+        where_clause = self.build_filter_clause(
+            start_date, end_date, country, channel, gcategory,
+            query_intent_classification, n_attributes_min=n_attributes_min, n_attributes_max=n_attributes_max
+        )
+
+        # Map dimension names to column names
+        dimension_map = {
+            'n_words_normalized': 'n_words_normalized',
+            'n_attributes': 'n_attributes',
+            'channel': 'channel',
+            'country': 'country',
+            'gcategory_name': 'gcategory_name',
+        }
+        group_col = dimension_map.get(dimension, dimension)
+
+        query = f"""
+            SELECT DISTINCT {group_col} as value
+            FROM `{self.table_path}`
+            {where_clause}
+            ORDER BY value
+        """
+
+        filters_dict = {
+            'start_date': start_date,
+            'end_date': end_date,
+            'country': country,
+            'channel': channel,
+            'gcategory': gcategory,
+            'query_intent_classification': query_intent_classification,
+            'dimension': dimension,
+            'n_attributes_min': n_attributes_min,
+            'n_attributes_max': n_attributes_max
+        }
+
+        df = self._execute_and_log_query(
+            query=query,
+            query_type='dimension_values',
+            endpoint=f'/api/pivot/dimension/{dimension}/values',
+            filters=filters_dict
+        )
+
+        # Convert to list of strings, filtering out any null values
+        return [str(val) for val in df['value'].tolist() if pd.notna(val)]
 
     def list_tables_in_dataset(self) -> List[Dict]:
         """

@@ -18,8 +18,16 @@ export interface PivotConfig {
   isDataSourceDropped: boolean
   isDateRangeDropped: boolean
   selectedDimensions: string[]
+  selectedTableDimensions: string[]
   selectedMetrics: string[]
   selectedFilters: DimensionFilter[]
+  // UI state (persisted)
+  isConfigOpen?: boolean
+  expandedRows?: string[]
+  selectedDisplayMetric?: string
+  sortColumn?: string | number
+  sortSubColumn?: 'value' | 'diff' | 'pctDiff'
+  sortDirection?: 'asc' | 'desc'
 }
 
 interface UsePivotConfigReturn {
@@ -33,6 +41,9 @@ interface UsePivotConfigReturn {
   addDimension: (dimension: string) => void
   removeDimension: (dimension: string) => void
   reorderDimensions: (fromIndex: number, toIndex: number) => void
+  addTableDimension: (dimension: string) => void
+  removeTableDimension: (dimension: string) => void
+  clearTableDimensions: () => void
   updateMetrics: (metrics: string[]) => void
   addMetric: (metricId: string) => void
   removeMetric: (metricId: string) => void
@@ -40,6 +51,11 @@ interface UsePivotConfigReturn {
   addFilter: (filter: DimensionFilter) => void
   removeFilter: (index: number) => void
   resetToDefaults: () => void
+  // UI state methods
+  setConfigOpen: (open: boolean) => void
+  setExpandedRows: (rows: string[]) => void
+  setSelectedDisplayMetric: (metric: string) => void
+  setSortConfig: (column: string | number, subColumn?: 'value' | 'diff' | 'pctDiff', direction?: 'asc' | 'desc') => void
 }
 
 const DEFAULT_CONFIG: PivotConfig = {
@@ -50,8 +66,16 @@ const DEFAULT_CONFIG: PivotConfig = {
   isDataSourceDropped: false,
   isDateRangeDropped: false,
   selectedDimensions: [],
+  selectedTableDimensions: [],
   selectedMetrics: DEFAULT_METRICS,
   selectedFilters: [],
+  // UI state defaults
+  isConfigOpen: true,
+  expandedRows: [],
+  selectedDisplayMetric: 'queries',
+  sortColumn: undefined,
+  sortSubColumn: undefined,
+  sortDirection: undefined,
 }
 
 export function usePivotConfig(): UsePivotConfigReturn {
@@ -73,6 +97,7 @@ export function usePivotConfig(): UsePivotConfigReturn {
           startDate: parsed.startDate ?? null,
           endDate: parsed.endDate ?? null,
           selectedDimensions: Array.isArray(parsed.selectedDimensions) ? parsed.selectedDimensions : [],
+          selectedTableDimensions: Array.isArray(parsed.selectedTableDimensions) ? parsed.selectedTableDimensions : [],
           selectedFilters: Array.isArray(parsed.selectedFilters) ? parsed.selectedFilters : [],
         }
         setConfig(migratedConfig)
@@ -117,7 +142,8 @@ export function usePivotConfig(): UsePivotConfigReturn {
 
   const addDimension = useCallback((dimension: string) => {
     setConfig((prev) => {
-      if (prev.selectedDimensions.includes(dimension)) {
+      // Don't add if already in row dimensions or table dimensions
+      if (prev.selectedDimensions.includes(dimension) || prev.selectedTableDimensions.includes(dimension)) {
         return prev
       }
       return {
@@ -144,6 +170,33 @@ export function usePivotConfig(): UsePivotConfigReturn {
         selectedDimensions: dimensions,
       }
     })
+  }, [])
+
+  const addTableDimension = useCallback((dimension: string) => {
+    setConfig((prev) => {
+      // Don't add if already in table dimensions or row dimensions
+      if (prev.selectedTableDimensions.includes(dimension) || prev.selectedDimensions.includes(dimension)) {
+        return prev
+      }
+      return {
+        ...prev,
+        selectedTableDimensions: [...prev.selectedTableDimensions, dimension],
+      }
+    })
+  }, [])
+
+  const removeTableDimension = useCallback((dimension: string) => {
+    setConfig((prev) => ({
+      ...prev,
+      selectedTableDimensions: prev.selectedTableDimensions.filter((dim) => dim !== dimension),
+    }))
+  }, [])
+
+  const clearTableDimensions = useCallback(() => {
+    setConfig((prev) => ({
+      ...prev,
+      selectedTableDimensions: [],
+    }))
   }, [])
 
   const updateMetrics = useCallback((metrics: string[]) => {
@@ -199,6 +252,28 @@ export function usePivotConfig(): UsePivotConfigReturn {
     setConfig(DEFAULT_CONFIG)
   }, [])
 
+  // UI state methods
+  const setConfigOpen = useCallback((open: boolean) => {
+    setConfig((prev) => ({ ...prev, isConfigOpen: open }))
+  }, [])
+
+  const setExpandedRows = useCallback((rows: string[]) => {
+    setConfig((prev) => ({ ...prev, expandedRows: rows }))
+  }, [])
+
+  const setSelectedDisplayMetric = useCallback((metric: string) => {
+    setConfig((prev) => ({ ...prev, selectedDisplayMetric: metric }))
+  }, [])
+
+  const setSortConfig = useCallback((column: string | number, subColumn?: 'value' | 'diff' | 'pctDiff', direction?: 'asc' | 'desc') => {
+    setConfig((prev) => ({
+      ...prev,
+      sortColumn: column,
+      sortSubColumn: subColumn,
+      sortDirection: direction,
+    }))
+  }, [])
+
   return {
     config,
     updateTable,
@@ -210,6 +285,9 @@ export function usePivotConfig(): UsePivotConfigReturn {
     addDimension,
     removeDimension,
     reorderDimensions,
+    addTableDimension,
+    removeTableDimension,
+    clearTableDimensions,
     updateMetrics,
     addMetric,
     removeMetric,
@@ -217,5 +295,10 @@ export function usePivotConfig(): UsePivotConfigReturn {
     addFilter,
     removeFilter,
     resetToDefaults,
+    // UI state methods
+    setConfigOpen,
+    setExpandedRows,
+    setSelectedDisplayMetric,
+    setSortConfig,
   }
 }
