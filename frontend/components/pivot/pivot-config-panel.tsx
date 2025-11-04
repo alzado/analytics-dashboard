@@ -1,31 +1,13 @@
 'use client'
 
-import { useState, useEffect } from 'react'
-import { X, GripVertical, Plus, Settings, Database, Calendar, ChevronDown, ChevronRight } from 'lucide-react'
+import { useState, useEffect, useMemo } from 'react'
+import { X, GripVertical, Settings, Database, Calendar, ChevronDown, ChevronRight } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'
 import { fetchBigQueryInfo, fetchTableDateRange } from '@/lib/api'
-import {
-  DndContext,
-  closestCenter,
-  KeyboardSensor,
-  PointerSensor,
-  useSensor,
-  useSensors,
-  DragEndEvent,
-} from '@dnd-kit/core'
-import {
-  arrayMove,
-  SortableContext,
-  sortableKeyboardCoordinates,
-  useSortable,
-  verticalListSortingStrategy,
-} from '@dnd-kit/sortable'
-import { CSS } from '@dnd-kit/utilities'
-import { usePivotConfig } from '@/hooks/use-pivot-config'
+import type { PivotConfig } from '@/hooks/use-pivot-config'
 import {
   AVAILABLE_METRICS,
   AVAILABLE_DIMENSIONS,
-  getMetricById,
   getDimensionByValue,
   MetricDefinition,
 } from '@/lib/pivot-metrics'
@@ -33,53 +15,20 @@ import {
 interface PivotConfigPanelProps {
   isOpen: boolean
   onClose: () => void
-}
-
-interface SortableMetricProps {
-  metric: MetricDefinition
-  onRemove: (id: string) => void
-}
-
-function SortableMetric({ metric, onRemove }: SortableMetricProps) {
-  const {
-    attributes,
-    listeners,
-    setNodeRef,
-    transform,
-    transition,
-    isDragging,
-  } = useSortable({ id: metric.id })
-
-  const style = {
-    transform: CSS.Transform.toString(transform),
-    transition,
-    opacity: isDragging ? 0.5 : 1,
-  }
-
-  return (
-    <div
-      ref={setNodeRef}
-      style={style}
-      className="flex items-center gap-2 p-2 bg-white border border-gray-200 rounded hover:border-blue-300 transition-colors"
-    >
-      <button
-        className="cursor-grab active:cursor-grabbing text-gray-400 hover:text-gray-600"
-        {...attributes}
-        {...listeners}
-      >
-        <GripVertical className="h-3 w-3" />
-      </button>
-      <div className="flex-1 min-w-0">
-        <div className="text-xs font-medium text-gray-900 truncate">{metric.label}</div>
-      </div>
-      <button
-        onClick={() => onRemove(metric.id)}
-        className="text-gray-400 hover:text-red-600 transition-colors"
-      >
-        <X className="h-3 w-3" />
-      </button>
-    </div>
-  )
+  config: PivotConfig
+  updateTable: (tableName: string | null) => void
+  updateDateRange: (dateRange: any) => void
+  updateStartDate: (date: string | null) => void
+  updateEndDate: (date: string | null) => void
+  setDataSourceDropped: (dropped: boolean) => void
+  setDateRangeDropped: (dropped: boolean) => void
+  addDimension: (dimension: string) => void
+  removeDimension: (dimension: string) => void
+  addMetric: (metricId: string) => void
+  removeMetric: (metricId: string) => void
+  addFilter: (filter: any) => void
+  removeFilter: (index: number) => void
+  resetToDefaults: () => void
 }
 
 interface AvailableMetricProps {
@@ -112,30 +61,30 @@ function AvailableMetric({ metric, onAdd, isSelected }: AvailableMetricProps) {
   )
 }
 
-export function PivotConfigPanel({ isOpen, onClose }: PivotConfigPanelProps) {
-  const {
-    config,
-    updateTable,
-    updateDateRange,
-    updateStartDate,
-    updateEndDate,
-    addDimension,
-    removeDimension,
-    reorderDimensions,
-    updateMetrics,
-    addMetric,
-    removeMetric,
-    reorderMetrics,
-    addFilter,
-    removeFilter,
-    resetToDefaults,
-  } = usePivotConfig()
+export function PivotConfigPanel({
+  isOpen,
+  onClose,
+  config,
+  updateTable,
+  updateDateRange,
+  updateStartDate,
+  updateEndDate,
+  setDataSourceDropped,
+  setDateRangeDropped,
+  addDimension,
+  removeDimension,
+  addMetric,
+  removeMetric,
+  addFilter,
+  removeFilter,
+  resetToDefaults,
+}: PivotConfigPanelProps) {
 
-  const [isDataSourceExpanded, setIsDataSourceExpanded] = useState(true)
-  const [isDateRangeExpanded, setIsDateRangeExpanded] = useState(true)
-  const [isDimensionsExpanded, setIsDimensionsExpanded] = useState(true)
-  const [isMetricsExpanded, setIsMetricsExpanded] = useState(true)
-  const [isFiltersExpanded, setIsFiltersExpanded] = useState(true)
+  const [isDataSourceExpanded, setIsDataSourceExpanded] = useState(false)
+  const [isDateRangeExpanded, setIsDateRangeExpanded] = useState(false)
+  const [isDimensionsExpanded, setIsDimensionsExpanded] = useState(false)
+  const [isMetricsExpanded, setIsMetricsExpanded] = useState(false)
+  const [isFiltersExpanded, setIsFiltersExpanded] = useState(false)
 
   // Fetch BigQuery info to get the configured table
   const { data: bqInfo, isLoading: bqInfoLoading } = useQuery({
@@ -159,42 +108,27 @@ export function PivotConfigPanel({ isOpen, onClose }: PivotConfigPanelProps) {
     retry: false,
   })
 
-  // Handle date range selection (use full available range)
+  // Auto-set start and end dates when table is selected (for the first time only)
   useEffect(() => {
     if (dateRangeInfo?.has_date_column && dateRangeInfo.min_date && dateRangeInfo.max_date) {
-      // Auto-set date range to full available range
-      if (!config.selectedDateRange) {
-        updateDateRange({
-          start_date: dateRangeInfo.min_date,
-          end_date: dateRangeInfo.max_date,
-        })
+      // Only auto-set if both dates are not already set
+      if (!config.startDate && !config.endDate) {
+        updateStartDate(dateRangeInfo.min_date)
+        updateEndDate(dateRangeInfo.max_date)
       }
     }
-  }, [dateRangeInfo, config.selectedDateRange, updateDateRange])
+  }, [dateRangeInfo])
 
-  const sensors = useSensors(
-    useSensor(PointerSensor),
-    useSensor(KeyboardSensor, {
-      coordinateGetter: sortableKeyboardCoordinates,
-    })
+  // Filter out metrics that are already selected
+  const selectedMetrics = config.selectedMetrics || []
+  const availableMetricsToAdd = AVAILABLE_METRICS.filter(
+    (m) => !selectedMetrics.includes(m.id)
   )
 
-  const handleDragEnd = (event: DragEndEvent) => {
-    const { active, over } = event
-
-    if (over && active.id !== over.id) {
-      const oldIndex = config.selectedMetrics.indexOf(active.id as string)
-      const newIndex = config.selectedMetrics.indexOf(over.id as string)
-      reorderMetrics(oldIndex, newIndex)
-    }
-  }
-
-  const selectedMetricObjects = config.selectedMetrics
-    .map((id) => getMetricById(id))
-    .filter((m): m is MetricDefinition => m !== undefined)
-
-  const availableMetricsToAdd = AVAILABLE_METRICS.filter(
-    (m) => !config.selectedMetrics.includes(m.id)
+  // Filter out dimensions that are already selected
+  const selectedDimensions = config.selectedDimensions || []
+  const availableDimensionsToAdd = AVAILABLE_DIMENSIONS.filter(
+    (d) => !selectedDimensions.includes(d.value)
   )
 
   // Group available metrics by category
@@ -209,7 +143,7 @@ export function PivotConfigPanel({ isOpen, onClose }: PivotConfigPanelProps) {
   if (!isOpen) return null
 
   return (
-    <div className="w-80 bg-gray-50 border-r border-gray-200 flex flex-col h-[calc(100vh-8rem)] overflow-hidden">
+    <div className="w-80 flex-shrink-0 bg-gray-50 border-r border-gray-200 flex flex-col h-[calc(100vh-4rem)] overflow-hidden sticky top-16">
       {/* Header */}
       <div className="bg-white border-b border-gray-200 p-4 flex-shrink-0">
         <div className="flex items-center justify-between mb-2">
@@ -397,7 +331,7 @@ export function PivotConfigPanel({ isOpen, onClose }: PivotConfigPanelProps) {
             className="w-full flex items-center justify-between mb-2 hover:opacity-70 transition-opacity"
           >
             <h4 className="text-xs font-semibold text-gray-700 uppercase">
-              Dimensions
+              Dimensions ({availableDimensionsToAdd.length} available)
             </h4>
             {isDimensionsExpanded ? (
               <ChevronDown className="h-3 w-3 text-gray-500" />
@@ -406,30 +340,37 @@ export function PivotConfigPanel({ isOpen, onClose }: PivotConfigPanelProps) {
             )}
           </button>
           {isDimensionsExpanded && (
-          <div className="space-y-2">
-            {AVAILABLE_DIMENSIONS.map((dimension) => (
-              <div
-                key={dimension.value}
-                draggable
-                onDragStart={(e) => {
-                  e.dataTransfer.setData('type', 'dimension')
-                  e.dataTransfer.setData('value', dimension.value)
-                  e.dataTransfer.setData('label', dimension.label)
-                }}
-                className="p-2 bg-green-50 border-2 border-green-300 rounded cursor-move hover:bg-green-100 transition-colors"
-              >
-                <div className="flex items-center gap-2">
-                  <GripVertical className="h-3 w-3 text-green-600" />
-                  <div className="flex-1">
-                    <div className="text-xs font-medium text-gray-900">
-                      {dimension.label}
-                    </div>
-                    <div className="text-xs text-green-600">Drag to table</div>
-                  </div>
+            <div className="space-y-2">
+              {availableDimensionsToAdd.length === 0 ? (
+                <div className="p-4 text-center bg-white border border-gray-200 rounded">
+                  <p className="text-xs text-gray-500">All dimensions added</p>
+                  <p className="text-xs text-gray-400 mt-1">Remove dimensions from table to add more</p>
                 </div>
-              </div>
-            ))}
-          </div>
+              ) : (
+                availableDimensionsToAdd.map((dimension) => (
+                  <div
+                    key={dimension.value}
+                    draggable
+                    onDragStart={(e) => {
+                      e.dataTransfer.setData('type', 'dimension')
+                      e.dataTransfer.setData('value', dimension.value)
+                      e.dataTransfer.setData('label', dimension.label)
+                    }}
+                    className="p-2 bg-green-50 border-2 border-green-300 rounded cursor-move hover:bg-green-100 transition-colors"
+                  >
+                    <div className="flex items-center gap-2">
+                      <GripVertical className="h-3 w-3 text-green-600" />
+                      <div className="flex-1">
+                        <div className="text-xs font-medium text-gray-900">
+                          {dimension.label}
+                        </div>
+                        <div className="text-xs text-green-600">Drag to table</div>
+                      </div>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
           )}
         </div>
 
@@ -497,14 +438,14 @@ export function PivotConfigPanel({ isOpen, onClose }: PivotConfigPanelProps) {
           )}
         </div>
 
-        {/* Metrics */}
+        {/* Metrics - Available to Add */}
         <div>
           <button
             onClick={() => setIsMetricsExpanded(!isMetricsExpanded)}
             className="w-full flex items-center justify-between mb-2 hover:opacity-70 transition-opacity"
           >
             <h4 className="text-xs font-semibold text-gray-700 uppercase">
-              Metrics
+              Metrics ({availableMetricsToAdd.length} available)
             </h4>
             {isMetricsExpanded ? (
               <ChevronDown className="h-3 w-3 text-gray-500" />
@@ -513,73 +454,33 @@ export function PivotConfigPanel({ isOpen, onClose }: PivotConfigPanelProps) {
             )}
           </button>
           {isMetricsExpanded && (
-            <div className="space-y-4">
-              {/* Selected Metrics */}
-              <div>
-                <h5 className="text-xs font-semibold text-gray-700 uppercase mb-2">
-                  Selected ({selectedMetricObjects.length})
-                </h5>
-                {selectedMetricObjects.length === 0 ? (
-                  <div className="p-4 text-center bg-white border-2 border-dashed border-gray-300 rounded">
-                    <p className="text-xs text-gray-500">
-                      Add metrics below
-                    </p>
-                  </div>
-                ) : (
-                  <DndContext
-                    sensors={sensors}
-                    collisionDetection={closestCenter}
-                    onDragEnd={handleDragEnd}
-                  >
-                    <SortableContext
-                      items={config.selectedMetrics}
-                      strategy={verticalListSortingStrategy}
-                    >
+            <div className="space-y-3">
+              {availableMetricsToAdd.length === 0 ? (
+                <div className="p-4 text-center bg-white border border-gray-200 rounded">
+                  <p className="text-xs text-gray-500">All metrics added</p>
+                  <p className="text-xs text-gray-400 mt-1">Remove metrics from table to add more</p>
+                </div>
+              ) : (
+                <>
+                  {Object.entries(metricsByCategory).map(([category, metrics]) => (
+                    <div key={category}>
+                      <h6 className="text-xs font-medium text-gray-600 mb-1">
+                        {category}
+                      </h6>
                       <div className="space-y-1">
-                        {selectedMetricObjects.map((metric) => (
-                          <SortableMetric
+                        {metrics.map((metric) => (
+                          <AvailableMetric
                             key={metric.id}
                             metric={metric}
-                            onRemove={removeMetric}
+                            onAdd={addMetric}
+                            isSelected={false}
                           />
                         ))}
                       </div>
-                    </SortableContext>
-                  </DndContext>
-                )}
-              </div>
-
-              {/* Available Metrics */}
-              <div>
-                <h5 className="text-xs font-semibold text-gray-700 uppercase mb-2">
-                  Available ({availableMetricsToAdd.length})
-                </h5>
-                {availableMetricsToAdd.length === 0 ? (
-                  <div className="p-4 text-center bg-white border border-gray-200 rounded">
-                    <p className="text-xs text-gray-500">All selected</p>
-                  </div>
-                ) : (
-                  <div className="space-y-3">
-                    {Object.entries(metricsByCategory).map(([category, metrics]) => (
-                      <div key={category}>
-                        <h6 className="text-xs font-medium text-gray-600 mb-1">
-                          {category}
-                        </h6>
-                        <div className="space-y-1">
-                          {metrics.map((metric) => (
-                            <AvailableMetric
-                              key={metric.id}
-                              metric={metric}
-                              onAdd={addMetric}
-                              isSelected={false}
-                            />
-                          ))}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
+                    </div>
+                  ))}
+                </>
+              )}
             </div>
           )}
         </div>

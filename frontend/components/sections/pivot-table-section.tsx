@@ -3,7 +3,6 @@
 import React, { useState, useMemo } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { fetchPivotData, fetchPivotChildren } from '@/lib/api'
-import { useFilters } from '@/lib/contexts/filter-context'
 import type { PivotRow, PivotChildRow } from '@/lib/types'
 import { ChevronRight, ChevronDown, Settings2 } from 'lucide-react'
 import { usePivotConfig } from '@/hooks/use-pivot-config'
@@ -11,10 +10,10 @@ import { getMetricById, getDimensionByValue } from '@/lib/pivot-metrics'
 import { PivotConfigPanel } from '@/components/pivot/pivot-config-panel'
 
 export function PivotTableSection() {
-  const { filters } = useFilters()
   const {
     config,
     updateTable,
+    updateDateRange,
     updateStartDate,
     updateEndDate,
     setDataSourceDropped,
@@ -23,9 +22,17 @@ export function PivotTableSection() {
     removeDimension,
     addMetric,
     removeMetric,
+    addFilter,
     removeFilter,
+    resetToDefaults,
     reorderMetrics,
   } = usePivotConfig()
+
+  // Build filters from pivot config, including date range
+  const filters = {
+    start_date: config.startDate,
+    end_date: config.endDate,
+  }
   const selectedDimensions = config.selectedDimensions
   const selectedMetrics = config.selectedMetrics
   const selectedTable = config.selectedTable
@@ -48,7 +55,7 @@ export function PivotTableSection() {
   const firstDimension = selectedDimensions.length > 0 ? [selectedDimensions[0]] : []
 
   const { data: pivotData, isLoading, error } = useQuery({
-    queryKey: ['pivot', firstDimension, filters, selectedTable, selectedDateRange],
+    queryKey: ['pivot', firstDimension, config.startDate, config.endDate, selectedTable],
     queryFn: () => {
       // If no dimensions, create a single "All Data" row manually
       if (selectedDimensions.length === 0) {
@@ -557,10 +564,27 @@ export function PivotTableSection() {
         </div>
 
         <div className="flex gap-4">
-          <PivotConfigPanel isOpen={isConfigOpen} onClose={() => setIsConfigOpen(false)} />
+          <PivotConfigPanel
+            isOpen={isConfigOpen}
+            onClose={() => setIsConfigOpen(false)}
+            config={config}
+            updateTable={updateTable}
+            updateDateRange={updateDateRange}
+            updateStartDate={updateStartDate}
+            updateEndDate={updateEndDate}
+            setDataSourceDropped={setDataSourceDropped}
+            setDateRangeDropped={setDateRangeDropped}
+            addDimension={addDimension}
+            removeDimension={removeDimension}
+            addMetric={addMetric}
+            removeMetric={removeMetric}
+            addFilter={addFilter}
+            removeFilter={removeFilter}
+            resetToDefaults={resetToDefaults}
+          />
 
           <div
-            className={`flex-1 bg-white shadow overflow-hidden rounded-lg transition-all ${
+            className={`flex-1 min-w-0 bg-white shadow overflow-hidden rounded-lg transition-all ${
               isDragOver ? 'ring-4 ring-blue-400 bg-blue-50' : ''
             }`}
             onDrop={handleDrop}
@@ -629,7 +653,7 @@ export function PivotTableSection() {
   }
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-4 h-full">
       <div className="flex justify-between items-center">
         <div>
           <h2 className="text-lg font-semibold text-gray-900">Pivot Table</h2>
@@ -683,9 +707,26 @@ export function PivotTableSection() {
       </div>
 
       <div className="flex gap-4">
-        <PivotConfigPanel isOpen={isConfigOpen} onClose={() => setIsConfigOpen(false)} />
+        <PivotConfigPanel
+          isOpen={isConfigOpen}
+          onClose={() => setIsConfigOpen(false)}
+          config={config}
+          updateTable={updateTable}
+          updateDateRange={updateDateRange}
+          updateStartDate={updateStartDate}
+          updateEndDate={updateEndDate}
+          setDataSourceDropped={setDataSourceDropped}
+          setDateRangeDropped={setDateRangeDropped}
+          addDimension={addDimension}
+          removeDimension={removeDimension}
+          addMetric={addMetric}
+          removeMetric={removeMetric}
+          addFilter={addFilter}
+          removeFilter={removeFilter}
+          resetToDefaults={resetToDefaults}
+        />
 
-        <div className="flex-1 space-y-4">
+        <div className="flex-1 min-w-0 space-y-4">
           {/* Configuration Bar */}
           {isConfigured && (
             <div className="bg-white shadow rounded-lg p-4">
@@ -773,15 +814,15 @@ export function PivotTableSection() {
 
           {/* Table with drop zone */}
           <div
-            className={`bg-white shadow overflow-hidden rounded-lg transition-all ${
+            className={`bg-white shadow rounded-lg transition-all ${
               isDragOver ? 'ring-4 ring-blue-400 bg-blue-50' : ''
             }`}
             onDrop={handleDrop}
             onDragOver={handleDragOver}
             onDragLeave={handleDragLeave}
           >
-            <div className="overflow-auto max-h-[calc(100vh-16rem)]">
-            <table className="min-w-full divide-y divide-gray-200">
+            <div className="overflow-x-auto overflow-y-auto h-[calc(100vh-22rem)]">
+            <table className="min-w-full divide-y divide-gray-200 w-max">
             <thead className="bg-gray-50">
               <tr>
                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">

@@ -108,8 +108,8 @@ class BigQueryService:
         Returns:
             WHERE clause string (includes "WHERE" keyword if non-empty)
         """
-        # Clamp dates to allowed range
-        start_date, end_date = self._clamp_dates(start_date, end_date)
+        # Date access limits removed - no longer clamping dates
+        # start_date, end_date = self._clamp_dates(start_date, end_date)
 
         conditions = []
 
@@ -572,24 +572,13 @@ def get_bigquery_info() -> dict:
         # Get table metadata
         table_ref = bq_service.client.get_table(bq_service.table_path)
 
-        # Build date filter clause if date limits are set
-        date_filter_conditions = []
-        if bq_service.allowed_min_date:
-            date_filter_conditions.append(f"date >= '{bq_service.allowed_min_date}'")
-        if bq_service.allowed_max_date:
-            date_filter_conditions.append(f"date <= '{bq_service.allowed_max_date}'")
-
-        date_filter_clause = ""
-        if date_filter_conditions:
-            date_filter_clause = "WHERE " + " AND ".join(date_filter_conditions)
-
+        # Date access limits removed - return full date range from table
         # Get date range
         date_query = f"""
             SELECT
                 MIN(date) as min_date,
                 MAX(date) as max_date
             FROM `{bq_service.table_path}`
-            {date_filter_clause}
         """
         date_df = bq_service.client.query(date_query).to_dataframe()
 
@@ -601,38 +590,23 @@ def get_bigquery_info() -> dict:
                 SUM(gross_purchase) as total_revenue,
                 COUNT(DISTINCT search_term) as unique_search_terms
             FROM `{bq_service.table_path}`
-            {date_filter_clause}
         """
         stats_df = bq_service.client.query(stats_query).to_dataframe()
 
         # Get available countries
-        # Combine date filter with country NOT NULL condition
-        countries_where = date_filter_clause
-        if countries_where:
-            countries_where += " AND country IS NOT NULL"
-        else:
-            countries_where = "WHERE country IS NOT NULL"
-
         countries_query = f"""
             SELECT DISTINCT country
             FROM `{bq_service.table_path}`
-            {countries_where}
+            WHERE country IS NOT NULL
             ORDER BY country
         """
         countries_df = bq_service.client.query(countries_query).to_dataframe()
 
         # Get available channels
-        # Combine date filter with channel NOT NULL condition
-        channels_where = date_filter_clause
-        if channels_where:
-            channels_where += " AND channel IS NOT NULL"
-        else:
-            channels_where = "WHERE channel IS NOT NULL"
-
         channels_query = f"""
             SELECT DISTINCT channel
             FROM `{bq_service.table_path}`
-            {channels_where}
+            WHERE channel IS NOT NULL
             ORDER BY channel
         """
         channels_df = bq_service.client.query(channels_query).to_dataframe()

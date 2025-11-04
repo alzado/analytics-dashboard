@@ -17,11 +17,7 @@ from services.bigquery_service import (
 )
 from config import config
 from models.schemas import (
-    OverviewMetrics,
-    TrendData,
     FilterParams,
-    DimensionBreakdown,
-    SearchTermData,
     PivotResponse,
     PivotChildRow,
     BigQueryInfo,
@@ -91,99 +87,6 @@ async def root():
 async def health_check():
     """Health check endpoint"""
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}
-
-@app.get("/api/overview", response_model=OverviewMetrics)
-async def get_overview(
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None,
-    country: Optional[str] = None,
-    channel: Optional[str] = None,
-    n_attributes_min: Optional[int] = None,
-    n_attributes_max: Optional[int] = None,
-):
-    """Get overview metrics with optional filters"""
-    try:
-        filters = FilterParams(
-            start_date=start_date,
-            end_date=end_date,
-            country=country,
-            channel=channel,
-            n_attributes_min=n_attributes_min,
-            n_attributes_max=n_attributes_max
-        )
-        return data_service.get_overview_metrics(filters)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/trends", response_model=List[TrendData])
-async def get_trends(
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None,
-    country: Optional[str] = None,
-    channel: Optional[str] = None,
-    granularity: str = "daily",
-):
-    """Get time series trend data"""
-    try:
-        filters = FilterParams(
-            start_date=start_date,
-            end_date=end_date,
-            country=country,
-            channel=channel
-        )
-        return data_service.get_trend_data(filters, granularity)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/breakdown/{dimension}", response_model=List[DimensionBreakdown])
-async def get_dimension_breakdown(
-    dimension: str,
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None,
-    country: Optional[str] = None,
-    channel: Optional[str] = None,
-    limit: int = 20,
-):
-    """Get breakdown by dimension (channel, n_words, n_attributes, etc.)"""
-    try:
-        filters = FilterParams(
-            start_date=start_date,
-            end_date=end_date,
-            country=country,
-            channel=channel
-        )
-        return data_service.get_dimension_breakdown(dimension, filters, limit)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/search-terms", response_model=List[SearchTermData])
-async def get_search_terms(
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None,
-    country: Optional[str] = None,
-    channel: Optional[str] = None,
-    limit: int = 100,
-    sort_by: str = "queries",
-):
-    """Get top search terms"""
-    try:
-        filters = FilterParams(
-            start_date=start_date,
-            end_date=end_date,
-            country=country,
-            channel=channel
-        )
-        return data_service.get_search_terms(filters, limit, sort_by)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/filters/options")
-async def get_filter_options():
-    """Get available filter options (countries, channels, date range)"""
-    try:
-        return data_service.get_filter_options()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/bigquery/info", response_model=BigQueryInfo)
 async def get_bigquery_information():
@@ -307,6 +210,7 @@ async def get_pivot_table(
     end_date: Optional[str] = None,
     country: Optional[str] = None,
     channel: Optional[str] = None,
+    gcategory: Optional[str] = None,
     n_attributes_min: Optional[int] = None,
     n_attributes_max: Optional[int] = None,
     attr_categoria: Optional[bool] = None,
@@ -326,6 +230,7 @@ async def get_pivot_table(
             end_date=end_date,
             country=country,
             channel=channel,
+            gcategory=gcategory,
             n_attributes_min=n_attributes_min,
             n_attributes_max=n_attributes_max,
             attr_categoria=attr_categoria,
@@ -347,6 +252,7 @@ async def get_all_pivot_children(
     end_date: Optional[str] = None,
     country: Optional[str] = None,
     channel: Optional[str] = None,
+    gcategory: Optional[str] = None,
     n_attributes_min: Optional[int] = None,
     n_attributes_max: Optional[int] = None,
     attr_categoria: Optional[bool] = None,
@@ -367,6 +273,7 @@ async def get_all_pivot_children(
             end_date=end_date,
             country=country,
             channel=channel,
+            gcategory=gcategory,
             n_attributes_min=n_attributes_min,
             n_attributes_max=n_attributes_max,
             attr_categoria=attr_categoria,
@@ -390,6 +297,7 @@ async def get_pivot_children(
     end_date: Optional[str] = None,
     country: Optional[str] = None,
     channel: Optional[str] = None,
+    gcategory: Optional[str] = None,
     n_attributes_min: Optional[int] = None,
     n_attributes_max: Optional[int] = None,
     attr_categoria: Optional[bool] = None,
@@ -410,6 +318,7 @@ async def get_pivot_children(
             end_date=end_date,
             country=country,
             channel=channel,
+            gcategory=gcategory,
             n_attributes_min=n_attributes_min,
             n_attributes_max=n_attributes_max,
             attr_categoria=attr_categoria,
