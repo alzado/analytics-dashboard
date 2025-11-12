@@ -33,19 +33,21 @@ class FormulaParser:
     def __init__(self, schema_service: SchemaService):
         self.schema_service = schema_service
 
-    def parse_formula(self, formula: str, schema: SchemaConfig) -> Tuple[str, List[str], List[str]]:
+    def parse_formula(self, formula: str, schema: SchemaConfig, current_metric_id: Optional[str] = None) -> Tuple[str, List[str], List[str], List[str], List[str]]:
         """
-        Parse a formula and return (sql_expression, depends_on, errors).
+        Parse a formula and return (sql_expression, depends_on, depends_on_base, depends_on_calculated, errors).
 
         Args:
             formula: User formula like "{queries_pdp} / {queries}"
             schema: Schema configuration to look up metric definitions
+            current_metric_id: ID of the metric being created/updated (for circular dependency detection)
 
         Returns:
-            Tuple of (sql_expression, depends_on_metric_ids, errors)
+            Tuple of (sql_expression, depends_on_all, depends_on_base, depends_on_calculated, errors)
         """
         errors = []
-        depends_on = []
+        depends_on_base = []
+        depends_on_calculated = []
 
         # Extract all metric references {metric_id}
         metric_refs = re.findall(r'\{([a-zA-Z0-9_]+)\}', formula)
@@ -59,26 +61,32 @@ class FormulaParser:
             if metric_ref not in all_metric_ids:
                 errors.append(f"Unknown metric reference: {metric_ref}")
             else:
-                if metric_ref not in depends_on:
-                    depends_on.append(metric_ref)
+                # Track which type of metric is referenced
+                if metric_ref in base_metric_ids and metric_ref not in depends_on_base:
+                    depends_on_base.append(metric_ref)
+                elif metric_ref in calculated_metric_ids and metric_ref not in depends_on_calculated:
+                    depends_on_calculated.append(metric_ref)
+
+        # Check for circular dependencies
+        if current_metric_id and current_metric_id in depends_on_calculated:
+            errors.append(f"Circular dependency detected: metric '{current_metric_id}' references itself")
+
+        # Check for deeper circular dependencies
+        if current_metric_id and depends_on_calculated:
+            circular_deps = self._detect_circular_dependencies(
+                current_metric_id,
+                depends_on_calculated,
+                schema
+            )
+            if circular_deps:
+                errors.append(f"Circular dependency chain detected: {' -> '.join(circular_deps)}")
 
         if errors:
-            return "", depends_on, errors
+            depends_on_all = depends_on_base + depends_on_calculated
+            return "", depends_on_all, depends_on_base, depends_on_calculated, errors
 
-        # Replace base metric references with their aggregated forms
-        # Note: Formulas should not contain {calculated_metric} references because
-        # the formula builder UI expands calculated metrics inline
-        sql_expression = formula
-        for metric_ref in metric_refs:
-            base_metric = next((m for m in schema.base_metrics if m.id == metric_ref), None)
-            if base_metric:
-                agg_func = base_metric.aggregation
-                # Replace {metric_id} with AGG(column_name)
-                if agg_func == 'COUNT_DISTINCT':
-                    replacement = f"COUNT(DISTINCT {base_metric.column_name})"
-                else:
-                    replacement = f"{agg_func}({base_metric.column_name})"
-                sql_expression = sql_expression.replace(f"{{{metric_ref}}}", replacement)
+        # Generate SQL by recursively resolving metric references
+        sql_expression = self._resolve_formula_to_sql(formula, schema, current_metric_id)
 
         # Handle division specially - wrap with SAFE_DIVIDE
         sql_expression = self._convert_division_to_safe_divide(sql_expression)
@@ -87,7 +95,96 @@ class FormulaParser:
         if not self._is_valid_sql_expression(sql_expression):
             errors.append("Generated SQL expression appears invalid")
 
-        return sql_expression, depends_on, errors
+        depends_on_all = depends_on_base + depends_on_calculated
+        return sql_expression, depends_on_all, depends_on_base, depends_on_calculated, errors
+
+    def _detect_circular_dependencies(self, metric_id: str, depends_on: List[str], schema: SchemaConfig, visited: Optional[Set[str]] = None) -> Optional[List[str]]:
+        """
+        Detect circular dependencies in calculated metrics.
+        Returns the circular dependency chain if found, None otherwise.
+        """
+        if visited is None:
+            visited = {metric_id}
+
+        for dep_id in depends_on:
+            if dep_id == metric_id:
+                return [metric_id, dep_id]
+
+            if dep_id in visited:
+                return [metric_id, dep_id]
+
+            # Check if this dependency is a calculated metric
+            dep_metric = next((m for m in schema.calculated_metrics if m.id == dep_id), None)
+            if dep_metric and dep_metric.depends_on_calculated:
+                new_visited = visited | {dep_id}
+                chain = self._detect_circular_dependencies(
+                    metric_id,
+                    dep_metric.depends_on_calculated,
+                    schema,
+                    new_visited
+                )
+                if chain:
+                    return [dep_id] + chain
+
+        return None
+
+    def _resolve_formula_to_sql(self, formula: str, schema: SchemaConfig, current_metric_id: Optional[str] = None, visited: Optional[Set[str]] = None) -> str:
+        """
+        Recursively resolve a formula to SQL by replacing metric references with their SQL expressions.
+        This allows calculated metrics to reference other calculated metrics, and changes to base metrics
+        propagate through all dependent calculated metrics.
+
+        Args:
+            formula: Formula with {metric_id} references
+            schema: Schema configuration
+            current_metric_id: ID of current metric being resolved (for cycle detection)
+            visited: Set of metric IDs already visited (for cycle detection)
+
+        Returns:
+            SQL expression with all metric references resolved
+        """
+        import re
+
+        if visited is None:
+            visited = set()
+        if current_metric_id:
+            visited.add(current_metric_id)
+
+        # Find all metric references in the formula
+        metric_refs = re.findall(r'\{([a-zA-Z0-9_]+)\}', formula)
+
+        sql_expression = formula
+        for metric_ref in metric_refs:
+            # Check for circular reference
+            if metric_ref in visited:
+                # Skip circular reference - this will be caught by validation
+                continue
+
+            # Check if it's a base metric
+            base_metric = next((m for m in schema.base_metrics if m.id == metric_ref), None)
+            if base_metric:
+                # Replace with aggregated column
+                agg_func = base_metric.aggregation
+                if agg_func == 'COUNT_DISTINCT':
+                    replacement = f"COUNT(DISTINCT {base_metric.column_name})"
+                else:
+                    replacement = f"{agg_func}({base_metric.column_name})"
+                sql_expression = sql_expression.replace(f"{{{metric_ref}}}", replacement)
+            else:
+                # It's a calculated metric - recursively resolve its formula
+                calc_metric = next((m for m in schema.calculated_metrics if m.id == metric_ref), None)
+                if calc_metric:
+                    # Recursively resolve the calculated metric's formula
+                    resolved_sql = self._resolve_formula_to_sql(
+                        calc_metric.formula,
+                        schema,
+                        metric_ref,
+                        visited.copy()
+                    )
+                    # Wrap in parentheses to preserve order of operations
+                    sql_expression = sql_expression.replace(f"{{{metric_ref}}}", f"({resolved_sql})")
+
+        return sql_expression
 
     def _convert_division_to_safe_divide(self, expression: str) -> str:
         """
@@ -203,9 +300,10 @@ class MetricService:
         if syntax_errors:
             raise ValueError(f"Formula syntax errors: {', '.join(syntax_errors)}")
 
-        sql_expression, depends_on, parse_errors = self.formula_parser.parse_formula(
+        sql_expression, depends_on, depends_on_base, depends_on_calculated, parse_errors = self.formula_parser.parse_formula(
             metric_data.formula,
-            schema
+            schema,
+            current_metric_id=metric_data.id
         )
 
         if parse_errors:
@@ -218,6 +316,8 @@ class MetricService:
             formula=metric_data.formula,
             sql_expression=sql_expression,
             depends_on=depends_on,
+            depends_on_base=depends_on_base,
+            depends_on_calculated=depends_on_calculated,
             format_type=metric_data.format_type,
             decimal_places=metric_data.decimal_places,
             category=metric_data.category,
@@ -269,9 +369,10 @@ class MetricService:
             if syntax_errors:
                 raise ValueError(f"Formula syntax errors: {', '.join(syntax_errors)}")
 
-            sql_expression, depends_on, parse_errors = self.formula_parser.parse_formula(
+            sql_expression, depends_on, depends_on_base, depends_on_calculated, parse_errors = self.formula_parser.parse_formula(
                 update_data.formula,
-                schema
+                schema,
+                current_metric_id=metric_id
             )
 
             if parse_errors:
@@ -280,6 +381,8 @@ class MetricService:
             metric.formula = update_data.formula
             metric.sql_expression = sql_expression
             metric.depends_on = depends_on
+            metric.depends_on_base = depends_on_base
+            metric.depends_on_calculated = depends_on_calculated
 
         # Update other fields
         update_dict = update_data.model_dump(exclude_unset=True, exclude={'formula'})
@@ -357,7 +460,7 @@ class MetricService:
     def validate_formula(self, formula: str) -> dict:
         """
         Validate a formula without saving it.
-        Returns dict with: {valid: bool, sql_expression: str, depends_on: list, errors: list}
+        Returns dict with: {valid: bool, sql_expression: str, depends_on: list, depends_on_base: list, depends_on_calculated: list, errors: list}
         """
         schema = self.schema_service.load_schema()
         if not schema:
@@ -365,7 +468,9 @@ class MetricService:
                 'valid': False,
                 'errors': ['Schema not loaded'],
                 'sql_expression': '',
-                'depends_on': []
+                'depends_on': [],
+                'depends_on_base': [],
+                'depends_on_calculated': []
             }
 
         # Check syntax
@@ -375,23 +480,190 @@ class MetricService:
                 'valid': False,
                 'errors': syntax_errors,
                 'sql_expression': '',
-                'depends_on': []
+                'depends_on': [],
+                'depends_on_base': [],
+                'depends_on_calculated': []
             }
 
         # Parse formula
-        sql_expression, depends_on, parse_errors = self.formula_parser.parse_formula(formula, schema)
+        sql_expression, depends_on, depends_on_base, depends_on_calculated, parse_errors = self.formula_parser.parse_formula(formula, schema)
 
         if parse_errors:
             return {
                 'valid': False,
                 'errors': parse_errors,
                 'sql_expression': sql_expression,
-                'depends_on': depends_on
+                'depends_on': depends_on,
+                'depends_on_base': depends_on_base,
+                'depends_on_calculated': depends_on_calculated
             }
 
         return {
             'valid': True,
             'errors': [],
             'sql_expression': sql_expression,
-            'depends_on': depends_on
+            'depends_on': depends_on,
+            'depends_on_base': depends_on_base,
+            'depends_on_calculated': depends_on_calculated
+        }
+
+    def get_all_dependents(self, metric_id: str, metric_type: str = 'base') -> List[str]:
+        """
+        Get all calculated metrics that depend on the given metric (directly or indirectly).
+
+        Args:
+            metric_id: ID of the metric to find dependents for
+            metric_type: 'base' or 'calculated'
+
+        Returns:
+            List of calculated metric IDs that depend on this metric
+        """
+        schema = self.schema_service.load_schema()
+        if not schema:
+            return []
+
+        dependents = set()
+
+        # Find direct dependents
+        if metric_type == 'base':
+            direct_dependents = [
+                m.id for m in schema.calculated_metrics
+                if metric_id in m.depends_on_base
+            ]
+        else:  # calculated
+            direct_dependents = [
+                m.id for m in schema.calculated_metrics
+                if metric_id in m.depends_on_calculated
+            ]
+
+        # Recursively find indirect dependents
+        for dep_id in direct_dependents:
+            dependents.add(dep_id)
+            # Find metrics that depend on this dependent
+            indirect_dependents = self.get_all_dependents(dep_id, 'calculated')
+            dependents.update(indirect_dependents)
+
+        return sorted(list(dependents))
+
+    def _topological_sort_metrics(self, metric_ids: List[str], schema: SchemaConfig) -> List[str]:
+        """
+        Sort calculated metrics in dependency order (metrics with no dependencies first).
+        This ensures that when we re-parse formulas, dependencies are updated before dependents.
+
+        Args:
+            metric_ids: List of calculated metric IDs to sort
+            schema: Current schema
+
+        Returns:
+            Sorted list of metric IDs
+        """
+        # Build dependency graph
+        in_degree = {mid: 0 for mid in metric_ids}
+        adj_list = {mid: [] for mid in metric_ids}
+
+        for metric_id in metric_ids:
+            metric = next((m for m in schema.calculated_metrics if m.id == metric_id), None)
+            if not metric:
+                continue
+
+            # Count dependencies that are in our update set
+            deps_in_set = [d for d in metric.depends_on_calculated if d in metric_ids]
+            in_degree[metric_id] = len(deps_in_set)
+
+            # Build adjacency list (reverse direction: dep -> dependent)
+            for dep_id in deps_in_set:
+                if dep_id in adj_list:
+                    adj_list[dep_id].append(metric_id)
+
+        # Kahn's algorithm for topological sort
+        queue = [mid for mid in metric_ids if in_degree[mid] == 0]
+        result = []
+
+        while queue:
+            current = queue.pop(0)
+            result.append(current)
+
+            for neighbor in adj_list[current]:
+                in_degree[neighbor] -= 1
+                if in_degree[neighbor] == 0:
+                    queue.append(neighbor)
+
+        # If result doesn't contain all metrics, there's a cycle (shouldn't happen with our validation)
+        if len(result) != len(metric_ids):
+            # Fall back to original order
+            return metric_ids
+
+        return result
+
+    def cascade_update_dependents(self, metric_id: str, metric_type: str = 'base') -> dict:
+        """
+        Cascade update all calculated metrics that depend on the given metric.
+        Re-parses formulas to regenerate SQL expressions.
+
+        Args:
+            metric_id: ID of the metric that was changed
+            metric_type: 'base' or 'calculated'
+
+        Returns:
+            Dict with: {updated_count: int, updated_metrics: List[str]}
+        """
+        print(f"🔄 CASCADE UPDATE triggered for {metric_type} metric '{metric_id}'")
+
+        schema = self.schema_service.load_schema()
+        if not schema:
+            print("❌ No schema found")
+            return {'updated_count': 0, 'updated_metrics': []}
+
+        # Find all metrics that need updating
+        dependent_ids = self.get_all_dependents(metric_id, metric_type)
+        print(f"📊 Found {len(dependent_ids)} dependent metrics: {dependent_ids}")
+
+        if not dependent_ids:
+            return {'updated_count': 0, 'updated_metrics': []}
+
+        # Sort in dependency order
+        sorted_ids = self._topological_sort_metrics(dependent_ids, schema)
+
+        updated_metrics = []
+
+        # Re-parse each metric's formula in dependency order
+        for dep_id in sorted_ids:
+            metric = next((m for m in schema.calculated_metrics if m.id == dep_id), None)
+            if not metric:
+                continue
+
+            try:
+                # Re-parse the formula with current schema (which has updated dependencies)
+                sql_expression, depends_on, depends_on_base, depends_on_calculated, parse_errors = self.formula_parser.parse_formula(
+                    metric.formula,
+                    schema,
+                    current_metric_id=dep_id
+                )
+
+                if parse_errors:
+                    # Log error but continue with other metrics
+                    print(f"Warning: Error re-parsing metric '{dep_id}': {', '.join(parse_errors)}")
+                    continue
+
+                # Update the metric
+                old_sql = metric.sql_expression
+                metric.sql_expression = sql_expression
+                metric.depends_on = depends_on
+                metric.depends_on_base = depends_on_base
+                metric.depends_on_calculated = depends_on_calculated
+
+                updated_metrics.append(dep_id)
+                print(f"  ✓ Updated '{dep_id}': SQL changed from '{old_sql[:80]}...' to '{sql_expression[:80]}...'")
+
+            except Exception as e:
+                print(f"Warning: Exception re-parsing metric '{dep_id}': {str(e)}")
+                continue
+
+        # Save updated schema
+        if updated_metrics:
+            self.schema_service.save_schema(schema)
+
+        return {
+            'updated_count': len(updated_metrics),
+            'updated_metrics': updated_metrics
         }

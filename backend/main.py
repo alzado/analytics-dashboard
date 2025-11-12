@@ -801,12 +801,23 @@ async def get_base_metric(metric_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.put("/api/metrics/base/{metric_id}", response_model=BaseMetric)
+@app.put("/api/metrics/base/{metric_id}")
 async def update_base_metric(metric_id: str, update: MetricUpdate):
-    """Update a base metric"""
+    """Update a base metric and cascade update dependents"""
     try:
         _, metric_service, _ = get_schema_services()
-        return metric_service.update_base_metric(metric_id, update)
+
+        # Update the base metric
+        updated_metric = metric_service.update_base_metric(metric_id, update)
+
+        # Cascade update all dependent calculated metrics
+        cascade_result = metric_service.cascade_update_dependents(metric_id, metric_type='base')
+
+        return {
+            "metric": updated_metric,
+            "cascade_updated_count": cascade_result['updated_count'],
+            "cascade_updated_metrics": cascade_result['updated_metrics']
+        }
     except HTTPException:
         raise
     except ValueError as e:
@@ -870,12 +881,23 @@ async def get_calculated_metric(metric_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.put("/api/metrics/calculated/{metric_id}", response_model=CalculatedMetric)
+@app.put("/api/metrics/calculated/{metric_id}")
 async def update_calculated_metric(metric_id: str, update: CalculatedMetricUpdate):
-    """Update a calculated metric"""
+    """Update a calculated metric and cascade update dependents"""
     try:
         _, metric_service, _ = get_schema_services()
-        return metric_service.update_calculated_metric(metric_id, update)
+
+        # Update the calculated metric
+        updated_metric = metric_service.update_calculated_metric(metric_id, update)
+
+        # Cascade update all dependent calculated metrics (if any)
+        cascade_result = metric_service.cascade_update_dependents(metric_id, metric_type='calculated')
+
+        return {
+            "metric": updated_metric,
+            "cascade_updated_count": cascade_result['updated_count'],
+            "cascade_updated_metrics": cascade_result['updated_metrics']
+        }
     except HTTPException:
         raise
     except ValueError as e:

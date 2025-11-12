@@ -360,11 +360,50 @@ class SchemaService:
             with open(schema_file, 'r') as f:
                 data = json.load(f)
                 schema = SchemaConfig(**data)
+
+                # Migrate old schemas to populate new dependency fields
+                needs_migration = self._migrate_calculated_metric_dependencies(schema)
+                if needs_migration:
+                    # Save the migrated schema
+                    self.save_schema(schema)
+                    print("✓ Migrated schema: populated depends_on_base and depends_on_calculated fields")
+
                 self._schema_cache = schema
                 return schema
         except Exception as e:
             print(f"Failed to load schema config: {e}")
             return None
+
+    def _migrate_calculated_metric_dependencies(self, schema: SchemaConfig) -> bool:
+        """
+        Migrate old calculated metrics to populate depends_on_base and depends_on_calculated fields.
+        Returns True if migration was performed, False otherwise.
+        """
+        needs_migration = False
+        base_metric_ids = {m.id for m in schema.base_metrics}
+        calculated_metric_ids = {m.id for m in schema.calculated_metrics}
+
+        for calc_metric in schema.calculated_metrics:
+            # Check if this metric needs migration
+            # Migrate if EITHER field is empty but depends_on has values
+            if calc_metric.depends_on and (not calc_metric.depends_on_base or not calc_metric.depends_on_calculated):
+                # Parse the depends_on field to separate base and calculated dependencies
+                depends_on_base = []
+                depends_on_calculated = []
+
+                for dep_id in calc_metric.depends_on:
+                    if dep_id in base_metric_ids:
+                        depends_on_base.append(dep_id)
+                    elif dep_id in calculated_metric_ids:
+                        depends_on_calculated.append(dep_id)
+
+                # Update the fields
+                calc_metric.depends_on_base = depends_on_base
+                calc_metric.depends_on_calculated = depends_on_calculated
+                needs_migration = True
+                print(f"  Migrated '{calc_metric.id}': base={depends_on_base}, calculated={depends_on_calculated}")
+
+        return needs_migration
 
     def save_schema(self, schema: SchemaConfig) -> None:
         """Save schema configuration to file"""

@@ -105,11 +105,16 @@ export function useSchema() {
     },
   })
 
-  const updateBaseMetricMutation = useMutation<BaseMetric, Error, { id: string; data: MetricUpdate }>({
+  const updateBaseMetricMutation = useMutation<
+    { metric: BaseMetric; cascade_updated_count: number; cascade_updated_metrics: string[] },
+    Error,
+    { id: string; data: MetricUpdate }
+  >({
     mutationFn: ({ id, data }) => updateBaseMetric(id, data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['schema'] })
       queryClient.invalidateQueries({ queryKey: ['base-metrics'] })
+      queryClient.invalidateQueries({ queryKey: ['calculated-metrics'] })
     },
   })
 
@@ -131,7 +136,7 @@ export function useSchema() {
   })
 
   const updateCalculatedMetricMutation = useMutation<
-    CalculatedMetric,
+    { metric: CalculatedMetric; cascade_updated_count: number; cascade_updated_metrics: string[] },
     Error,
     { id: string; data: CalculatedMetricUpdate }
   >({

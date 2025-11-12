@@ -16,7 +16,7 @@ interface FormulaBuilderModalProps {
 
 type FormulaToken = {
   id: string
-  type: 'metric' | 'dimension' | 'operator' | 'parenthesis' | 'number' | 'function' | 'wildcard'
+  type: 'metric' | 'dimension' | 'operator' | 'parenthesis' | 'number' | 'function' | 'wildcard' | 'comma'
   value: string
   displayName?: string
 }
@@ -39,26 +39,15 @@ export function FormulaBuilderModal({
   })
 
   const addMetric = (metric: BaseMetric | CalculatedMetric) => {
-    // Check if this is a calculated metric
-    if ('formula' in metric) {
-      // For calculated metrics, expand their formula instead of adding reference
-      const expandedTokens = parseFormulaToTokens(
-        metric.formula,
-        availableMetrics,
-        availableCalculatedMetrics,
-        availableDimensions
-      )
-      setTokens([...tokens, ...expandedTokens])
-    } else {
-      // For base metrics, add as a reference
-      const newToken: FormulaToken = {
-        id: `token-${Date.now()}-${Math.random()}`,
-        type: 'metric',
-        value: metric.id,
-        displayName: metric.display_name,
-      }
-      setTokens([...tokens, newToken])
+    // Add metric as a reference {metric_id} for both base and calculated metrics
+    // This allows cascade updates to work - when the metric changes, dependent formulas update automatically
+    const newToken: FormulaToken = {
+      id: `token-${Date.now()}-${Math.random()}`,
+      type: 'metric',
+      value: metric.id,
+      displayName: metric.display_name,
     }
+    setTokens([...tokens, newToken])
   }
 
   const addDimension = (dimension: DimensionDef) => {
@@ -71,7 +60,7 @@ export function FormulaBuilderModal({
     setTokens([...tokens, newToken])
   }
 
-  const addFunction = (funcName: 'COUNT_DISTINCT' | 'COUNT' | 'SUM' | 'AVG' | 'MIN' | 'MAX') => {
+  const addFunction = (funcName: 'COUNT' | 'SUM' | 'AVG' | 'MIN' | 'MAX' | 'CONCAT' | 'DISTINCT' | 'COALESCE') => {
     const newToken: FormulaToken = {
       id: `token-${Date.now()}-${Math.random()}`,
       type: 'function',
@@ -107,6 +96,15 @@ export function FormulaBuilderModal({
     setTokens([...tokens, newToken])
   }
 
+  const addComma = () => {
+    const newToken: FormulaToken = {
+      id: `token-${Date.now()}-${Math.random()}`,
+      type: 'comma',
+      value: ',',
+    }
+    setTokens([...tokens, newToken])
+  }
+
   const addNumber = () => {
     const number = prompt('Enter a number:')
     if (number && !isNaN(Number(number))) {
@@ -114,6 +112,18 @@ export function FormulaBuilderModal({
         id: `token-${Date.now()}-${Math.random()}`,
         type: 'number',
         value: number,
+      }
+      setTokens([...tokens, newToken])
+    }
+  }
+
+  const addString = () => {
+    const string = prompt('Enter a string (will be wrapped in quotes):')
+    if (string !== null) {
+      const newToken: FormulaToken = {
+        id: `token-${Date.now()}-${Math.random()}`,
+        type: 'number', // Reuse 'number' type for literals
+        value: `'${string}'`,
       }
       setTokens([...tokens, newToken])
     }
@@ -135,7 +145,7 @@ export function FormulaBuilderModal({
         if (token.type === 'metric') {
           return `{${token.value}}`
         } else if (token.type === 'dimension') {
-          return `[${token.value}]`
+          return token.value
         } else if (token.type === 'function') {
           return token.value
         }
@@ -194,6 +204,8 @@ export function FormulaBuilderModal({
                           ? 'bg-green-100 text-green-800'
                           : token.type === 'wildcard'
                           ? 'bg-yellow-100 text-yellow-800'
+                          : token.type === 'comma'
+                          ? 'bg-gray-200 text-gray-800'
                           : 'bg-gray-200 text-gray-800'
                       }`}
                     >
@@ -326,8 +338,8 @@ export function FormulaBuilderModal({
                 </div>
 
                 <div>
-                  <p className="text-xs text-gray-600 mb-2">Parentheses</p>
-                  <div className="grid grid-cols-2 gap-2">
+                  <p className="text-xs text-gray-600 mb-2">Parentheses & Comma</p>
+                  <div className="grid grid-cols-3 gap-2">
                     <button
                       onClick={() => addParenthesis('(')}
                       className="px-3 py-2 bg-gray-200 text-gray-800 rounded hover:bg-gray-300 font-medium"
@@ -339,6 +351,12 @@ export function FormulaBuilderModal({
                       className="px-3 py-2 bg-gray-200 text-gray-800 rounded hover:bg-gray-300 font-medium"
                     >
                       )
+                    </button>
+                    <button
+                      onClick={addComma}
+                      className="px-3 py-2 bg-gray-200 text-gray-800 rounded hover:bg-gray-300 font-medium"
+                    >
+                      ,
                     </button>
                   </div>
                 </div>
@@ -353,10 +371,10 @@ export function FormulaBuilderModal({
                       COUNT
                     </button>
                     <button
-                      onClick={() => addFunction('COUNT_DISTINCT')}
+                      onClick={() => addFunction('DISTINCT')}
                       className="w-full px-3 py-2 bg-indigo-100 text-indigo-800 rounded hover:bg-indigo-200 font-medium text-sm"
                     >
-                      COUNT_DISTINCT
+                      DISTINCT
                     </button>
                     <button
                       onClick={() => addFunction('SUM')}
@@ -382,6 +400,18 @@ export function FormulaBuilderModal({
                     >
                       MAX
                     </button>
+                    <button
+                      onClick={() => addFunction('CONCAT')}
+                      className="w-full px-3 py-2 bg-indigo-100 text-indigo-800 rounded hover:bg-indigo-200 font-medium text-sm"
+                    >
+                      CONCAT
+                    </button>
+                    <button
+                      onClick={() => addFunction('COALESCE')}
+                      className="w-full px-3 py-2 bg-indigo-100 text-indigo-800 rounded hover:bg-indigo-200 font-medium text-sm"
+                    >
+                      COALESCE
+                    </button>
                   </div>
                 </div>
 
@@ -400,6 +430,12 @@ export function FormulaBuilderModal({
                     >
                       Add Number
                     </button>
+                    <button
+                      onClick={addString}
+                      className="w-full px-3 py-2 bg-green-100 text-green-800 rounded hover:bg-green-200 font-medium"
+                    >
+                      Add String
+                    </button>
                   </div>
                 </div>
               </div>
@@ -409,8 +445,10 @@ export function FormulaBuilderModal({
                 <p className="font-medium mb-1">Tips:</p>
                 <ul className="list-disc list-inside space-y-1">
                   <li>Click metrics/dimensions to add them</li>
-                  <li>Use COUNT_DISTINCT with dimensions for unique counts</li>
-                  <li>Example: COUNT_DISTINCT ( [user_id] )</li>
+                  <li>Use COUNT with DISTINCT for unique counts</li>
+                  <li>Example: COUNT ( DISTINCT [user_id] )</li>
+                  <li>Use CONCAT to combine text fields</li>
+                  <li>Example: CONCAT ( [country] , [channel] )</li>
                   <li>Division uses SAFE_DIVIDE (no errors)</li>
                   <li>Click X on tokens to remove them</li>
                 </ul>
@@ -448,7 +486,8 @@ function parseFormulaToTokens(
   availableDimensions: DimensionDef[]
 ): FormulaToken[] {
   const tokens: FormulaToken[] = []
-  const parts = formula.split(/(\{[^}]+\}|\[[^\]]+\]|COUNT_DISTINCT|COUNT|SUM|AVG|MIN|MAX|[+\-*/()]|\s+)/).filter(p => p.trim())
+  // Note: COUNT_DISTINCT is kept for backward compatibility, but we'll convert it to COUNT DISTINCT
+  const parts = formula.split(/(\{[^}]+\}|\[[^\]]+\]|COUNT_DISTINCT|DISTINCT|COUNT|SUM|AVG|MIN|MAX|CONCAT|[+\-*/(),]|\s+)/).filter(p => p.trim())
 
   parts.forEach((part, index) => {
     const metricMatch = part.match(/^\{([^}]+)\}$/)
@@ -474,7 +513,19 @@ function parseFormulaToTokens(
         value: dimensionId,
         displayName: dimension?.display_name || dimensionId,
       })
-    } else if (['COUNT_DISTINCT', 'COUNT', 'SUM', 'AVG', 'MIN', 'MAX'].includes(part)) {
+    } else if (part === 'COUNT_DISTINCT') {
+      // Convert COUNT_DISTINCT to COUNT DISTINCT for backward compatibility
+      tokens.push({
+        id: `token-init-${index}-count`,
+        type: 'function',
+        value: 'COUNT',
+      })
+      tokens.push({
+        id: `token-init-${index}-distinct`,
+        type: 'function',
+        value: 'DISTINCT',
+      })
+    } else if (['COUNT', 'DISTINCT', 'SUM', 'AVG', 'MIN', 'MAX', 'CONCAT'].includes(part)) {
       tokens.push({
         id: `token-init-${index}`,
         type: 'function',
@@ -497,6 +548,12 @@ function parseFormulaToTokens(
       tokens.push({
         id: `token-init-${index}`,
         type: 'parenthesis',
+        value: part,
+      })
+    } else if (part === ',') {
+      tokens.push({
+        id: `token-init-${index}`,
+        type: 'comma',
         value: part,
       })
     } else if (!isNaN(Number(part))) {

@@ -225,10 +225,18 @@ export function SchemaSection() {
     if (!editingBaseMetric) return
 
     try {
-      await updateBaseMetric({ id: editingBaseMetric.id, data })
+      const result = await updateBaseMetric({ id: editingBaseMetric.id, data })
       setIsBaseMetricModalOpen(false)
       setEditingBaseMetric(null)
-      setDetectionResult('Base metric updated successfully!')
+
+      // Show success message with cascade info
+      if (result.cascade_updated_count > 0) {
+        setDetectionResult(
+          `Base metric updated successfully! Also updated ${result.cascade_updated_count} dependent calculated metric(s): ${result.cascade_updated_metrics.join(', ')}`
+        )
+      } else {
+        setDetectionResult('Base metric updated successfully!')
+      }
     } catch (error) {
       setDetectionResult(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`)
     }
@@ -255,10 +263,18 @@ export function SchemaSection() {
     if (!editingCalculatedMetric) return
 
     try {
-      await updateCalculatedMetric({ id: editingCalculatedMetric.id, data })
+      const result = await updateCalculatedMetric({ id: editingCalculatedMetric.id, data })
       setIsCalculatedMetricModalOpen(false)
       setEditingCalculatedMetric(null)
-      setDetectionResult('Calculated metric updated successfully!')
+
+      // Show success message with cascade info
+      if (result.cascade_updated_count > 0) {
+        setDetectionResult(
+          `Calculated metric updated successfully! Also updated ${result.cascade_updated_count} dependent calculated metric(s): ${result.cascade_updated_metrics.join(', ')}`
+        )
+      } else {
+        setDetectionResult('Calculated metric updated successfully!')
+      }
     } catch (error) {
       setDetectionResult(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`)
     }
@@ -594,6 +610,9 @@ export function SchemaSection() {
             setIsCalculatedMetricModalOpen(false)
             setEditingCalculatedMetric(null)
           }}
+          baseMetrics={baseMetrics || []}
+          calculatedMetrics={calculatedMetrics || []}
+          dimensions={dimensions || []}
         />
       )}
 
@@ -1850,9 +1869,12 @@ interface EditCalculatedMetricModalProps {
   metric: CalculatedMetric
   onSave: (data: CalculatedMetricUpdate) => void
   onClose: () => void
+  baseMetrics: BaseMetric[]
+  calculatedMetrics: CalculatedMetric[]
+  dimensions: DimensionDef[]
 }
 
-function EditCalculatedMetricModal({ metric, onSave, onClose }: EditCalculatedMetricModalProps) {
+function EditCalculatedMetricModal({ metric, onSave, onClose, baseMetrics, calculatedMetrics, dimensions }: EditCalculatedMetricModalProps) {
   const [formData, setFormData] = useState({
     display_name: metric.display_name,
     formula: metric.formula,
@@ -1863,6 +1885,7 @@ function EditCalculatedMetricModal({ metric, onSave, onClose }: EditCalculatedMe
     sort_order: metric.sort_order,
     description: metric.description || '',
   })
+  const [isFormulaBuilderOpen, setIsFormulaBuilderOpen] = useState(false)
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
@@ -1895,14 +1918,23 @@ function EditCalculatedMetricModal({ metric, onSave, onClose }: EditCalculatedMe
             <label className="block text-sm font-medium text-gray-700 mb-1">
               Formula
             </label>
-            <textarea
-              value={formData.formula}
-              onChange={(e) => setFormData({ ...formData, formula: e.target.value })}
-              className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono text-sm"
-              rows={3}
-              placeholder="{metric1} / {metric2}"
-              required
-            />
+            <div className="relative">
+              <textarea
+                value={formData.formula}
+                onChange={(e) => setFormData({ ...formData, formula: e.target.value })}
+                className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono text-sm"
+                rows={3}
+                placeholder="{metric1} / {metric2}"
+                required
+              />
+              <button
+                type="button"
+                onClick={() => setIsFormulaBuilderOpen(true)}
+                className="absolute top-2 right-2 px-3 py-1 text-xs font-medium text-blue-600 bg-blue-50 border border-blue-200 rounded hover:bg-blue-100"
+              >
+                Open Formula Builder
+              </button>
+            </div>
             <p className="text-xs text-gray-500 mt-1">Use curly braces to reference other metrics, e.g., {'{'}queries{'}'}</p>
           </div>
 
@@ -2009,6 +2041,20 @@ function EditCalculatedMetricModal({ metric, onSave, onClose }: EditCalculatedMe
             </button>
           </div>
         </form>
+
+        {/* Formula Builder Modal */}
+        <FormulaBuilderModal
+          isOpen={isFormulaBuilderOpen}
+          onClose={() => setIsFormulaBuilderOpen(false)}
+          availableMetrics={baseMetrics}
+          availableCalculatedMetrics={calculatedMetrics}
+          availableDimensions={dimensions}
+          initialFormula={formData.formula}
+          onApply={(formula) => {
+            setFormData({ ...formData, formula })
+            setIsFormulaBuilderOpen(false)
+          }}
+        />
       </div>
     </div>
   )
