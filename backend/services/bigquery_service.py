@@ -19,7 +19,8 @@ class BigQueryService:
         project_id: str,
         dataset: str,
         table: str,
-        credentials_path: Optional[str] = None
+        credentials_path: Optional[str] = None,
+        table_id: Optional[str] = None
     ):
         """
         Initialize BigQuery service.
@@ -29,11 +30,13 @@ class BigQueryService:
             dataset: BigQuery dataset name
             table: BigQuery table name
             credentials_path: Path to service account JSON (optional)
+            table_id: Table ID for multi-table support (optional)
         """
         self.project_id = project_id
         self.dataset = dataset
         self.table = table
         self.table_path = f"{project_id}.{dataset}.{table}"
+        self.table_id = table_id
 
         # Date limits (optional)
         self.allowed_min_date: Optional[str] = None
@@ -46,6 +49,11 @@ class BigQueryService:
         else:
             self.client = bigquery.Client(project=project_id)
 
+        # Initialize schema service and load schema
+        self.schema_service = None
+        self.schema_config = None
+        self._load_schema()
+
     def set_date_limits(self, min_date: Optional[str] = None, max_date: Optional[str] = None) -> None:
         """
         Set allowed date range for queries.
@@ -56,6 +64,76 @@ class BigQueryService:
         """
         self.allowed_min_date = min_date
         self.allowed_max_date = max_date
+
+    def _load_schema(self) -> None:
+        """Load schema configuration from SchemaService."""
+        try:
+            from services.schema_service import SchemaService
+
+            self.schema_service = SchemaService(self.client, table_id=self.table_id)
+
+            # Try to load existing schema or create default
+            self.schema_config = self.schema_service.load_schema()
+
+            if not self.schema_config:
+                # Auto-detect and create schema on first run
+                self.schema_config = self.schema_service.get_or_create_schema(
+                    self.project_id,
+                    self.dataset,
+                    self.table,
+                    auto_detect=True
+                )
+        except Exception as e:
+            print(f"Warning: Failed to load schema: {e}")
+            print("BigQuery service will continue without dynamic schema")
+            self.schema_service = None
+            self.schema_config = None
+
+    def _build_metric_select_clause(self, include_search_term: bool = False) -> str:
+        """
+        Build SELECT clause dynamically from schema.
+
+        Args:
+            include_search_term: Whether to include search_term column
+
+        Returns:
+            Comma-separated SELECT clause with aggregated metrics
+        """
+        if not self.schema_config:
+            raise ValueError("Schema not loaded. Cannot build metric SELECT clause without schema configuration.")
+
+        select_parts = []
+
+        # Add search_term if requested (not aggregated)
+        if include_search_term:
+            select_parts.append("search_term")
+
+        # Add all base metrics with their aggregations
+        for metric in self.schema_config.base_metrics:
+            if metric.aggregation == 'COUNT_DISTINCT':
+                # Support multi-column COUNT_DISTINCT: column_name can be "col1, col2, col3"
+                # BigQuery syntax: COUNT(DISTINCT col1, col2, col3)
+                columns = metric.column_name.strip()
+                select_parts.append(f"COUNT(DISTINCT {columns}) as {metric.id}")
+            else:
+                select_parts.append(f"{metric.aggregation}({metric.column_name}) as {metric.id}")
+
+        # Note: Calculated metrics are computed post-query using their sql_expression
+        # They cannot be included in the SELECT directly as they depend on base metrics
+
+        return ",\n                ".join(select_parts)
+
+    def _build_dimension_columns(self) -> List[str]:
+        """
+        Get list of dimension column names from schema.
+
+        Returns:
+            List of dimension column names
+        """
+        if not self.schema_config:
+            raise ValueError("Schema not loaded. Cannot get dimension columns without schema configuration.")
+
+        return [dim.column_name for dim in self.schema_config.dimensions]
 
     def _execute_and_log_query(
         self,
@@ -172,27 +250,23 @@ class BigQueryService:
         self,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
-        country: Optional[str] = None,
-        channel: Optional[str] = None,
-        gcategory: Optional[str] = None,
-        query_intent_classification: Optional[str] = None,
-        n_words_normalized: Optional[int] = None,
-        n_attributes: Optional[int] = None,
-        n_attributes_min: Optional[int] = None,
-        n_attributes_max: Optional[int] = None,
+        dimension_filters: Optional[Dict[str, List[str]]] = None,
     ) -> str:
         """
-        Build WHERE clause from filter parameters.
+        Build WHERE clause from filter parameters - fully dynamic.
+
+        Args:
+            start_date: Start date for date range filter (YYYY-MM-DD)
+            end_date: End date for date range filter (YYYY-MM-DD)
+            dimension_filters: Dictionary mapping dimension IDs to lists of values for multi-select filtering
+                              Example: {"country": ["USA", "Canada"], "channel": ["Web"]}
 
         Returns:
             WHERE clause string (includes "WHERE" keyword if non-empty)
         """
-        # Date access limits removed - no longer clamping dates
-        # start_date, end_date = self._clamp_dates(start_date, end_date)
-
         conditions = []
 
-        # Date filters
+        # Date range filter (special handling for date dimension)
         if start_date and end_date:
             conditions.append(f"date BETWEEN '{start_date}' AND '{end_date}'")
         elif start_date:
@@ -200,35 +274,50 @@ class BigQueryService:
         elif end_date:
             conditions.append(f"date <= '{end_date}'")
 
-        # Country filter
-        if country:
-            conditions.append(f"country = '{country}'")
+        # Dynamic dimension filters
+        if dimension_filters:
+            for dimension_id, values in dimension_filters.items():
+                if not values:  # Skip empty filter arrays
+                    continue
 
-        # Channel filter
-        if channel:
-            conditions.append(f"channel = '{channel}'")
+                # Find dimension in schema to get column name and data type
+                dimension_def = None
+                if self.schema_config:
+                    dimension_def = next((d for d in self.schema_config.dimensions if d.id == dimension_id), None)
 
-        # GCategory filter
-        if gcategory:
-            conditions.append(f"gcategory_name = '{gcategory}'")
+                # Default to using dimension_id as column_name if not found in schema
+                column_name = dimension_def.column_name if dimension_def else dimension_id
+                data_type = dimension_def.data_type if dimension_def else "STRING"
 
-        # Query intent classification filter
-        if query_intent_classification:
-            conditions.append(f"query_intent_classification = '{query_intent_classification}'")
-
-        # N_words exact filter
-        if n_words_normalized is not None:
-            conditions.append(f"n_words_normalized = {n_words_normalized}")
-
-        # N_attributes exact filter
-        if n_attributes is not None:
-            conditions.append(f"n_attributes = {n_attributes}")
-
-        # Attribute count range filters
-        if n_attributes_min is not None:
-            conditions.append(f"n_attributes >= {n_attributes_min}")
-        if n_attributes_max is not None:
-            conditions.append(f"n_attributes <= {n_attributes_max}")
+                # Build filter condition based on data type
+                if len(values) == 1:
+                    # Single value - use equality
+                    value = values[0]
+                    if data_type in ["STRING", "DATE"]:
+                        # Escape single quotes in string values
+                        escaped_value = value.replace("'", "''")
+                        conditions.append(f"{column_name} = '{escaped_value}'")
+                    elif data_type == "BOOLEAN":
+                        bool_value = "TRUE" if value.lower() in ["true", "1", "yes"] else "FALSE"
+                        conditions.append(f"{column_name} = {bool_value}")
+                    else:  # INTEGER, FLOAT
+                        conditions.append(f"{column_name} = {value}")
+                else:
+                    # Multiple values - use IN clause with OR logic
+                    if data_type in ["STRING", "DATE"]:
+                        # Escape single quotes in string values
+                        escaped_values = [v.replace("'", "''") for v in values]
+                        values_str = "', '".join(escaped_values)
+                        conditions.append(f"{column_name} IN ('{values_str}')")
+                    elif data_type == "BOOLEAN":
+                        bool_values = ", ".join([
+                            "TRUE" if v.lower() in ["true", "1", "yes"] else "FALSE"
+                            for v in values
+                        ])
+                        conditions.append(f"{column_name} IN ({bool_values})")
+                    else:  # INTEGER, FLOAT
+                        values_str = ", ".join(values)
+                        conditions.append(f"{column_name} IN ({values_str})")
 
         if conditions:
             return "WHERE " + " AND ".join(conditions)
@@ -277,23 +366,21 @@ class BigQueryService:
 
     def query_all_data(
         self,
-        start_date: Optional[str] = None,
-        end_date: Optional[str] = None,
-        country: Optional[str] = None,
-        channel: Optional[str] = None,
-        gcategory: Optional[str] = None,
-        n_attributes_min: Optional[int] = None,
-        n_attributes_max: Optional[int] = None,
+        filters: 'FilterParams'
     ) -> pd.DataFrame:
         """
         Query all data from BigQuery with filters.
+
+        Args:
+            filters: FilterParams object with filter criteria
 
         Returns:
             DataFrame with all columns
         """
         where_clause = self.build_filter_clause(
-            start_date, end_date, country, channel, gcategory,
-            n_attributes_min, n_attributes_max
+            start_date=filters.start_date,
+            end_date=filters.end_date,
+            dimension_filters=filters.dimension_filters
         )
 
         query = f"""
@@ -303,13 +390,9 @@ class BigQueryService:
         """
 
         filters_dict = {
-            'start_date': start_date,
-            'end_date': end_date,
-            'country': country,
-            'channel': channel,
-            'gcategory': gcategory,
-            'n_attributes_min': n_attributes_min,
-            'n_attributes_max': n_attributes_max
+            'start_date': filters.start_date,
+            'end_date': filters.end_date,
+            'dimension_filters': filters.dimension_filters
         }
 
         return self._execute_and_log_query(
@@ -321,53 +404,37 @@ class BigQueryService:
 
     def query_kpi_metrics(
         self,
-        start_date: Optional[str] = None,
-        end_date: Optional[str] = None,
-        country: Optional[str] = None,
-        channel: Optional[str] = None,
-        gcategory: Optional[str] = None,
-        n_attributes_min: Optional[int] = None,
-        n_attributes_max: Optional[int] = None,
+        filters: 'FilterParams'
     ) -> Dict:
         """
-        Query aggregated KPI metrics.
+        Query aggregated KPI metrics dynamically from schema.
+
+        Args:
+            filters: FilterParams object with filter criteria
 
         Returns:
-            Dictionary with aggregated metrics
+            Dictionary with aggregated metrics (all base metrics from schema)
         """
         where_clause = self.build_filter_clause(
-            start_date, end_date, country, channel, gcategory,
-            n_attributes_min, n_attributes_max
+            start_date=filters.start_date,
+            end_date=filters.end_date,
+            dimension_filters=filters.dimension_filters
         )
+
+        # Build dynamic SELECT clause from schema
+        select_clause = self._build_metric_select_clause()
 
         query = f"""
             SELECT
-                SUM(queries) as total_queries,
-                SUM(queries_pdp) as total_queries_pdp,
-                SUM(queries_a2c) as total_queries_a2c,
-                SUM(purchases) as total_purchases,
-                SUM(gross_purchase) as total_revenue,
-                SUM(products_pdp_1p) as total_products_pdp_1p,
-                SUM(products_pdp_3p) as total_products_pdp_3p,
-                SUM(products_a2c_1p) as total_products_a2c_1p,
-                SUM(products_a2c_3p) as total_products_a2c_3p,
-                SUM(purchases_1p) as total_purchases_1p,
-                SUM(purchases_3p) as total_purchases_3p,
-                SUM(gross_purchase_1p) as total_revenue_1p,
-                SUM(gross_purchase_3p) as total_revenue_3p,
-                COUNT(DISTINCT search_term) as unique_search_terms
+                {select_clause}
             FROM `{self.table_path}`
             {where_clause}
         """
 
         filters_dict = {
-            'start_date': start_date,
-            'end_date': end_date,
-            'country': country,
-            'channel': channel,
-            'gcategory': gcategory,
-            'n_attributes_min': n_attributes_min,
-            'n_attributes_max': n_attributes_max
+            'start_date': filters.start_date,
+            'end_date': filters.end_date,
+            'dimension_filters': filters.dimension_filters
         }
 
         df = self._execute_and_log_query(
@@ -380,47 +447,44 @@ class BigQueryService:
         if df.empty:
             return {}
 
+        # Convert DataFrame row to dict dynamically
         row = df.iloc[0]
-        return {
-            'queries': int(row['total_queries'] or 0),
-            'queries_pdp': int(row['total_queries_pdp'] or 0),
-            'queries_a2c': int(row['total_queries_a2c'] or 0),
-            'purchases': int(row['total_purchases'] or 0),
-            'revenue': float(row['total_revenue'] or 0),
-            'products_pdp_1p': int(row['total_products_pdp_1p'] or 0),
-            'products_pdp_3p': int(row['total_products_pdp_3p'] or 0),
-            'products_a2c_1p': int(row['total_products_a2c_1p'] or 0),
-            'products_a2c_3p': int(row['total_products_a2c_3p'] or 0),
-            'purchases_1p': int(row['total_purchases_1p'] or 0),
-            'purchases_3p': int(row['total_purchases_3p'] or 0),
-            'revenue_1p': float(row['total_revenue_1p'] or 0),
-            'revenue_3p': float(row['total_revenue_3p'] or 0),
-            'unique_search_terms': int(row['unique_search_terms'] or 0),
-        }
+        result = {}
+
+        # Add all metrics from the query result
+        for col in df.columns:
+            value = row[col]
+            # Convert pandas types to Python native types
+            if pd.isna(value):
+                result[col] = 0
+            elif df[col].dtype in ['int64', 'int32', 'int16', 'int8']:
+                result[col] = int(value)
+            elif df[col].dtype in ['float64', 'float32']:
+                result[col] = float(value)
+            else:
+                result[col] = value
+
+        return result
 
     def query_timeseries(
         self,
-        granularity: str = 'daily',
-        start_date: Optional[str] = None,
-        end_date: Optional[str] = None,
-        country: Optional[str] = None,
-        channel: Optional[str] = None,
-        gcategory: Optional[str] = None,
-        n_attributes_min: Optional[int] = None,
-        n_attributes_max: Optional[int] = None,
+        filters: 'FilterParams',
+        granularity: str = 'daily'
     ) -> pd.DataFrame:
         """
-        Query time-series data.
+        Query time-series data dynamically from schema.
 
         Args:
+            filters: FilterParams object with filter criteria
             granularity: 'daily', 'weekly', or 'monthly'
 
         Returns:
-            DataFrame with time-series data
+            DataFrame with time-series data (all base metrics from schema)
         """
         where_clause = self.build_filter_clause(
-            start_date, end_date, country, channel, gcategory,
-            n_attributes_min, n_attributes_max
+            start_date=filters.start_date,
+            end_date=filters.end_date,
+            dimension_filters=filters.dimension_filters
         )
 
         # Map granularity to BigQuery date truncation
@@ -431,14 +495,13 @@ class BigQueryService:
         }
         date_trunc = date_trunc_map.get(granularity, 'DAY')
 
+        # Build dynamic SELECT clause from schema
+        select_clause = self._build_metric_select_clause()
+
         query = f"""
             SELECT
                 DATE_TRUNC(date, {date_trunc}) as date,
-                SUM(queries) as queries,
-                SUM(queries_pdp) as queries_pdp,
-                SUM(queries_a2c) as queries_a2c,
-                SUM(purchases) as purchases,
-                SUM(gross_purchase) as revenue
+                {select_clause}
             FROM `{self.table_path}`
             {where_clause}
             GROUP BY date
@@ -446,14 +509,10 @@ class BigQueryService:
         """
 
         filters_dict = {
-            'start_date': start_date,
-            'end_date': end_date,
-            'country': country,
-            'channel': channel,
-            'gcategory': gcategory,
-            'granularity': granularity,
-            'n_attributes_min': n_attributes_min,
-            'n_attributes_max': n_attributes_max
+            'start_date': filters.start_date,
+            'end_date': filters.end_date,
+            'dimension_filters': filters.dimension_filters,
+            'granularity': granularity
         }
 
         return self._execute_and_log_query(
@@ -466,64 +525,57 @@ class BigQueryService:
     def query_dimension_breakdown(
         self,
         dimension: str,
-        limit: int = 20,
-        start_date: Optional[str] = None,
-        end_date: Optional[str] = None,
-        country: Optional[str] = None,
-        channel: Optional[str] = None,
-        gcategory: Optional[str] = None,
-        n_attributes_min: Optional[int] = None,
-        n_attributes_max: Optional[int] = None,
+        filters: 'FilterParams',
+        limit: int = 20
     ) -> pd.DataFrame:
         """
-        Query breakdown by dimension.
+        Query breakdown by dimension dynamically from schema.
 
         Args:
-            dimension: Column to group by (e.g., 'channel', 'country', 'n_words')
+            dimension: Column to group by (e.g., 'channel', 'country', 'n_words_normalized')
+            filters: FilterParams object with filter criteria
+            limit: Maximum number of rows to return
 
         Returns:
-            DataFrame with dimension breakdown
+            DataFrame with dimension breakdown (all base metrics from schema)
         """
         where_clause = self.build_filter_clause(
-            start_date, end_date, country, channel, gcategory,
-            n_attributes_min, n_attributes_max
+            start_date=filters.start_date,
+            end_date=filters.end_date,
+            dimension_filters=filters.dimension_filters
         )
 
-        # Map dimension names to column names
-        dimension_map = {
-            'n_words_normalized': 'n_words_normalized',
-            'n_attributes': 'n_attributes',
-            'channel': 'channel',
-            'country': 'country',
-            'gcategory_name': 'gcategory_name',
-        }
-        group_col = dimension_map.get(dimension, dimension)
+        # Find dimension column name from schema
+        group_col = dimension
+        if self.schema_config:
+            # Look up dimension by ID to get column name
+            dim = next((d for d in self.schema_config.dimensions if d.id == dimension), None)
+            if dim:
+                group_col = dim.column_name
+            else:
+                # Fallback: use dimension as is (might be a column name)
+                group_col = dimension
+
+        # Build dynamic SELECT clause from schema
+        select_clause = self._build_metric_select_clause()
 
         query = f"""
             SELECT
                 {group_col} as dimension_value,
-                SUM(queries) as queries,
-                SUM(queries_pdp) as queries_pdp,
-                SUM(queries_a2c) as queries_a2c,
-                SUM(purchases) as purchases,
-                SUM(gross_purchase) as revenue
+                {select_clause}
             FROM `{self.table_path}`
             {where_clause}
             GROUP BY {group_col}
-            ORDER BY queries DESC
+            ORDER BY {group_col}
             LIMIT {limit}
         """
 
         filters_dict = {
-            'start_date': start_date,
-            'end_date': end_date,
-            'country': country,
-            'channel': channel,
-            'gcategory': gcategory,
+            'start_date': filters.start_date,
+            'end_date': filters.end_date,
+            'dimension_filters': filters.dimension_filters,
             'dimension': dimension,
-            'limit': limit,
-            'n_attributes_min': n_attributes_min,
-            'n_attributes_max': n_attributes_max
+            'limit': limit
         }
 
         return self._execute_and_log_query(
@@ -535,42 +587,43 @@ class BigQueryService:
 
     def query_search_terms(
         self,
+        filters: 'FilterParams',
         limit: int = 100,
-        sort_by: str = 'queries',
-        start_date: Optional[str] = None,
-        end_date: Optional[str] = None,
-        country: Optional[str] = None,
-        channel: Optional[str] = None,
-        gcategory: Optional[str] = None,
-        n_attributes_min: Optional[int] = None,
-        n_attributes_max: Optional[int] = None,
+        sort_by: str = 'queries'
     ) -> pd.DataFrame:
         """
-        Query search terms data.
+        Query search terms data dynamically from schema.
+
+        Args:
+            filters: FilterParams object with filter criteria
+            limit: Maximum number of rows to return
+            sort_by: Metric ID to sort by
 
         Returns:
-            DataFrame with search terms
+            DataFrame with search terms and all base metrics from schema
         """
         where_clause = self.build_filter_clause(
-            start_date, end_date, country, channel, gcategory,
-            n_attributes_min, n_attributes_max
+            start_date=filters.start_date,
+            end_date=filters.end_date,
+            dimension_filters=filters.dimension_filters
         )
 
-        # Validate sort column
-        valid_sorts = ['queries', 'purchases', 'revenue', 'queries_pdp', 'queries_a2c']
-        if sort_by not in valid_sorts:
-            sort_by = 'queries'
+        # Build dynamic SELECT clause from schema (including search_term)
+        select_clause = self._build_metric_select_clause(include_search_term=True)
+
+        # Validate sort column against available metrics
+        # If schema not loaded, use default; otherwise check if metric exists
+        if self.schema_config:
+            valid_sorts = [m.id for m in self.schema_config.base_metrics]
+        else:
+            valid_sorts = ['queries', 'purchases', 'revenue', 'queries_pdp', 'queries_a2c']
+
+        if sort_by not in valid_sorts and len(valid_sorts) > 0:
+            sort_by = valid_sorts[0]  # Default to first metric
 
         query = f"""
             SELECT
-                search_term,
-                SUM(queries) as queries,
-                SUM(queries_pdp) as queries_pdp,
-                SUM(queries_a2c) as queries_a2c,
-                SUM(purchases) as purchases,
-                SUM(gross_purchase) as revenue,
-                MAX(n_words_normalized) as n_words_normalized,
-                MAX(n_attributes) as n_attributes
+                {select_clause}
             FROM `{self.table_path}`
             {where_clause}
             GROUP BY search_term
@@ -579,15 +632,11 @@ class BigQueryService:
         """
 
         filters_dict = {
-            'start_date': start_date,
-            'end_date': end_date,
-            'country': country,
-            'channel': channel,
-            'gcategory': gcategory,
+            'start_date': filters.start_date,
+            'end_date': filters.end_date,
+            'dimension_filters': filters.dimension_filters,
             'limit': limit,
-            'sort_by': sort_by,
-            'n_attributes_min': n_attributes_min,
-            'n_attributes_max': n_attributes_max
+            'sort_by': sort_by
         }
 
         return self._execute_and_log_query(
@@ -600,38 +649,34 @@ class BigQueryService:
     def query_dimension_values(
         self,
         dimension: str,
-        start_date: Optional[str] = None,
-        end_date: Optional[str] = None,
-        country: Optional[str] = None,
-        channel: Optional[str] = None,
-        gcategory: Optional[str] = None,
-        query_intent_classification: Optional[str] = None,
-        n_attributes_min: Optional[int] = None,
-        n_attributes_max: Optional[int] = None,
+        filters: 'FilterParams'
     ) -> List[str]:
         """
-        Get distinct values for a given dimension.
+        Get distinct values for a given dimension from schema.
 
         Args:
-            dimension: Column to get distinct values for (e.g., 'channel', 'country', 'n_words')
+            dimension: Dimension ID or column name to get distinct values for
+            filters: FilterParams object with filter criteria
 
         Returns:
             List of distinct values for the dimension
         """
         where_clause = self.build_filter_clause(
-            start_date, end_date, country, channel, gcategory,
-            query_intent_classification, n_attributes_min=n_attributes_min, n_attributes_max=n_attributes_max
+            start_date=filters.start_date,
+            end_date=filters.end_date,
+            dimension_filters=filters.dimension_filters
         )
 
-        # Map dimension names to column names
-        dimension_map = {
-            'n_words_normalized': 'n_words_normalized',
-            'n_attributes': 'n_attributes',
-            'channel': 'channel',
-            'country': 'country',
-            'gcategory_name': 'gcategory_name',
-        }
-        group_col = dimension_map.get(dimension, dimension)
+        # Find dimension column name from schema
+        group_col = dimension
+        if self.schema_config:
+            # Look up dimension by ID to get column name
+            dim = next((d for d in self.schema_config.dimensions if d.id == dimension), None)
+            if dim:
+                group_col = dim.column_name
+            else:
+                # Fallback: use dimension as is (might be a column name)
+                group_col = dimension
 
         query = f"""
             SELECT DISTINCT {group_col} as value
@@ -641,15 +686,10 @@ class BigQueryService:
         """
 
         filters_dict = {
-            'start_date': start_date,
-            'end_date': end_date,
-            'country': country,
-            'channel': channel,
-            'gcategory': gcategory,
-            'query_intent_classification': query_intent_classification,
-            'dimension': dimension,
-            'n_attributes_min': n_attributes_min,
-            'n_attributes_max': n_attributes_max
+            'start_date': filters.start_date,
+            'end_date': filters.end_date,
+            'dimension_filters': filters.dimension_filters,
+            'dimension': dimension
         }
 
         df = self._execute_and_log_query(
@@ -731,63 +771,111 @@ class BigQueryService:
         }
 
 
-# Global instance (will be initialized on startup)
-_bq_service: Optional[BigQueryService] = None
+# Global instances (multi-table support)
+_bq_services: Dict[str, BigQueryService] = {}
 
 
-def get_bigquery_service() -> Optional[BigQueryService]:
-    """Get the global BigQuery service instance."""
-    return _bq_service
+def get_bigquery_service(table_id: Optional[str] = None) -> Optional[BigQueryService]:
+    """
+    Get BigQuery service instance for a specific table.
+
+    Args:
+        table_id: Table ID to get service for. If None, uses active table.
+
+    Returns:
+        BigQuery service instance or None
+    """
+    from config import table_registry
+
+    if table_id is None:
+        table_id = table_registry.get_active_table_id()
+
+    if table_id is None:
+        return None
+
+    return _bq_services.get(table_id)
 
 
-def clear_bigquery_service() -> None:
-    """Clear the global BigQuery service instance."""
-    global _bq_service
-    _bq_service = None
+def clear_bigquery_service(table_id: Optional[str] = None) -> None:
+    """
+    Clear BigQuery service instance(s).
+
+    Args:
+        table_id: Specific table ID to clear. If None, clears all.
+    """
+    global _bq_services
+
+    if table_id:
+        if table_id in _bq_services:
+            del _bq_services[table_id]
+    else:
+        _bq_services = {}
 
 
 def initialize_bigquery_service(
     project_id: str,
     dataset: str,
     table: str,
-    credentials_path: Optional[str] = None
+    credentials_path: Optional[str] = None,
+    table_id: Optional[str] = None
 ) -> BigQueryService:
     """
-    Initialize the global BigQuery service.
+    Initialize BigQuery service for a specific table.
 
     Args:
         project_id: GCP project ID
         dataset: BigQuery dataset name
         table: BigQuery table name
         credentials_path: Path to service account JSON (optional)
+        table_id: Table ID to associate with this service
 
     Returns:
         BigQuery service instance
     """
-    global _bq_service
-    _bq_service = BigQueryService(project_id, dataset, table, credentials_path)
-    return _bq_service
+    global _bq_services
+    from config import table_registry
+
+    # Use active table if not specified
+    if table_id is None:
+        table_id = table_registry.get_active_table_id()
+
+    if table_id is None:
+        raise ValueError("No table_id specified and no active table set")
+
+    service = BigQueryService(project_id, dataset, table, credentials_path, table_id)
+    _bq_services[table_id] = service
+    return service
 
 
 def initialize_bigquery_with_json(
     project_id: str,
     dataset: str,
     table: str,
-    credentials_json: str
+    credentials_json: str,
+    table_id: Optional[str] = None
 ) -> BigQueryService:
     """
-    Initialize the global BigQuery service with credentials JSON string.
+    Initialize BigQuery service with credentials JSON string.
 
     Args:
         project_id: GCP project ID
         dataset: BigQuery dataset name
         table: BigQuery table name
         credentials_json: Service account JSON as string
+        table_id: Table ID to associate with this service
 
     Returns:
         BigQuery service instance
     """
-    global _bq_service
+    global _bq_services
+    from config import table_registry
+
+    # Use active table if not specified
+    if table_id is None:
+        table_id = table_registry.get_active_table_id()
+
+    if table_id is None:
+        raise ValueError("No table_id specified and no active table set")
 
     # Parse JSON and create credentials
     try:
@@ -798,17 +886,24 @@ def initialize_bigquery_with_json(
         client = bigquery.Client(credentials=credentials, project=project_id)
 
         # Create service instance manually
-        _bq_service = BigQueryService.__new__(BigQueryService)
-        _bq_service.project_id = project_id
-        _bq_service.dataset = dataset
-        _bq_service.table = table
-        _bq_service.table_path = f"{project_id}.{dataset}.{table}"
-        _bq_service.client = client
+        service = BigQueryService.__new__(BigQueryService)
+        service.project_id = project_id
+        service.dataset = dataset
+        service.table = table
+        service.table_path = f"{project_id}.{dataset}.{table}"
+        service.client = client
+        service.table_id = table_id
         # Initialize date limit attributes
-        _bq_service.allowed_min_date = None
-        _bq_service.allowed_max_date = None
+        service.allowed_min_date = None
+        service.allowed_max_date = None
 
-        return _bq_service
+        # Initialize schema attributes and load schema
+        service.schema_service = None
+        service.schema_config = None
+        service._load_schema()
+
+        _bq_services[table_id] = service
+        return service
     except json.JSONDecodeError as e:
         raise ValueError(f"Invalid credentials JSON: {e}")
     except Exception as e:
@@ -825,26 +920,39 @@ def get_bigquery_info() -> dict:
     bq_service = get_bigquery_service()
     if bq_service is None:
         # Return not-configured status instead of raising error
-        from config import config
-        return {
-            "project_id": config.BIGQUERY_PROJECT_ID or "",
-            "dataset": config.BIGQUERY_DATASET or "",
-            "table": config.BIGQUERY_TABLE or "",
-            "table_full_path": "",
-            "connection_status": "not configured",
-            "date_range": {"min": "", "max": ""},
-            "total_rows": 0,
-            "total_searches": 0,
-            "total_revenue": 0.0,
-            "unique_search_terms": 0,
-            "available_countries": [],
-            "available_channels": [],
-            "table_size_mb": 0.0,
-            "last_modified": "",
-            "schema_columns": [],
-            "allowed_min_date": config.ALLOWED_MIN_DATE,
-            "allowed_max_date": config.ALLOWED_MAX_DATE
-        }
+        from config import table_registry
+        active_id = table_registry.get_active_table_id()
+        if active_id:
+            table_info = table_registry.get_table(active_id)
+            return {
+                "project_id": table_info.project_id,
+                "dataset": table_info.dataset,
+                "table": table_info.table,
+                "table_full_path": f"{table_info.project_id}.{table_info.dataset}.{table_info.table}",
+                "connection_status": "configured but not connected",
+                "date_range": {"min": "", "max": ""},
+                "total_rows": 0,
+                "table_size_mb": 0.0,
+                "last_modified": "",
+                "schema_columns": [],
+                "allowed_min_date": table_info.allowed_min_date,
+                "allowed_max_date": table_info.allowed_max_date
+            }
+        else:
+            return {
+                "project_id": "",
+                "dataset": "",
+                "table": "",
+                "table_full_path": "",
+                "connection_status": "not configured",
+                "date_range": {"min": "", "max": ""},
+                "total_rows": 0,
+                "table_size_mb": 0.0,
+                "last_modified": "",
+                "schema_columns": [],
+                "allowed_min_date": None,
+                "allowed_max_date": None
+            }
 
     try:
         # Get table metadata
@@ -860,37 +968,19 @@ def get_bigquery_info() -> dict:
         """
         date_df = bq_service.client.query(date_query).to_dataframe()
 
-        # Get summary statistics
+        # Get summary statistics - just row count, no hardcoded columns
         stats_query = f"""
             SELECT
-                COUNT(*) as total_rows,
-                SUM(queries) as total_searches,
-                SUM(gross_purchase) as total_revenue,
-                COUNT(DISTINCT search_term) as unique_search_terms
+                COUNT(*) as total_rows
             FROM `{bq_service.table_path}`
         """
         stats_df = bq_service.client.query(stats_query).to_dataframe()
 
-        # Get available countries
-        countries_query = f"""
-            SELECT DISTINCT country
-            FROM `{bq_service.table_path}`
-            WHERE country IS NOT NULL
-            ORDER BY country
-        """
-        countries_df = bq_service.client.query(countries_query).to_dataframe()
-
-        # Get available channels
-        channels_query = f"""
-            SELECT DISTINCT channel
-            FROM `{bq_service.table_path}`
-            WHERE channel IS NOT NULL
-            ORDER BY channel
-        """
-        channels_df = bq_service.client.query(channels_query).to_dataframe()
-
         # Extract schema column names
         schema_columns = [field.name for field in table_ref.schema]
+
+        min_date = date_df['min_date'].iloc[0]
+        max_date = date_df['max_date'].iloc[0]
 
         return {
             "project_id": bq_service.project_id,
@@ -899,15 +989,10 @@ def get_bigquery_info() -> dict:
             "table_full_path": bq_service.table_path,
             "connection_status": "connected",
             "date_range": {
-                "min": date_df['min_date'].iloc[0].strftime('%Y-%m-%d'),
-                "max": date_df['max_date'].iloc[0].strftime('%Y-%m-%d')
+                "min": min_date.strftime('%Y-%m-%d') if pd.notna(min_date) else None,
+                "max": max_date.strftime('%Y-%m-%d') if pd.notna(max_date) else None
             },
             "total_rows": int(stats_df['total_rows'].iloc[0]),
-            "total_searches": int(stats_df['total_searches'].iloc[0]),
-            "total_revenue": float(stats_df['total_revenue'].iloc[0]),
-            "unique_search_terms": int(stats_df['unique_search_terms'].iloc[0]),
-            "available_countries": countries_df['country'].tolist(),
-            "available_channels": channels_df['channel'].tolist(),
             "table_size_mb": round(table_ref.num_bytes / (1024 * 1024), 2),
             "last_modified": table_ref.modified.isoformat(),
             "schema_columns": schema_columns,
@@ -924,11 +1009,6 @@ def get_bigquery_info() -> dict:
             "connection_status": f"error: {str(e)}",
             "date_range": {},
             "total_rows": 0,
-            "total_searches": 0,
-            "total_revenue": 0.0,
-            "unique_search_terms": 0,
-            "available_countries": [],
-            "available_channels": [],
             "table_size_mb": 0.0,
             "last_modified": "",
             "schema_columns": [],

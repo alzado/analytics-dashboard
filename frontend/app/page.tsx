@@ -7,6 +7,7 @@ import { DashboardLayout } from '@/components/layout/dashboard-layout'
 import { PivotTableSection } from '@/components/sections/pivot-table-section'
 import { BigQueryInfoSection } from '@/components/sections/bigquery-info-section'
 import { UsageLogsSection } from '@/components/sections/usage-logs-section'
+import { SchemaSection } from '@/components/sections/schema-section'
 
 export default function Home() {
   const [activeTab, setActiveTab] = useState('pivot')
@@ -15,7 +16,9 @@ export default function Home() {
   const { data: bqInfo, isLoading } = useQuery({
     queryKey: ['bigquery-info'],
     queryFn: fetchBigQueryInfo,
-    refetchInterval: 10000, // Check every 10 seconds
+    staleTime: 5 * 60 * 1000, // 5 minutes - don't refetch unless data is stale
+    refetchInterval: false, // Disable automatic polling
+    refetchOnWindowFocus: false, // Don't refetch when window regains focus
   })
 
   // Show loading state
@@ -50,6 +53,7 @@ export default function Home() {
   return (
     <DashboardLayout activeTab={activeTab} onTabChange={setActiveTab}>
       {activeTab === 'pivot' && <PivotTableSection />}
+      {activeTab === 'schema' && <SchemaSection />}
       {activeTab === 'logs' && <UsageLogsSection />}
       {activeTab === 'info' && <BigQueryInfoSection />}
     </DashboardLayout>

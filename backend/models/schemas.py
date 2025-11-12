@@ -1,88 +1,38 @@
 from pydantic import BaseModel, Field, field_validator, model_validator
-from typing import Optional, List, Union, Literal
+from typing import Optional, List, Union, Literal, Dict
 from datetime import date
 
 class FilterParams(BaseModel):
-    """Filter parameters for queries"""
+    """Filter parameters for queries - fully dynamic dimension-based filtering"""
+    # Date range filters (special handling for date dimension)
     start_date: Optional[str] = None
     end_date: Optional[str] = None
-    country: Optional[str] = None
-    channel: Optional[str] = None
-    gcategory: Optional[str] = None
-    query_intent_classification: Optional[str] = None
-    n_words_normalized: Optional[int] = None
-    n_attributes: Optional[int] = None
-    n_attributes_min: Optional[int] = None
-    n_attributes_max: Optional[int] = None
-    attr_categoria: Optional[bool] = None
-    attr_tipo: Optional[bool] = None
-    attr_genero: Optional[bool] = None
-    attr_marca: Optional[bool] = None
-    attr_color: Optional[bool] = None
-    attr_material: Optional[bool] = None
-    attr_talla: Optional[bool] = None
-    attr_modelo: Optional[bool] = None
+
+    # Dynamic dimension filters
+    # Format: { "dimension_id": ["value1", "value2"], ... }
+    # Supports multi-select with OR logic within a dimension
+    # Example: {"country": ["USA", "Canada"], "channel": ["Web", "App"]}
+    dimension_filters: Optional[Dict[str, List[str]]] = Field(default_factory=dict, description="Dynamic dimension filters with multi-select support")
 
 class OverviewMetrics(BaseModel):
-    """Overview dashboard metrics"""
-    queries: int
-    queries_pdp: int
-    queries_a2c: int
-    purchases: int
-    revenue: float
-    ctr: float
-    a2c_rate: float
-    conversion_rate: float
-    pdp_conversion: float
-    revenue_per_query: float
-    aov: float
-    avg_queries_per_day: float
-    unique_search_terms: int
+    """Overview dashboard metrics - fully dynamic"""
+    metrics: Dict[str, Union[int, float]]  # All metrics as dynamic dictionary
 
 class TrendData(BaseModel):
-    """Time series data point"""
-    date: str
-    queries: int
-    queries_pdp: int
-    queries_a2c: int
-    purchases: int
-    revenue: float
-    ctr: float
-    a2c_rate: float
-    conversion_rate: float
-    pdp_conversion: float
-    revenue_per_query: float
+    """Time series data point - fully dynamic"""
+    date: Optional[str] = None  # Date string (YYYY-MM-DD)
+    metrics: Dict[str, Union[int, float]]  # All metrics as dynamic dictionary
 
 class DimensionBreakdown(BaseModel):
-    """Breakdown by a specific dimension"""
+    """Breakdown by a specific dimension - fully dynamic"""
     dimension_value: str
-    queries: int
-    queries_pdp: int
-    queries_a2c: int
-    purchases: int
-    revenue: float
-    ctr: float
-    a2c_rate: float
-    conversion_rate: float
-    pdp_conversion: float
-    revenue_per_query: float
-    avg_queries_per_day: float
+    metrics: Dict[str, Union[int, float]]  # All metrics as dynamic dictionary
     percentage_of_total: float
 
 class SearchTermData(BaseModel):
-    """Individual search term metrics"""
+    """Individual search term metrics - fully dynamic"""
     search_term: str
-    queries: int
-    queries_pdp: int
-    queries_a2c: int
-    purchases: int
-    revenue: float
-    ctr: float
-    conversion_rate: float
-    pdp_conversion: float
-    avg_queries_per_day: float
-    n_words: int
-    n_attributes: int
+    metrics: Dict[str, Union[int, float]]  # All metrics as dynamic dictionary
 
 class FilterOptions(BaseModel):
     """Available filter options"""
@@ -92,37 +42,17 @@ class FilterOptions(BaseModel):
     attributes: List[str]
 
 class PivotRow(BaseModel):
-    """Single row in pivot table"""
+    """Single row in pivot table with dynamic metrics - completely generic"""
     dimension_value: str
-    queries: int
-    queries_pdp: int
-    queries_a2c: int
-    purchases: int
-    revenue: float
-    ctr: float
-    a2c_rate: float
-    conversion_rate: float
-    pdp_conversion: float
-    revenue_per_query: float
-    aov: float
-    avg_queries_per_day: float
-    percentage_of_total: float
-    search_term_count: int = 0
-    has_children: bool = False
+    metrics: Dict[str, Union[int, float]]  # All metrics as dynamic dictionary
+    percentage_of_total: float  # Percentage relative to grand total (requires cross-row context)
+    has_children: bool = False  # For hierarchical drill-down support
 
 class PivotChildRow(BaseModel):
-    """Child row (search term) in pivot table"""
-    search_term: str
-    queries: int
-    queries_pdp: int
-    purchases: int
-    revenue: float
-    ctr: float
-    conversion_rate: float
-    pdp_conversion: float
-    avg_queries_per_day: float
-    percentage_of_total: float
-    aov: float
+    """Child row in hierarchical pivot - completely generic"""
+    dimension_value: str  # Generic name for the child dimension value
+    metrics: Dict[str, Union[int, float]]  # All metrics as dynamic dictionary
+    percentage_of_total: float  # Percentage relative to parent or grand total
 
 class PivotResponse(BaseModel):
     """Pivot table response"""
@@ -130,6 +60,7 @@ class PivotResponse(BaseModel):
     total: PivotRow
     available_dimensions: List[str]
     dimension_metadata: Optional[dict] = None  # Metadata about the dimension used (e.g., custom dimension name)
+    total_count: Optional[int] = None  # Total number of dimension values (for pagination)
 
 
 class BigQueryInfo(BaseModel):
@@ -141,11 +72,6 @@ class BigQueryInfo(BaseModel):
     connection_status: str
     date_range: dict
     total_rows: int
-    total_searches: int
-    total_revenue: float
-    unique_search_terms: int
-    available_countries: List[str]
-    available_channels: List[str]
     table_size_mb: float
     last_modified: str
     schema_columns: List[str]
@@ -167,6 +93,61 @@ class BigQueryConfigResponse(BaseModel):
     success: bool
     message: str
     connection_status: str
+
+# Multi-Table Management Models
+
+class TableInfoResponse(BaseModel):
+    """Information about a BigQuery table configuration"""
+    table_id: str
+    name: str
+    project_id: str
+    dataset: str
+    table: str
+    created_at: str
+    last_used_at: str
+    is_active: bool = False
+
+class TableListResponse(BaseModel):
+    """List of all configured tables"""
+    tables: List[TableInfoResponse]
+    active_table_id: Optional[str] = None
+
+class TableCreateRequest(BaseModel):
+    """Request to create a new table configuration"""
+    name: str = Field(..., min_length=1, max_length=100)
+    project_id: str
+    dataset: str
+    table: str
+    credentials_json: str = ""
+    allowed_min_date: Optional[str] = None
+    allowed_max_date: Optional[str] = None
+
+class TableUpdateRequest(BaseModel):
+    """Request to update table metadata"""
+    name: str = Field(..., min_length=1, max_length=100)
+
+class TableConfigUpdateRequest(BaseModel):
+    """Request to update table BigQuery configuration"""
+    project_id: str
+    dataset: str
+    table: str
+    credentials_json: str = ""
+    allowed_min_date: Optional[str] = None
+    allowed_max_date: Optional[str] = None
+
+class TableActivateRequest(BaseModel):
+    """Request to activate a table"""
+    table_id: str
+
+class SchemaCopyRequest(BaseModel):
+    """Request to copy schema from one table to another"""
+    source_table_id: str
+    target_table_id: str
+
+class SchemaTemplateRequest(BaseModel):
+    """Request to apply a schema template"""
+    template_name: Literal["ecommerce", "saas", "marketing"]
+    table_id: Optional[str] = None  # If None, applies to active table
 
 class CustomDimensionValue(BaseModel):
     """A value within a custom dimension (e.g., a date range)"""
@@ -315,3 +296,150 @@ class ClearLogsResponse(BaseModel):
     success: bool
     message: str
     logs_deleted: int
+
+
+# Dynamic Schema Models
+
+class BaseMetric(BaseModel):
+    """A base metric representing a raw BigQuery column that can be aggregated"""
+    id: str = Field(..., description="Unique identifier (e.g., 'queries', 'revenue')")
+    column_name: str = Field(..., description="Actual BigQuery column name (or comma-separated columns for multi-column COUNT_DISTINCT)")
+    display_name: str = Field(..., description="Human-readable name for UI")
+    aggregation: Literal["SUM", "COUNT", "AVG", "MIN", "MAX", "COUNT_DISTINCT"] = Field(default="SUM", description="SQL aggregation function")
+    data_type: Literal["INTEGER", "FLOAT", "NUMERIC"] = Field(default="INTEGER", description="Data type")
+    format_type: Literal["number", "currency", "percent"] = Field(default="number", description="Display format")
+    decimal_places: int = Field(default=0, description="Number of decimal places to show")
+    category: str = Field(default="other", description="Metric category (volume, conversion, revenue, etc.)")
+    is_visible_by_default: bool = Field(default=True, description="Whether to show in tables by default")
+    sort_order: int = Field(default=999, description="Display order in UI (lower = first)")
+    description: Optional[str] = Field(None, description="Metric description")
+
+    @model_validator(mode='after')
+    def validate_multi_column(self):
+        """Validate that multi-column syntax is only used with COUNT_DISTINCT"""
+        if ',' in self.column_name and self.aggregation != 'COUNT_DISTINCT':
+            raise ValueError("Multi-column syntax (comma-separated) can only be used with COUNT_DISTINCT aggregation")
+        return self
+
+class CalculatedMetric(BaseModel):
+    """A calculated metric with a formula (e.g., CTR = queries_pdp / queries)"""
+    id: str = Field(..., description="Unique identifier (e.g., 'ctr', 'conversion_rate')")
+    display_name: str = Field(..., description="Human-readable name for UI")
+    formula: str = Field(..., description="Formula expression (e.g., '{queries_pdp} / {queries}')")
+    sql_expression: str = Field(..., description="Compiled SQL expression (e.g., 'SAFE_DIVIDE(SUM(queries_pdp), SUM(queries))')")
+    depends_on: List[str] = Field(default_factory=list, description="List of base metric IDs used in formula")
+    format_type: Literal["number", "currency", "percent"] = Field(default="number", description="Display format")
+    decimal_places: int = Field(default=2, description="Number of decimal places to show")
+    category: str = Field(default="other", description="Metric category")
+    is_visible_by_default: bool = Field(default=True, description="Whether to show in tables by default")
+    sort_order: int = Field(default=999, description="Display order in UI")
+    description: Optional[str] = Field(None, description="Metric description")
+
+class DimensionDef(BaseModel):
+    """A dimension representing a column that can be used for grouping or filtering"""
+    id: str = Field(..., description="Unique identifier (e.g., 'country', 'channel')")
+    column_name: str = Field(..., description="Actual BigQuery column name")
+    display_name: str = Field(..., description="Human-readable name for UI")
+    data_type: Literal["STRING", "INTEGER", "FLOAT", "DATE", "BOOLEAN"] = Field(default="STRING", description="Data type")
+    is_filterable: bool = Field(default=True, description="Can be used in filters")
+    is_groupable: bool = Field(default=True, description="Can be used for GROUP BY")
+    sort_order: int = Field(default=999, description="Display order in UI")
+    filter_type: Optional[Literal["single", "multi", "range", "date_range", "boolean"]] = Field(None, description="Type of filter UI to show")
+    description: Optional[str] = Field(None, description="Dimension description")
+
+class SchemaConfig(BaseModel):
+    """Complete schema configuration with all metrics and dimensions"""
+    base_metrics: List[BaseMetric] = Field(default_factory=list, description="List of base metrics")
+    calculated_metrics: List[CalculatedMetric] = Field(default_factory=list, description="List of calculated metrics")
+    dimensions: List[DimensionDef] = Field(default_factory=list, description="List of dimensions")
+
+    # Pivot table settings
+    primary_sort_metric: Optional[str] = Field(None, description="Default metric ID to sort pivot tables by")
+    avg_per_day_metric: Optional[str] = Field(None, description="Metric ID to use for average per day calculation in pivot tables")
+    pagination_threshold: int = Field(default=100, description="Paginate dimension values when count exceeds this")
+
+    version: int = Field(default=1, description="Schema version for migrations")
+    created_at: str = Field(..., description="ISO timestamp when schema was created")
+    updated_at: str = Field(..., description="ISO timestamp when schema was last updated")
+
+class SchemaDetectionResult(BaseModel):
+    """Result of auto-detecting schema from BigQuery table"""
+    detected_base_metrics: List[BaseMetric]
+    detected_dimensions: List[DimensionDef]
+    column_count: int
+    warnings: List[str] = Field(default_factory=list, description="Any warnings during detection")
+
+class MetricCreate(BaseModel):
+    """Request to create a base metric"""
+    id: str
+    column_name: str
+    display_name: str
+    aggregation: Literal["SUM", "COUNT", "AVG", "MIN", "MAX", "COUNT_DISTINCT"] = "SUM"
+    data_type: Literal["INTEGER", "FLOAT", "NUMERIC"] = "INTEGER"
+    format_type: Literal["number", "currency", "percent"] = "number"
+    decimal_places: int = 0
+    category: str = "other"
+    is_visible_by_default: bool = True
+    sort_order: int = 999
+    description: Optional[str] = None
+
+class CalculatedMetricCreate(BaseModel):
+    """Request to create a calculated metric"""
+    id: str
+    display_name: str
+    formula: str
+    format_type: Literal["number", "currency", "percent"] = "number"
+    decimal_places: int = 2
+    category: str = "other"
+    is_visible_by_default: bool = True
+    sort_order: int = 999
+    description: Optional[str] = None
+
+class DimensionCreate(BaseModel):
+    """Request to create a dimension"""
+    id: str
+    column_name: str
+    display_name: str
+    data_type: Literal["STRING", "INTEGER", "FLOAT", "DATE", "BOOLEAN"] = "STRING"
+    is_filterable: bool = True
+    is_groupable: bool = True
+    sort_order: int = 999
+    filter_type: Optional[Literal["single", "multi", "range", "date_range", "boolean"]] = None
+    description: Optional[str] = None
+
+class MetricUpdate(BaseModel):
+    """Request to update a metric (partial update)"""
+    display_name: Optional[str] = None
+    aggregation: Optional[Literal["SUM", "COUNT", "AVG", "MIN", "MAX", "COUNT_DISTINCT"]] = None
+    format_type: Optional[Literal["number", "currency", "percent"]] = None
+    decimal_places: Optional[int] = None
+    category: Optional[str] = None
+    is_visible_by_default: Optional[bool] = None
+    sort_order: Optional[int] = None
+    description: Optional[str] = None
+
+class CalculatedMetricUpdate(BaseModel):
+    """Request to update a calculated metric (partial update)"""
+    display_name: Optional[str] = None
+    formula: Optional[str] = None
+    format_type: Optional[Literal["number", "currency", "percent"]] = None
+    decimal_places: Optional[int] = None
+    category: Optional[str] = None
+    is_visible_by_default: Optional[bool] = None
+    sort_order: Optional[int] = None
+    description: Optional[str] = None
+
+class DimensionUpdate(BaseModel):
+    """Request to update a dimension (partial update)"""
+    display_name: Optional[str] = None
+    is_filterable: Optional[bool] = None
+    is_groupable: Optional[bool] = None
+    sort_order: Optional[int] = None
+    filter_type: Optional[Literal["single", "multi", "range", "date_range", "boolean"]] = None
+    description: Optional[str] = None
+
+class PivotConfigUpdate(BaseModel):
+    """Request to update pivot table configuration settings"""
+    primary_sort_metric: Optional[str] = Field(None, description="Metric ID to use as default sort for pivot tables")
+    avg_per_day_metric: Optional[str] = Field(None, description="Metric ID to use for average per day calculations")
+    pagination_threshold: Optional[int] = Field(None, description="Paginate dimensions when unique values exceed this threshold", ge=1)

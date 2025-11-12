@@ -3,13 +3,15 @@
 import { useState, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { fetchBigQueryInfo, configureBigQuery, disconnectBigQuery } from '@/lib/api'
-import { Database, Calendar, HardDrive, Table, CheckCircle, AlertCircle, Settings } from 'lucide-react'
+import { fetchBigQueryInfo, configureBigQuery, disconnectBigQuery, fetchTables, activateTable, deleteTable } from '@/lib/api'
+import { Database, Calendar, HardDrive, Table, CheckCircle, AlertCircle, Settings, Plus, Trash2, Layers } from 'lucide-react'
 import type { BigQueryConfig } from '@/lib/types'
+import { CreateTableModal } from '@/components/modals/create-table-modal'
 
 export function BigQueryInfoSection() {
   const router = useRouter()
   const queryClient = useQueryClient()
+  const [showCreateTableModal, setShowCreateTableModal] = useState(false)
   const [formData, setFormData] = useState<BigQueryConfig>({
     project_id: '',
     dataset: '',
@@ -65,6 +67,45 @@ export function BigQueryInfoSection() {
       console.error('Disconnect error:', error)
     }
   })
+
+  // Fetch table list
+  const { data: tablesData } = useQuery({
+    queryKey: ['tables'],
+    queryFn: fetchTables,
+    refetchInterval: 30000, // Refresh every 30 seconds
+  })
+
+  // Activate table mutation
+  const activateTableMutation = useMutation({
+    mutationFn: activateTable,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['tables'] })
+      queryClient.invalidateQueries({ queryKey: ['bigquery-info'] })
+      // Trigger full page reload to refresh all data with new table
+      window.location.reload()
+    },
+  })
+
+  // Delete table mutation
+  const deleteTableMutation = useMutation({
+    mutationFn: deleteTable,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['tables'] })
+      queryClient.invalidateQueries({ queryKey: ['bigquery-info'] })
+    },
+  })
+
+  const handleTableSwitch = (tableId: string) => {
+    if (confirm('Switching tables will reload the page. Continue?')) {
+      activateTableMutation.mutate(tableId)
+    }
+  }
+
+  const handleDeleteTable = (tableId: string, tableName: string) => {
+    if (confirm(`Are you sure you want to delete the table "${tableName}"? This will remove its configuration and schema.`)) {
+      deleteTableMutation.mutate(tableId)
+    }
+  }
 
   // Pre-fill form with saved connection details when not connected
   useEffect(() => {
@@ -340,6 +381,72 @@ export function BigQueryInfoSection() {
         </div>
       </div>
 
+      {/* Table Management */}
+      {tablesData && tablesData.tables.length > 0 && (
+        <div className="bg-white rounded-lg border border-gray-200 p-6">
+          <div className="flex items-center justify-between mb-4">
+            <div className="flex items-center gap-2">
+              <Layers className="text-blue-600" size={24} />
+              <h2 className="text-lg font-semibold">Table Management</h2>
+            </div>
+            <button
+              onClick={() => setShowCreateTableModal(true)}
+              className="flex items-center gap-2 px-3 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium text-sm"
+            >
+              <Plus size={16} />
+              Add Table
+            </button>
+          </div>
+
+          <div className="space-y-2">
+            {tablesData.tables.map((table) => (
+              <div
+                key={table.table_id}
+                className={`flex items-center justify-between p-4 rounded-lg border ${
+                  table.is_active ? 'border-blue-500 bg-blue-50' : 'border-gray-200 bg-gray-50'
+                }`}
+              >
+                <div className="flex-1">
+                  <div className="flex items-center gap-2">
+                    <h3 className="font-semibold">{table.name}</h3>
+                    {table.is_active && (
+                      <span className="px-2 py-0.5 bg-blue-600 text-white text-xs rounded-full">
+                        Active
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-sm text-gray-600 font-mono mt-1">
+                    {table.project_id}.{table.dataset}.{table.table}
+                  </p>
+                  <p className="text-xs text-gray-500 mt-1">
+                    Last used: {new Date(table.last_used_at).toLocaleString()}
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  {!table.is_active && (
+                    <button
+                      onClick={() => handleTableSwitch(table.table_id)}
+                      disabled={activateTableMutation.isPending}
+                      className="px-3 py-1.5 bg-blue-600 text-white rounded hover:bg-blue-700 disabled:bg-gray-400 text-sm"
+                    >
+                      Switch
+                    </button>
+                  )}
+                  <button
+                    onClick={() => handleDeleteTable(table.table_id, table.name)}
+                    disabled={deleteTableMutation.isPending || table.is_active}
+                    className="p-1.5 text-red-600 hover:bg-red-50 rounded disabled:opacity-50 disabled:cursor-not-allowed"
+                    title={table.is_active ? 'Cannot delete active table' : 'Delete table'}
+                  >
+                    <Trash2 size={18} />
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* Table Information */}
       <div className="bg-white rounded-lg border border-gray-200 p-6">
         <div className="flex items-center gap-2 mb-4">
@@ -372,22 +479,10 @@ export function BigQueryInfoSection() {
           <Table className="text-blue-600" size={24} />
           <h2 className="text-lg font-semibold">Data Summary</h2>
         </div>
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <div className="grid grid-cols-1 gap-4">
           <div className="bg-gray-50 rounded-lg p-4">
             <p className="text-sm text-gray-600">Total Rows</p>
             <p className="text-2xl font-bold text-gray-900">{info.total_rows.toLocaleString()}</p>
-          </div>
-          <div className="bg-gray-50 rounded-lg p-4">
-            <p className="text-sm text-gray-600">Total Searches</p>
-            <p className="text-2xl font-bold text-gray-900">{info.total_searches.toLocaleString()}</p>
-          </div>
-          <div className="bg-gray-50 rounded-lg p-4">
-            <p className="text-sm text-gray-600">Unique Terms</p>
-            <p className="text-2xl font-bold text-gray-900">{info.unique_search_terms.toLocaleString()}</p>
-          </div>
-          <div className="bg-gray-50 rounded-lg p-4">
-            <p className="text-sm text-gray-600">Total Revenue</p>
-            <p className="text-2xl font-bold text-gray-900">${info.total_revenue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
           </div>
         </div>
       </div>
@@ -410,37 +505,6 @@ export function BigQueryInfoSection() {
         </div>
       </div>
 
-      {/* Available Filters */}
-      <div className="bg-white rounded-lg border border-gray-200 p-6">
-        <h2 className="text-lg font-semibold mb-4">Available Filters</h2>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-          <div>
-            <p className="text-sm text-gray-600 mb-2">Countries ({info.available_countries.length})</p>
-            <div className="flex flex-wrap gap-2">
-              {info.available_countries.slice(0, 10).map((country) => (
-                <span key={country} className="px-3 py-1 bg-blue-50 text-blue-700 rounded-full text-sm">
-                  {country}
-                </span>
-              ))}
-              {info.available_countries.length > 10 && (
-                <span className="px-3 py-1 bg-gray-100 text-gray-600 rounded-full text-sm">
-                  +{info.available_countries.length - 10} more
-                </span>
-              )}
-            </div>
-          </div>
-          <div>
-            <p className="text-sm text-gray-600 mb-2">Channels ({info.available_channels.length})</p>
-            <div className="flex flex-wrap gap-2">
-              {info.available_channels.map((channel) => (
-                <span key={channel} className="px-3 py-1 bg-green-50 text-green-700 rounded-full text-sm">
-                  {channel}
-                </span>
-              ))}
-            </div>
-          </div>
-        </div>
-      </div>
 
       {/* Table Metadata */}
       <div className="bg-white rounded-lg border border-gray-200 p-6">
@@ -473,6 +537,12 @@ export function BigQueryInfoSection() {
           </div>
         </div>
       </div>
+
+      {/* Create Table Modal */}
+      <CreateTableModal
+        isOpen={showCreateTableModal}
+        onClose={() => setShowCreateTableModal(false)}
+      />
     </div>
   )
 }

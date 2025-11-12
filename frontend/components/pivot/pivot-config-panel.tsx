@@ -10,16 +10,13 @@ import {
   createCustomDimension,
   updateCustomDimension,
   deleteCustomDimension,
-  duplicateCustomDimension
+  duplicateCustomDimension,
+  fetchDimensionValues
 } from '@/lib/api'
 import type { PivotConfig } from '@/hooks/use-pivot-config'
 import type { CustomDimension, CustomDimensionCreate, CustomDimensionUpdate } from '@/lib/types'
-import {
-  AVAILABLE_METRICS,
-  AVAILABLE_DIMENSIONS,
-  getDimensionByValue,
-  MetricDefinition,
-} from '@/lib/pivot-metrics'
+import { usePivotMetrics, type MetricDefinition } from '@/hooks/use-pivot-metrics'
+import { useSchema } from '@/hooks/use-schema'
 import CustomDimensionModal from '@/components/modals/custom-dimension-modal'
 
 interface PivotConfigPanelProps {
@@ -39,6 +36,11 @@ interface PivotConfigPanelProps {
   addFilter: (filter: any) => void
   removeFilter: (index: number) => void
   resetToDefaults: () => void
+  // New props for dimension filters
+  dimensionFilters?: Record<string, string[]>
+  onDimensionFilterChange?: (dimensionId: string, values: string[]) => void
+  onClearDimensionFilters?: () => void
+  currentFilters?: any
 }
 
 interface AvailableMetricProps {
@@ -71,6 +73,146 @@ function AvailableMetric({ metric, onAdd, isSelected }: AvailableMetricProps) {
   )
 }
 
+interface DimensionFilterInlineProps {
+  dimension: any
+  selectedValues: string[]
+  onFilterChange: (values: string[]) => void
+  currentFilters?: any
+}
+
+function DimensionFilterInline({
+  dimension,
+  selectedValues,
+  onFilterChange,
+  currentFilters,
+}: DimensionFilterInlineProps) {
+  const [isOpen, setIsOpen] = useState(false)
+  const [availableValues, setAvailableValues] = useState<string[]>([])
+  const [isLoadingValues, setIsLoadingValues] = useState(false)
+
+  // Load available values when dropdown opens
+  useEffect(() => {
+    if (isOpen && availableValues.length === 0) {
+      setIsLoadingValues(true)
+      fetchDimensionValues(dimension.id, currentFilters || {})
+        .then(values => {
+          setAvailableValues(values)
+        })
+        .catch(err => {
+          console.error(`Failed to load values for ${dimension.id}:`, err)
+        })
+        .finally(() => {
+          setIsLoadingValues(false)
+        })
+    }
+  }, [isOpen, dimension.id, availableValues.length, currentFilters])
+
+  const toggleValue = (value: string) => {
+    if (selectedValues.includes(value)) {
+      onFilterChange(selectedValues.filter(v => v !== value))
+    } else {
+      onFilterChange([...selectedValues, value])
+    }
+  }
+
+  const selectAll = () => {
+    onFilterChange(availableValues)
+  }
+
+  const clearSelection = () => {
+    onFilterChange([])
+  }
+
+  return (
+    <div className="relative">
+      <button
+        onClick={() => setIsOpen(!isOpen)}
+        className={`w-full flex items-center justify-between px-2 py-1.5 text-xs border rounded transition-colors ${
+          selectedValues.length > 0
+            ? 'border-pink-400 bg-pink-50 text-pink-900'
+            : 'border-gray-300 bg-white text-gray-700 hover:border-gray-400'
+        }`}
+      >
+        <span className="truncate">
+          {dimension.display_name}
+          {selectedValues.length > 0 && (
+            <span className="ml-1 text-xs font-medium">
+              ({selectedValues.length})
+            </span>
+          )}
+        </span>
+        <ChevronDown
+          className={`h-3 w-3 transition-transform ${isOpen ? 'transform rotate-180' : ''}`}
+        />
+      </button>
+
+      {isOpen && (
+        <>
+          {/* Overlay to close dropdown when clicking outside */}
+          <div
+            className="fixed inset-0 z-10"
+            onClick={() => setIsOpen(false)}
+          />
+
+          {/* Dropdown content */}
+          <div className="absolute z-20 mt-1 w-full bg-white border border-gray-300 rounded shadow-lg max-h-48 overflow-auto">
+            {isLoadingValues ? (
+              <div className="p-3 text-center text-xs text-gray-500">
+                Loading...
+              </div>
+            ) : (
+              <>
+                {/* Select all / Clear all buttons */}
+                <div className="sticky top-0 bg-gray-50 border-b border-gray-200 px-2 py-1 flex gap-2">
+                  <button
+                    onClick={selectAll}
+                    className="text-xs text-blue-600 hover:text-blue-800"
+                  >
+                    Select all
+                  </button>
+                  <span className="text-gray-300">|</span>
+                  <button
+                    onClick={clearSelection}
+                    className="text-xs text-gray-600 hover:text-gray-800"
+                  >
+                    Clear
+                  </button>
+                </div>
+
+                {/* Value checkboxes */}
+                <div className="py-1">
+                  {availableValues.map(value => (
+                    <label
+                      key={value}
+                      className="flex items-center gap-2 px-2 py-1 hover:bg-gray-50 cursor-pointer"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={selectedValues.includes(value)}
+                        onChange={() => toggleValue(value)}
+                        className="h-3 w-3 text-blue-600 border-gray-300 rounded focus:ring-blue-500"
+                      />
+                      <span className="text-xs text-gray-700 truncate flex-1">
+                        {value}
+                      </span>
+                    </label>
+                  ))}
+
+                  {availableValues.length === 0 && (
+                    <div className="p-3 text-center text-xs text-gray-500">
+                      No values available
+                    </div>
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
 export function PivotConfigPanel({
   isOpen,
   onClose,
@@ -88,7 +230,17 @@ export function PivotConfigPanel({
   addFilter,
   removeFilter,
   resetToDefaults,
+  dimensionFilters = {},
+  onDimensionFilterChange,
+  onClearDimensionFilters,
+  currentFilters,
 }: PivotConfigPanelProps) {
+  // Load dynamic metrics and dimensions from schema
+  const { metrics: AVAILABLE_METRICS, dimensions: AVAILABLE_DIMENSIONS } = usePivotMetrics()
+  const { schema } = useSchema()
+
+  // Get filterable dimensions
+  const filterableDimensions = schema?.dimensions?.filter(d => d.is_filterable) || []
 
   const [isDataSourceExpanded, setIsDataSourceExpanded] = useState(false)
   const [isDateRangeExpanded, setIsDateRangeExpanded] = useState(false)
@@ -566,51 +718,50 @@ export function PivotConfigPanel({
             )}
           </button>
           {isFiltersExpanded && (
-            <>
-              {config.selectedFilters.length === 0 ? (
-                <div className="p-3 text-center bg-pink-50 border border-pink-200 rounded">
-                  <p className="text-xs text-pink-700">
-                    No filters applied yet
-                  </p>
-                  <p className="text-xs text-gray-500 mt-1">
-                    Filters will appear here once created
-                  </p>
-                </div>
-              ) : (
-                <div className="space-y-2">
-                  {config.selectedFilters.map((filter, index) => (
-                    <div
-                      key={`${filter.dimension}-${filter.value}-${index}`}
-                      draggable
-                      onDragStart={(e) => {
-                        e.dataTransfer.setData('type', 'filter')
-                        e.dataTransfer.setData('dimension', filter.dimension)
-                        e.dataTransfer.setData('value', filter.value)
-                        e.dataTransfer.setData('label', filter.label)
-                        e.dataTransfer.setData('index', String(index))
-                      }}
-                      className="p-2 bg-pink-50 border-2 border-pink-300 rounded cursor-move hover:bg-pink-100 transition-colors"
-                    >
-                      <div className="flex items-center gap-2">
-                        <GripVertical className="h-3 w-3 text-pink-600" />
-                        <div className="flex-1">
-                          <div className="text-xs font-medium text-gray-900">
-                            {filter.label}
-                          </div>
-                          <div className="text-xs text-pink-600">Drag to table</div>
-                        </div>
+            <div className="space-y-2">
+              {filterableDimensions.length > 0 ? (
+                <>
+                  {/* Active filter count and clear button */}
+                  {Object.keys(dimensionFilters).length > 0 && (
+                    <div className="flex items-center justify-between px-2 py-1 bg-blue-50 rounded">
+                      <span className="text-xs text-blue-700 font-medium">
+                        {Object.keys(dimensionFilters).length} dimension filter(s) active
+                      </span>
+                      {onClearDimensionFilters && (
                         <button
-                          onClick={() => removeFilter(index)}
-                          className="text-gray-400 hover:text-red-600 transition-colors"
+                          onClick={onClearDimensionFilters}
+                          className="text-xs text-blue-600 hover:text-blue-800"
                         >
-                          <X className="h-3 w-3" />
+                          Clear all
                         </button>
-                      </div>
+                      )}
                     </div>
+                  )}
+
+                  {/* Dimension filter dropdowns */}
+                  {filterableDimensions.map(dimension => (
+                    <DimensionFilterInline
+                      key={dimension.id}
+                      dimension={dimension}
+                      selectedValues={dimensionFilters[dimension.id] || []}
+                      onFilterChange={(values) => {
+                        if (onDimensionFilterChange) {
+                          onDimensionFilterChange(dimension.id, values)
+                        }
+                      }}
+                      currentFilters={currentFilters}
+                    />
                   ))}
+                </>
+              ) : (
+                <div className="p-3 text-center bg-pink-50 border border-pink-200 rounded">
+                  <p className="text-xs text-pink-700">No filterable dimensions available</p>
+                  <p className="text-xs text-gray-500 mt-1">
+                    Dimensions must be marked as filterable in the schema
+                  </p>
                 </div>
               )}
-            </>
+            </div>
           )}
         </div>
 

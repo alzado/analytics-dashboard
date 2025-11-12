@@ -29,6 +29,209 @@ def safe_float(value: float) -> float:
     return float(value)
 
 
+def _get_all_metrics_for_pivot():
+    """
+    Load all base and calculated metrics from schema service for pivot table.
+    Returns dict with:
+    - base_metrics: List of base metric definitions
+    - calculated_metrics: List of calculated metric definitions
+    - all_metric_ids: List of all metric IDs
+    - primary_sort_metric: ID of the metric to sort by (from schema config)
+    - schema_config: Full schema config object
+    """
+    try:
+        from services.schema_service import SchemaService
+        bq_service = get_bigquery_service()
+        if bq_service and bq_service.client:
+            schema_service = SchemaService(bq_service.client, table_id=bq_service.table_id)
+            schema_config = schema_service.load_schema()
+
+            # Access Pydantic model attributes directly (not .get() method)
+            base_metrics = schema_config.base_metrics if schema_config else []
+            calculated_metrics = schema_config.calculated_metrics if schema_config else []
+
+            # Get all metric IDs
+            all_metric_ids = [m.id for m in base_metrics] + [m.id for m in calculated_metrics]
+
+            # Get primary sort metric from schema config, or use first visible base metric
+            primary_sort_metric = schema_config.primary_sort_metric if schema_config else None
+            if not primary_sort_metric and base_metrics:
+                # Fallback: use first visible metric with lowest sort_order
+                visible = [m for m in base_metrics if m.is_visible_by_default]
+                if visible:
+                    primary_sort_metric = sorted(visible, key=lambda m: m.sort_order)[0].id
+                else:
+                    primary_sort_metric = base_metrics[0].id
+
+            # Get avg per day metric from schema config, or use primary sort metric as fallback
+            avg_per_day_metric = schema_config.avg_per_day_metric if schema_config else None
+            if not avg_per_day_metric:
+                avg_per_day_metric = primary_sort_metric  # Use same metric as sort metric
+
+            return {
+                'base_metrics': base_metrics,
+                'calculated_metrics': calculated_metrics,
+                'all_metric_ids': all_metric_ids,
+                'primary_sort_metric': primary_sort_metric,
+                'avg_per_day_metric': avg_per_day_metric,
+                'schema_config': schema_config
+            }
+    except Exception as e:
+        print(f"Warning: Could not load metrics for pivot: {e}")
+
+    # Return empty structure if loading fails
+    return {
+        'base_metrics': [],
+        'calculated_metrics': [],
+        'all_metric_ids': [],
+        'primary_sort_metric': None,
+        'avg_per_day_metric': None,
+        'schema_config': None
+    }
+
+
+def _load_metrics_data(bq_service):
+    """
+    Load all base and calculated metrics from schema service.
+    This is an alias for _get_all_metrics_for_pivot() for backward compatibility.
+    """
+    return _get_all_metrics_for_pivot()
+
+
+def _build_pivot_select_clause(metrics_data):
+    """
+    Build dynamic SQL SELECT clause for pivot table queries.
+    Includes all base metrics and SQL expressions for calculated metrics.
+
+    Args:
+        metrics_data: Dict from _get_all_metrics_for_pivot()
+
+    Returns:
+        String with SELECT clause items (without the SELECT keyword)
+    """
+    select_items = []
+
+    # Add base metrics
+    for metric in metrics_data['base_metrics']:
+        # Use aggregation from schema with actual column name from BigQuery
+        agg = metric.aggregation
+        col = metric.column_name
+        select_items.append(f"{agg}({col}) as {metric.id}")
+
+    # Add calculated metrics using their SQL expressions
+    for metric in metrics_data['calculated_metrics']:
+        # The sql_expression already includes the aggregation
+        select_items.append(f"({metric.sql_expression}) as {metric.id}")
+
+    return ",\n                ".join(select_items)
+
+
+def _extract_metrics_from_row(row, metrics_data):
+    """
+    Extract all metric values from a DataFrame row into a dictionary.
+
+    Args:
+        row: pandas Series with metric columns
+        metrics_data: Dict from _get_all_metrics_for_pivot()
+
+    Returns:
+        Dict with metric_id -> value mapping
+    """
+    metrics = {}
+
+    # Extract all metrics from the row
+    for metric_id in metrics_data['all_metric_ids']:
+        if metric_id in row:
+            value = row[metric_id]
+            # Handle pandas dtypes - convert to int or float
+            if pd.isna(value):
+                metrics[metric_id] = 0.0
+            elif 'int' in str(row[metric_id].__class__.__name__).lower():
+                metrics[metric_id] = int(value)
+            else:
+                metrics[metric_id] = safe_float(value)
+
+    return metrics
+
+
+def _get_schema_config():
+    """Load schema configuration from SchemaService."""
+    try:
+        from services.schema_service import SchemaService
+        bq_service = get_bigquery_service()
+        if bq_service and bq_service.client:
+            schema_service = SchemaService(bq_service.client, table_id=bq_service.table_id)
+            return schema_service.load_schema()
+    except Exception as e:
+        print(f"Warning: Could not load schema: {e}")
+    return None
+
+
+def _compute_calculated_metrics(base_metrics: Dict, schema_config=None) -> Dict:
+    """
+    Compute calculated metrics from base metrics using schema formulas.
+
+    Args:
+        base_metrics: Dictionary of base metric values from BigQuery
+        schema_config: Schema configuration with calculated metric definitions
+
+    Returns:
+        Dictionary of calculated metric values
+    """
+    calculated = {}
+
+    if not schema_config or not schema_config.calculated_metrics:
+        return calculated
+
+    # For each calculated metric in schema, compute its value
+    for calc_metric in schema_config.calculated_metrics:
+        try:
+            # Build expression by replacing metric IDs with their values
+            expression = calc_metric.sql_expression
+
+            # Simple approach: replace AGG(column) patterns with actual values
+            # This works for post-aggregation calculations
+            for base_metric in schema_config.base_metrics:
+                # Replace patterns like "SUM(queries)" with the actual value
+                patterns = [
+                    f"{base_metric.aggregation}({base_metric.column_name})",
+                    base_metric.id
+                ]
+                for pattern in patterns:
+                    if pattern in expression:
+                        value = base_metrics.get(base_metric.id, 0)
+                        expression = expression.replace(pattern, str(value))
+
+            # Handle SAFE_DIVIDE specially
+            if "SAFE_DIVIDE" in expression:
+                # Extract numerator and denominator from SAFE_DIVIDE(num, denom)
+                import re
+                match = re.match(r'SAFE_DIVIDE\((.*?),\s*(.*?)\)', expression)
+                if match:
+                    try:
+                        numerator = float(eval(match.group(1)))
+                        denominator = float(eval(match.group(2)))
+                        result = numerator / denominator if denominator != 0 else 0
+                    except:
+                        result = 0
+                else:
+                    result = 0
+            else:
+                # Evaluate the expression
+                try:
+                    result = eval(expression)
+                except:
+                    result = 0
+
+            calculated[calc_metric.id] = safe_float(result)
+
+        except Exception as e:
+            print(f"Warning: Could not compute calculated metric '{calc_metric.id}': {e}")
+            calculated[calc_metric.id] = 0
+
+    return calculated
+
+
 def _query_custom_dimension_pivot(
     custom_dim_id: str,
     filters: FilterParams,
@@ -46,15 +249,26 @@ def _query_custom_dimension_pivot(
     if not custom_dim:
         return None
 
+    # Load all metrics dynamically from schema
+    metrics_data = _get_all_metrics_for_pivot()
+    select_clause = _build_pivot_select_clause(metrics_data)
+
+    # Determine metric for sorting and avg per day
+    if metrics_data['primary_sort_metric']:
+        primary_sort = metrics_data['primary_sort_metric']
+    elif metrics_data['base_metrics']:
+        primary_sort = metrics_data['base_metrics'][0].id
+    else:
+        raise ValueError("No metrics available in schema")
+    avg_per_day_metric = metrics_data['avg_per_day_metric'] or primary_sort
+    avg_per_day_key = f"{avg_per_day_metric}_per_day"
+
     # For date_range type custom dimensions, run a query for each date range value
     if custom_dim.type == "date_range":
         all_rows = []
-        total_queries_sum = 0
-        total_queries_pdp_sum = 0
-        total_queries_a2c_sum = 0
-        total_purchases_sum = 0
-        total_revenue_sum = 0.0
-        total_search_term_count = 0
+
+        # Initialize base metric totals dynamically
+        base_metric_totals = {metric.id: 0 for metric in metrics_data['base_metrics']}
 
         # Track actual min/max dates across all queries for num_days calculation
         overall_min_date = None
@@ -67,28 +281,22 @@ def _query_custom_dimension_pivot(
             value_filters.end_date = value.end_date
 
             # Build filter clause for this date range
-            where_clause = bq_service.build_filter_clause(
+            # Create a modified FilterParams with overridden dates
+            range_filters = FilterParams(
                 start_date=value.start_date,
                 end_date=value.end_date,
-                country=filters.country,
-                channel=filters.channel,
-                gcategory=filters.gcategory,
-                query_intent_classification=filters.query_intent_classification,
-                n_words_normalized=filters.n_words_normalized,
-                n_attributes=filters.n_attributes,
-                n_attributes_min=filters.n_attributes_min,
-                n_attributes_max=filters.n_attributes_max
+                dimension_filters=filters.dimension_filters
+            )
+            where_clause = bq_service.build_filter_clause(
+                start_date=range_filters.start_date,
+                end_date=range_filters.end_date,
+                dimension_filters=range_filters.dimension_filters
             )
 
-            # Query for this date range
+            # Query for this date range with dynamic metrics
             query = f"""
                 SELECT
-                    SUM(queries) as queries,
-                    SUM(queries_pdp) as queries_pdp,
-                    SUM(queries_a2c) as queries_a2c,
-                    SUM(purchases) as purchases,
-                    SUM(gross_purchase) as revenue,
-                    COUNT(DISTINCT search_term) as search_term_count,
+                    {select_clause},
                     MIN(date) as min_date,
                     MAX(date) as max_date
                 FROM `{bq_service.table_path}`
@@ -97,18 +305,15 @@ def _query_custom_dimension_pivot(
 
             df = bq_service._execute_and_log_query(query, query_type="pivot", endpoint="data_service")
 
-            if not df.empty and df['queries'].iloc[0] > 0:
+            if not df.empty:
                 row_data = df.iloc[0]
-                queries = int(row_data['queries'])
-                queries_pdp = int(row_data['queries_pdp'])
-                queries_a2c = int(row_data['queries_a2c'])
-                purchases = int(row_data['purchases'])
-                revenue = safe_float(row_data['revenue'])
-                search_term_count = int(row_data['search_term_count'])
 
-                # Track date range for avg_queries_per_day calculation
-                min_date = row_data['min_date']
-                max_date = row_data['max_date']
+                # Extract all metrics dynamically
+                metrics = _extract_metrics_from_row(row_data, metrics_data)
+
+                # Track date range for avg_per_day calculation
+                min_date = row_data['min_date'] if 'min_date' in row_data else None
+                max_date = row_data['max_date'] if 'max_date' in row_data else None
 
                 if min_date and max_date:
                     num_days = (max_date - min_date).days + 1
@@ -121,42 +326,21 @@ def _query_custom_dimension_pivot(
                 if overall_max_date is None or (max_date and max_date > overall_max_date):
                     overall_max_date = max_date
 
-                # Calculate metrics
-                ctr = safe_float(queries_pdp / queries) if queries > 0 else 0.0
-                a2c_rate = safe_float(queries_a2c / queries) if queries > 0 else 0.0
-                conversion_rate = safe_float(purchases / queries) if queries > 0 else 0.0
-                pdp_conversion = safe_float(purchases / queries_pdp) if queries_pdp > 0 else 0.0
-                revenue_per_query = safe_float(revenue / queries) if queries > 0 else 0.0
-                aov = safe_float(revenue / purchases) if purchases > 0 else 0.0
-                avg_queries_per_day = safe_float(queries / num_days) if num_days > 0 else 0.0
+                # Add avg per day as a computed metric
+                avg_per_day_value = metrics.get(avg_per_day_metric, 0)
+                metrics[avg_per_day_key] = safe_float(avg_per_day_value / num_days) if num_days > 0 and avg_per_day_value > 0 else 0.0
 
                 # Add row
                 all_rows.append(PivotRow(
                     dimension_value=value.label,
-                    queries=queries,
-                    queries_pdp=queries_pdp,
-                    queries_a2c=queries_a2c,
-                    purchases=purchases,
-                    revenue=revenue,
-                    ctr=ctr,
-                    a2c_rate=a2c_rate,
-                    conversion_rate=conversion_rate,
-                    pdp_conversion=pdp_conversion,
-                    revenue_per_query=revenue_per_query,
-                    aov=aov,
-                    avg_queries_per_day=avg_queries_per_day,
+                    metrics=metrics,
                     percentage_of_total=0.0,  # Will calculate after
-                    search_term_count=search_term_count,
-                    has_children=True
+                    has_children=False
                 ))
 
-                # Accumulate totals
-                total_queries_sum += queries
-                total_queries_pdp_sum += queries_pdp
-                total_queries_a2c_sum += queries_a2c
-                total_purchases_sum += purchases
-                total_revenue_sum += revenue
-                total_search_term_count += search_term_count
+                # Accumulate base metric totals
+                for metric in metrics_data['base_metrics']:
+                    base_metric_totals[metric.id] += metrics.get(metric.id, 0)
 
         # Query for "Other" - dates not in any defined date range
         # Build exclusion conditions for all date ranges
@@ -170,14 +354,7 @@ def _query_custom_dimension_pivot(
         base_where_clause = bq_service.build_filter_clause(
             start_date=filters.start_date,
             end_date=filters.end_date,
-            country=filters.country,
-            channel=filters.channel,
-            gcategory=filters.gcategory,
-            query_intent_classification=filters.query_intent_classification,
-            n_words_normalized=filters.n_words_normalized,
-            n_attributes=filters.n_attributes,
-            n_attributes_min=filters.n_attributes_min,
-            n_attributes_max=filters.n_attributes_max
+            dimension_filters=filters.dimension_filters
         )
 
         # Add date exclusions to WHERE clause
@@ -189,15 +366,10 @@ def _query_custom_dimension_pivot(
         else:
             combined_where_clause = base_where_clause
 
-        # Query for "Other" dates
+        # Query for "Other" dates with dynamic metrics
         other_query = f"""
             SELECT
-                SUM(queries) as queries,
-                SUM(queries_pdp) as queries_pdp,
-                SUM(queries_a2c) as queries_a2c,
-                SUM(purchases) as purchases,
-                SUM(gross_purchase) as revenue,
-                COUNT(DISTINCT search_term) as search_term_count,
+                {select_clause},
                 MIN(date) as min_date,
                 MAX(date) as max_date
             FROM `{bq_service.table_path}`
@@ -206,18 +378,15 @@ def _query_custom_dimension_pivot(
 
         other_df = bq_service._execute_and_log_query(other_query, query_type="pivot", endpoint="data_service")
 
-        if not other_df.empty and other_df['queries'].iloc[0] > 0:
+        if not other_df.empty:
             other_row_data = other_df.iloc[0]
-            other_queries = int(other_row_data['queries'])
-            other_queries_pdp = int(other_row_data['queries_pdp'])
-            other_queries_a2c = int(other_row_data['queries_a2c'])
-            other_purchases = int(other_row_data['purchases'])
-            other_revenue = safe_float(other_row_data['revenue'])
-            other_search_term_count = int(other_row_data['search_term_count'])
 
-            # Track date range for avg_queries_per_day calculation
-            other_min_date = other_row_data['min_date']
-            other_max_date = other_row_data['max_date']
+            # Extract all metrics dynamically
+            other_metrics = _extract_metrics_from_row(other_row_data, metrics_data)
+
+            # Track date range for avg_per_day calculation
+            other_min_date = other_row_data['min_date'] if 'min_date' in other_row_data else None
+            other_max_date = other_row_data['max_date'] if 'max_date' in other_row_data else None
 
             if other_min_date and other_max_date:
                 other_num_days = (other_max_date - other_min_date).days + 1
@@ -230,46 +399,27 @@ def _query_custom_dimension_pivot(
             if overall_max_date is None or (other_max_date and other_max_date > overall_max_date):
                 overall_max_date = other_max_date
 
-            # Calculate metrics for "Other"
-            other_ctr = safe_float(other_queries_pdp / other_queries) if other_queries > 0 else 0.0
-            other_a2c_rate = safe_float(other_queries_a2c / other_queries) if other_queries > 0 else 0.0
-            other_conversion_rate = safe_float(other_purchases / other_queries) if other_queries > 0 else 0.0
-            other_pdp_conversion = safe_float(other_purchases / other_queries_pdp) if other_queries_pdp > 0 else 0.0
-            other_revenue_per_query = safe_float(other_revenue / other_queries) if other_queries > 0 else 0.0
-            other_aov = safe_float(other_revenue / other_purchases) if other_purchases > 0 else 0.0
-            other_avg_queries_per_day = safe_float(other_queries / other_num_days) if other_num_days > 0 else 0.0
+            # Add avg per day as a computed metric
+            other_avg_per_day_value = other_metrics.get(avg_per_day_metric, 0)
+            other_metrics[avg_per_day_key] = safe_float(other_avg_per_day_value / other_num_days) if other_num_days > 0 and other_avg_per_day_value > 0 else 0.0
 
             # Add "Other" row
             all_rows.append(PivotRow(
                 dimension_value="Other",
-                queries=other_queries,
-                queries_pdp=other_queries_pdp,
-                queries_a2c=other_queries_a2c,
-                purchases=other_purchases,
-                revenue=other_revenue,
-                ctr=other_ctr,
-                a2c_rate=other_a2c_rate,
-                conversion_rate=other_conversion_rate,
-                pdp_conversion=other_pdp_conversion,
-                revenue_per_query=other_revenue_per_query,
-                aov=other_aov,
-                avg_queries_per_day=other_avg_queries_per_day,
+                metrics=other_metrics,
                 percentage_of_total=0.0,  # Will calculate after
-                search_term_count=other_search_term_count,
-                has_children=True
+                has_children=False
             ))
 
             # Accumulate "Other" totals
-            total_queries_sum += other_queries
-            total_queries_pdp_sum += other_queries_pdp
-            total_queries_a2c_sum += other_queries_a2c
-            total_purchases_sum += other_purchases
-            total_revenue_sum += other_revenue
-            total_search_term_count += other_search_term_count
+            for metric in metrics_data['base_metrics']:
+                base_metric_totals[metric.id] += other_metrics.get(metric.id, 0)
 
         # Calculate percentage of total for each row
+        total_primary_metric = base_metric_totals.get(primary_sort, 0)
         for row in all_rows:
-            row.percentage_of_total = safe_float(row.queries / total_queries_sum * 100) if total_queries_sum > 0 else 0.0
+            row_primary_value = row.metrics.get(primary_sort, 0)
+            row.percentage_of_total = safe_float(row_primary_value / total_primary_metric * 100) if total_primary_metric > 0 else 0.0
 
         # Calculate overall num_days
         if overall_min_date and overall_max_date:
@@ -277,34 +427,29 @@ def _query_custom_dimension_pivot(
         else:
             overall_num_days = 1
 
+        # Compute calculated metrics from base metric totals
+        calculated_totals = _compute_calculated_metrics(base_metric_totals, metrics_data['schema_config'])
+
+        # Combine all totals
+        total_metrics = {**base_metric_totals, **calculated_totals}
+
+        # Add avg per day to total metrics
+        total_avg_per_day_value = total_metrics.get(avg_per_day_metric, 0)
+        total_metrics[avg_per_day_key] = safe_float(total_avg_per_day_value / overall_num_days) if overall_num_days > 0 else 0.0
+
         # Create total row
         total_row = PivotRow(
             dimension_value="Total",
-            queries=total_queries_sum,
-            queries_pdp=total_queries_pdp_sum,
-            queries_a2c=total_queries_a2c_sum,
-            purchases=total_purchases_sum,
-            revenue=total_revenue_sum,
-            ctr=safe_float(total_queries_pdp_sum / total_queries_sum) if total_queries_sum > 0 else 0.0,
-            a2c_rate=safe_float(total_queries_a2c_sum / total_queries_sum) if total_queries_sum > 0 else 0.0,
-            conversion_rate=safe_float(total_purchases_sum / total_queries_sum) if total_queries_sum > 0 else 0.0,
-            pdp_conversion=safe_float(total_purchases_sum / total_queries_pdp_sum) if total_queries_pdp_sum > 0 else 0.0,
-            revenue_per_query=safe_float(total_revenue_sum / total_queries_sum) if total_queries_sum > 0 else 0.0,
-            aov=safe_float(total_revenue_sum / total_purchases_sum) if total_purchases_sum > 0 else 0.0,
-            avg_queries_per_day=safe_float(total_queries_sum / overall_num_days) if overall_num_days > 0 else 0.0,
+            metrics=total_metrics,
             percentage_of_total=100.0,
-            search_term_count=total_search_term_count,
             has_children=False
         )
 
-        # Get available dimensions (include built-in ones)
-        dimension_map = {
-            'n_words_normalized': 'n_words_normalized',
-            'n_attributes': 'n_attributes',
-            'channel': 'channel',
-            'country': 'country',
-            'gcategory_name': 'gcategory_name'
-        }
+        # Get available dimensions from schema
+        dimension_map = {}
+        if bq_service.schema_config and bq_service.schema_config.dimensions:
+            for dim in bq_service.schema_config.dimensions:
+                dimension_map[dim.id] = dim.column_name
 
         return PivotResponse(
             rows=all_rows,
@@ -318,526 +463,145 @@ def _query_custom_dimension_pivot(
             }
         )
 
-    # For metric_condition type custom dimensions
+    # metric_condition custom dimensions are not supported (removed - too hardcoded for search_term)
     elif custom_dim.type == "metric_condition":
-        all_rows = []
+        raise ValueError(f"Custom dimension type 'metric_condition' is not supported. This feature was removed because it contained hardcoded references to 'search_term' column.")
 
-        # First, calculate the metric for all search terms
-        where_clause = bq_service.build_filter_clause(
-            start_date=filters.start_date,
-            end_date=filters.end_date,
-            country=filters.country,
-            channel=filters.channel,
-            gcategory=filters.gcategory,
-            query_intent_classification=filters.query_intent_classification,
-            n_words_normalized=filters.n_words_normalized,
-            n_attributes=filters.n_attributes,
-            n_attributes_min=filters.n_attributes_min,
-            n_attributes_max=filters.n_attributes_max
-        )
-
-        # Get metric column name - need to handle calculated metrics
-        metric_name = custom_dim.metric
-
-        # Map metric names to SQL expressions
-        metric_expression_map = {
-            'queries': 'SUM(queries)',
-            'purchases': 'SUM(purchases)',
-            'revenue': 'SUM(gross_purchase)',
-            'queries_pdp': 'SUM(queries_pdp)',
-            'queries_a2c': 'SUM(queries_a2c)',
-            'ctr': 'SAFE_DIVIDE(SUM(queries_pdp), SUM(queries))',
-            'conversion_rate': 'SAFE_DIVIDE(SUM(purchases), SUM(queries))',
-            'a2c_rate': 'SAFE_DIVIDE(SUM(queries_a2c), SUM(queries))',
-            'pdp_conversion': 'SAFE_DIVIDE(SUM(purchases), SUM(queries_pdp))',
-            'revenue_per_query': 'SAFE_DIVIDE(SUM(gross_purchase), SUM(queries))',
-            'aov': 'SAFE_DIVIDE(SUM(gross_purchase), SUM(purchases))',
-            'avg_queries_per_day': 'SAFE_DIVIDE(SUM(queries), COUNT(DISTINCT date))'
-        }
-
-        metric_expression = metric_expression_map.get(metric_name, f'SUM({metric_name})')
-
-        # Track totals for the overall dataset
-        total_queries_sum = 0
-        total_queries_pdp_sum = 0
-        total_queries_a2c_sum = 0
-        total_purchases_sum = 0
-        total_revenue_sum = 0.0
-        total_search_term_count = 0
-        overall_min_date = None
-        overall_max_date = None
-
-        # Query each metric dimension value
-        for value in custom_dim.metric_values:
-            # Build condition SQL from the value's conditions
-            conditions_list = [
-                {
-                    'operator': cond.operator,
-                    'value': cond.value,
-                    'value_max': cond.value_max
-                }
-                for cond in value.conditions
-            ]
-            # Use "metric_value" as the column name in HAVING clause since that's what we alias it to in SELECT
-            metric_condition_sql = bq_service.build_metric_condition_sql("metric_value", conditions_list)
-
-            # Build query with metric condition as a subquery filter
-            query = f"""
-                WITH search_term_metrics AS (
-                    SELECT
-                        search_term,
-                        SUM(queries) as queries,
-                        SUM(queries_pdp) as queries_pdp,
-                        SUM(queries_a2c) as queries_a2c,
-                        SUM(purchases) as purchases,
-                        SUM(gross_purchase) as revenue,
-                        {metric_expression} as metric_value,
-                        MIN(date) as min_date,
-                        MAX(date) as max_date
-                    FROM `{bq_service.table_path}`
-                    {where_clause}
-                    GROUP BY search_term
-                    HAVING {metric_condition_sql}
-                )
-                SELECT
-                    SUM(queries) as queries,
-                    SUM(queries_pdp) as queries_pdp,
-                    SUM(queries_a2c) as queries_a2c,
-                    SUM(purchases) as purchases,
-                    SUM(revenue) as revenue,
-                    COUNT(DISTINCT search_term) as search_term_count,
-                    MIN(min_date) as min_date,
-                    MAX(max_date) as max_date
-                FROM search_term_metrics
-            """
-
-            df = bq_service._execute_and_log_query(query, query_type="pivot", endpoint="data_service")
-
-            if not df.empty and df['queries'].iloc[0] > 0:
-                row_data = df.iloc[0]
-                queries = int(row_data['queries'])
-                queries_pdp = int(row_data['queries_pdp'])
-                queries_a2c = int(row_data['queries_a2c'])
-                purchases = int(row_data['purchases'])
-                revenue = safe_float(row_data['revenue'])
-                search_term_count = int(row_data['search_term_count'])
-
-                # Track date range
-                min_date = row_data['min_date']
-                max_date = row_data['max_date']
-                if min_date and max_date:
-                    num_days = (max_date - min_date).days + 1
-                else:
-                    num_days = 1
-
-                # Calculate metrics
-                ctr = safe_float(queries_pdp / queries) if queries > 0 else 0.0
-                a2c_rate = safe_float(queries_a2c / queries) if queries > 0 else 0.0
-                conversion_rate = safe_float(purchases / queries) if queries > 0 else 0.0
-                pdp_conversion = safe_float(purchases / queries_pdp) if queries_pdp > 0 else 0.0
-                revenue_per_query = safe_float(revenue / queries) if queries > 0 else 0.0
-                aov = safe_float(revenue / purchases) if purchases > 0 else 0.0
-                avg_queries_per_day = safe_float(queries / num_days) if num_days > 0 else 0.0
-
-                all_rows.append(PivotRow(
-                    dimension_value=value.label,
-                    queries=queries,
-                    queries_pdp=queries_pdp,
-                    queries_a2c=queries_a2c,
-                    purchases=purchases,
-                    revenue=revenue,
-                    ctr=ctr,
-                    a2c_rate=a2c_rate,
-                    conversion_rate=conversion_rate,
-                    pdp_conversion=pdp_conversion,
-                    revenue_per_query=revenue_per_query,
-                    aov=aov,
-                    avg_queries_per_day=avg_queries_per_day,
-                    percentage_of_total=0.0,  # Will calculate after
-                    search_term_count=search_term_count,
-                    has_children=True
-                ))
-
-        # Query for "Other" group (data NOT matching any conditions)
-        # Build negated conditions (NOT matching any of the defined conditions)
-        if True:  # Always create "Other" category
-            all_conditions = []
-            for value in custom_dim.metric_values:
-                conditions_list = [
-                    {
-                        'operator': cond.operator,
-                        'value': cond.value,
-                        'value_max': cond.value_max
-                    }
-                    for cond in value.conditions
-                ]
-                # Use "metric_value" as the column name in HAVING clause since that's what we alias it to in SELECT
-                value_condition = bq_service.build_metric_condition_sql("metric_value", conditions_list)
-                all_conditions.append(f"({value_condition})")
-
-            negated_condition = " OR ".join(all_conditions)
-
-            query = f"""
-                WITH search_term_metrics AS (
-                    SELECT
-                        search_term,
-                        SUM(queries) as queries,
-                        SUM(queries_pdp) as queries_pdp,
-                        SUM(queries_a2c) as queries_a2c,
-                        SUM(purchases) as purchases,
-                        SUM(gross_purchase) as revenue,
-                        {metric_expression} as metric_value,
-                        MIN(date) as min_date,
-                        MAX(date) as max_date
-                    FROM `{bq_service.table_path}`
-                    {where_clause}
-                    GROUP BY search_term
-                    HAVING NOT ({negated_condition})
-                )
-                SELECT
-                    SUM(queries) as queries,
-                    SUM(queries_pdp) as queries_pdp,
-                    SUM(queries_a2c) as queries_a2c,
-                    SUM(purchases) as purchases,
-                    SUM(revenue) as revenue,
-                    COUNT(DISTINCT search_term) as search_term_count,
-                    MIN(min_date) as min_date,
-                    MAX(max_date) as max_date
-                FROM search_term_metrics
-            """
-
-            df = bq_service._execute_and_log_query(query, query_type="pivot", endpoint="data_service")
-
-            if not df.empty and df['queries'].iloc[0] > 0:
-                row_data = df.iloc[0]
-                queries = int(row_data['queries'])
-                queries_pdp = int(row_data['queries_pdp'])
-                queries_a2c = int(row_data['queries_a2c'])
-                purchases = int(row_data['purchases'])
-                revenue = safe_float(row_data['revenue'])
-                search_term_count = int(row_data['search_term_count'])
-
-                min_date = row_data['min_date']
-                max_date = row_data['max_date']
-                if min_date and max_date:
-                    num_days = (max_date - min_date).days + 1
-                else:
-                    num_days = 1
-
-                ctr = safe_float(queries_pdp / queries) if queries > 0 else 0.0
-                a2c_rate = safe_float(queries_a2c / queries) if queries > 0 else 0.0
-                conversion_rate = safe_float(purchases / queries) if queries > 0 else 0.0
-                pdp_conversion = safe_float(purchases / queries_pdp) if queries_pdp > 0 else 0.0
-                revenue_per_query = safe_float(revenue / queries) if queries > 0 else 0.0
-                aov = safe_float(revenue / purchases) if purchases > 0 else 0.0
-                avg_queries_per_day = safe_float(queries / num_days) if num_days > 0 else 0.0
-
-                all_rows.append(PivotRow(
-                    dimension_value="Other",
-                    queries=queries,
-                    queries_pdp=queries_pdp,
-                    queries_a2c=queries_a2c,
-                    purchases=purchases,
-                    revenue=revenue,
-                    ctr=ctr,
-                    a2c_rate=a2c_rate,
-                    conversion_rate=conversion_rate,
-                    pdp_conversion=pdp_conversion,
-                    revenue_per_query=revenue_per_query,
-                    aov=aov,
-                    avg_queries_per_day=avg_queries_per_day,
-                    percentage_of_total=0.0,
-                    search_term_count=search_term_count,
-                    has_children=True
-                ))
-
-        # Calculate total (overall dataset, not sum of groups since there can be overlap)
-        total_query = f"""
-            SELECT
-                SUM(queries) as queries,
-                SUM(queries_pdp) as queries_pdp,
-                SUM(queries_a2c) as queries_a2c,
-                SUM(purchases) as purchases,
-                SUM(gross_purchase) as revenue,
-                COUNT(DISTINCT search_term) as search_term_count,
-                MIN(date) as min_date,
-                MAX(date) as max_date
-            FROM `{bq_service.table_path}`
-            {where_clause}
-        """
-
-        total_df = bq_service._execute_and_log_query(total_query, query_type="pivot", endpoint="data_service")
-
-        if not total_df.empty:
-            total_data = total_df.iloc[0]
-            total_queries_sum = int(total_data['queries'])
-            total_queries_pdp_sum = int(total_data['queries_pdp'])
-            total_queries_a2c_sum = int(total_data['queries_a2c'])
-            total_purchases_sum = int(total_data['purchases'])
-            total_revenue_sum = safe_float(total_data['revenue'])
-            total_search_term_count = int(total_data['search_term_count'])
-            overall_min_date = total_data['min_date']
-            overall_max_date = total_data['max_date']
-
-        # Calculate percentage for each row
-        for row in all_rows:
-            row.percentage_of_total = safe_float(row.queries / total_queries_sum * 100) if total_queries_sum > 0 else 0.0
-
-        # Calculate overall num_days
-        if overall_min_date and overall_max_date:
-            overall_num_days = (overall_max_date - overall_min_date).days + 1
-        else:
-            overall_num_days = 1
-
-        # Create total row
-        total_row = PivotRow(
-            dimension_value="Total",
-            queries=total_queries_sum,
-            queries_pdp=total_queries_pdp_sum,
-            queries_a2c=total_queries_a2c_sum,
-            purchases=total_purchases_sum,
-            revenue=total_revenue_sum,
-            ctr=safe_float(total_queries_pdp_sum / total_queries_sum) if total_queries_sum > 0 else 0.0,
-            a2c_rate=safe_float(total_queries_a2c_sum / total_queries_sum) if total_queries_sum > 0 else 0.0,
-            conversion_rate=safe_float(total_purchases_sum / total_queries_sum) if total_queries_sum > 0 else 0.0,
-            pdp_conversion=safe_float(total_purchases_sum / total_queries_pdp_sum) if total_queries_pdp_sum > 0 else 0.0,
-            revenue_per_query=safe_float(total_revenue_sum / total_queries_sum) if total_queries_sum > 0 else 0.0,
-            aov=safe_float(total_revenue_sum / total_purchases_sum) if total_purchases_sum > 0 else 0.0,
-            avg_queries_per_day=safe_float(total_queries_sum / overall_num_days) if overall_num_days > 0 else 0.0,
-            percentage_of_total=100.0,
-            search_term_count=total_search_term_count,
-            has_children=False
-        )
-
-        dimension_map = {
-            'n_words_normalized': 'n_words_normalized',
-            'n_attributes': 'n_attributes',
-            'channel': 'channel',
-            'country': 'country',
-            'gcategory_name': 'gcategory_name'
-        }
-
-        return PivotResponse(
-            rows=all_rows,
-            total=total_row,
-            available_dimensions=list(dimension_map.keys()),
-            dimension_metadata={
-                "id": custom_dim.id,
-                "name": custom_dim.name,
-                "type": custom_dim.type,
-                "metric": custom_dim.metric,
-                "is_custom": True
-            }
-        )
 
     return None
 
 
 def get_overview_metrics(filters: FilterParams) -> OverviewMetrics:
-    """Get overview metrics from BigQuery"""
+    """Get overview metrics from BigQuery - fully dynamic"""
     bq_service = get_bigquery_service()
     if bq_service is None:
         raise ValueError("BigQuery not initialized. Please configure BigQuery connection.")
 
-    metrics_dict = bq_service.query_kpi_metrics(
-        start_date=filters.start_date,
-        end_date=filters.end_date,
-        country=filters.country,
-        channel=filters.channel,
-        n_attributes_min=filters.n_attributes_min,
-        n_attributes_max=filters.n_attributes_max
-    )
+    # query_kpi_metrics already returns all base + calculated metrics dynamically
+    metrics_dict = bq_service.query_kpi_metrics(filters=filters)
 
-    # Calculate derived metrics
-    queries = metrics_dict.get('queries', 0)
-    queries_pdp = metrics_dict.get('queries_pdp', 0)
-    queries_a2c = metrics_dict.get('queries_a2c', 0)
-    purchases = metrics_dict.get('purchases', 0)
-    revenue = metrics_dict.get('revenue', 0)
-
-    # Calculate number of days for avg_queries_per_day
-    num_days = 1
-    if filters.start_date and filters.end_date:
-        from datetime import datetime
-        start = datetime.strptime(filters.start_date, '%Y-%m-%d')
-        end = datetime.strptime(filters.end_date, '%Y-%m-%d')
-        num_days = (end - start).days + 1
-
-    return OverviewMetrics(
-        queries=queries,
-        queries_pdp=queries_pdp,
-        queries_a2c=queries_a2c,
-        purchases=purchases,
-        revenue=revenue,
-        ctr=queries_pdp / queries if queries > 0 else 0,
-        a2c_rate=queries_a2c / queries if queries > 0 else 0,
-        conversion_rate=purchases / queries if queries > 0 else 0,
-        pdp_conversion=purchases / queries_pdp if queries_pdp > 0 else 0,
-        revenue_per_query=revenue / queries if queries > 0 else 0,
-        aov=revenue / purchases if purchases > 0 else 0,
-        avg_queries_per_day=queries / num_days if num_days > 0 else 0,
-        unique_search_terms=metrics_dict.get('unique_search_terms', 0)
-    )
+    # Return metrics as-is in dynamic format
+    return OverviewMetrics(metrics=metrics_dict)
 
 
 def get_trend_data(filters: FilterParams, granularity: str = "daily") -> List[TrendData]:
-    """Get time series trend data from BigQuery"""
+    """Get time series trend data from BigQuery - fully dynamic"""
     bq_service = get_bigquery_service()
     if bq_service is None:
         raise ValueError("BigQuery not initialized. Please configure BigQuery connection.")
 
     df = bq_service.query_timeseries(
-        granularity=granularity,
-        start_date=filters.start_date,
-        end_date=filters.end_date,
-        country=filters.country,
-        channel=filters.channel,
-        n_attributes_min=filters.n_attributes_min,
-        n_attributes_max=filters.n_attributes_max
+        filters=filters,
+        granularity=granularity
     )
 
     if df.empty:
         return []
 
-    # Calculate rates
-    df['ctr'] = df['queries_pdp'] / df['queries']
-    df['a2c_rate'] = df['queries_a2c'] / df['queries']
-    df['conversion_rate'] = df['purchases'] / df['queries']
-    df['pdp_conversion'] = df['purchases'] / df['queries_pdp']
-    df['revenue_per_query'] = df['revenue'] / df['queries']
+    # Get metrics data for dynamic extraction
+    metrics_data = _load_metrics_data(bq_service)
 
-    # Fill NaN with 0
-    df = df.fillna(0)
+    # Fill NaN with 0 for numeric columns only
+    numeric_columns = df.select_dtypes(include=[np.number]).columns
+    df[numeric_columns] = df[numeric_columns].fillna(0)
 
-    # Convert to response format
+    # Convert to response format with dynamic metrics
     result = []
     for _, row in df.iterrows():
+        # Extract all metrics dynamically
+        metrics = _extract_metrics_from_row(row, metrics_data)
+
         result.append(TrendData(
-            date=row['date'].strftime('%Y-%m-%d'),
-            queries=int(row['queries']),
-            queries_pdp=int(row['queries_pdp']),
-            queries_a2c=int(row['queries_a2c']),
-            purchases=int(row['purchases']),
-            revenue=float(row['revenue']),
-            ctr=float(row['ctr']),
-            a2c_rate=float(row['a2c_rate']),
-            conversion_rate=float(row['conversion_rate']),
-            pdp_conversion=float(row['pdp_conversion']),
-            revenue_per_query=float(row['revenue_per_query'])
+            date=row['date'].strftime('%Y-%m-%d') if pd.notna(row['date']) else None,
+            metrics=metrics
         ))
 
     return result
 
 
 def get_dimension_breakdown(dimension: str, filters: FilterParams, limit: int = 20) -> List[DimensionBreakdown]:
-    """Get breakdown by dimension from BigQuery"""
+    """Get breakdown by dimension from BigQuery - fully dynamic"""
     bq_service = get_bigquery_service()
     if bq_service is None:
         raise ValueError("BigQuery not initialized. Please configure BigQuery connection.")
 
     df = bq_service.query_dimension_breakdown(
         dimension=dimension,
-        limit=limit,
-        start_date=filters.start_date,
-        end_date=filters.end_date,
-        country=filters.country,
-        channel=filters.channel,
-        n_attributes_min=filters.n_attributes_min,
-        n_attributes_max=filters.n_attributes_max
+        filters=filters,
+        limit=limit
     )
 
     if df.empty:
         return []
 
-    total_queries = df['queries'].sum()
+    # Get metrics data for dynamic extraction
+    metrics_data = _load_metrics_data(bq_service)
 
-    # Calculate number of days for avg_queries_per_day
-    num_days = 1
-    if filters.start_date and filters.end_date:
-        from datetime import datetime
-        start = datetime.strptime(filters.start_date, '%Y-%m-%d')
-        end = datetime.strptime(filters.end_date, '%Y-%m-%d')
-        num_days = (end - start).days + 1
+    # Get primary sort metric for percentage calculation
+    if metrics_data.get('primary_sort_metric'):
+        primary_sort = metrics_data['primary_sort_metric']
+    elif metrics_data.get('base_metrics'):
+        primary_sort = metrics_data['base_metrics'][0].id
+    else:
+        raise ValueError("No metrics available in schema")
 
-    # Calculate rates
-    df['ctr'] = df['queries_pdp'] / df['queries']
-    df['a2c_rate'] = df['queries_a2c'] / df['queries']
-    df['conversion_rate'] = df['purchases'] / df['queries']
-    df['pdp_conversion'] = df['purchases'] / df['queries_pdp']
-    df['revenue_per_query'] = df['revenue'] / df['queries']
-    df['avg_queries_per_day'] = df['queries'] / num_days if num_days > 0 else 0
-    df['percentage_of_total'] = (df['queries'] / total_queries * 100) if total_queries > 0 else 0
+    # Calculate total for percentage
+    total_primary = df[primary_sort].sum() if primary_sort in df.columns else 0
 
-    # Fill NaN with 0
-    df = df.fillna(0)
+    # Fill NaN with 0 for numeric columns only
+    numeric_columns = df.select_dtypes(include=[np.number]).columns
+    df[numeric_columns] = df[numeric_columns].fillna(0)
 
-    # Convert to response format
+    # Convert to response format with dynamic metrics
     result = []
     for _, row in df.iterrows():
+        # Extract all metrics dynamically
+        metrics = _extract_metrics_from_row(row, metrics_data)
+
+        # Calculate percentage of total
+        primary_value = metrics.get(primary_sort, 0)
+        percentage = (primary_value / total_primary * 100) if total_primary > 0 else 0
+
         result.append(DimensionBreakdown(
             dimension_value=str(row['dimension_value']),
-            queries=int(row['queries']),
-            queries_pdp=int(row['queries_pdp']),
-            queries_a2c=int(row['queries_a2c']),
-            purchases=int(row['purchases']),
-            revenue=float(row['revenue']),
-            ctr=float(row['ctr']),
-            a2c_rate=float(row['a2c_rate']),
-            conversion_rate=float(row['conversion_rate']),
-            pdp_conversion=float(row['pdp_conversion']),
-            revenue_per_query=float(row['revenue_per_query']),
-            avg_queries_per_day=float(row['avg_queries_per_day']),
-            percentage_of_total=float(row['percentage_of_total'])
+            metrics=metrics,
+            percentage_of_total=float(percentage)
         ))
 
     return result
 
 
 def get_search_terms(filters: FilterParams, limit: int = 100, sort_by: str = "queries") -> List[SearchTermData]:
-    """Get top search terms from BigQuery"""
+    """Get top search terms from BigQuery - fully dynamic"""
     bq_service = get_bigquery_service()
     if bq_service is None:
         raise ValueError("BigQuery not initialized. Please configure BigQuery connection.")
 
     df = bq_service.query_search_terms(
+        filters=filters,
         limit=limit,
-        sort_by=sort_by,
-        start_date=filters.start_date,
-        end_date=filters.end_date,
-        country=filters.country,
-        channel=filters.channel,
-        n_attributes_min=filters.n_attributes_min,
-        n_attributes_max=filters.n_attributes_max
+        sort_by=sort_by
     )
 
     if df.empty:
         return []
 
-    # Calculate rates
-    df['ctr'] = df['queries_pdp'] / df['queries']
-    df['conversion_rate'] = df['purchases'] / df['queries']
-    df['pdp_conversion'] = df['purchases'] / df['queries_pdp']
-    df['avg_queries_per_day'] = df['queries'] / num_days if num_days > 0 else 0
+    # Get metrics data for dynamic extraction
+    metrics_data = _load_metrics_data(bq_service)
 
-    # Fill NaN with 0
-    df = df.fillna(0)
+    # Fill NaN with 0 for numeric columns only
+    numeric_columns = df.select_dtypes(include=[np.number]).columns
+    df[numeric_columns] = df[numeric_columns].fillna(0)
 
-    # Convert to response format
+    # Convert to response format with dynamic metrics
     result = []
     for _, row in df.iterrows():
+        # Extract all metrics dynamically
+        metrics = _extract_metrics_from_row(row, metrics_data)
+
         result.append(SearchTermData(
             search_term=str(row['search_term']),
-            queries=int(row['queries']),
-            queries_pdp=int(row['queries_pdp']),
-            queries_a2c=int(row['queries_a2c']),
-            purchases=int(row['purchases']),
-            revenue=float(row['revenue']),
-            ctr=float(row['ctr']),
-            conversion_rate=float(row['conversion_rate']),
-            pdp_conversion=float(row['pdp_conversion']),
-            avg_queries_per_day=float(row['avg_queries_per_day']),
-            n_words=int(row['n_words_normalized']),
-            n_attributes=int(row['n_attributes'])
+            metrics=metrics
         ))
 
     return result
@@ -863,9 +627,12 @@ def get_filter_options() -> FilterOptions:
     date_query = f"SELECT MIN(date) as min_date, MAX(date) as max_date FROM `{bq_service.table_path}`"
     date_df = bq_service._execute_and_log_query(date_query, query_type="pivot", endpoint="data_service")
 
+    min_date = date_df['min_date'].iloc[0]
+    max_date = date_df['max_date'].iloc[0]
+
     date_range = {
-        'min': date_df['min_date'].iloc[0].strftime('%Y-%m-%d'),
-        'max': date_df['max_date'].iloc[0].strftime('%Y-%m-%d')
+        'min': min_date.strftime('%Y-%m-%d') if pd.notna(min_date) else None,
+        'max': max_date.strftime('%Y-%m-%d') if pd.notna(max_date) else None
     }
 
     attributes = ['categoria', 'tipo', 'genero', 'marca', 'color', 'material', 'talla', 'modelo']
@@ -878,11 +645,23 @@ def get_filter_options() -> FilterOptions:
     )
 
 
-def get_pivot_data(dimensions: List[str], filters: FilterParams, limit: int = 50) -> PivotResponse:
-    """Get hierarchical pivot table data by dimensions from BigQuery"""
+def get_pivot_data(dimensions: List[str], filters: FilterParams, limit: int = 50, offset: int = 0, dimension_values: Optional[List[str]] = None) -> PivotResponse:
+    """Get hierarchical pivot table data by dimensions from BigQuery
+
+    Args:
+        dimensions: List of dimension IDs to group by
+        filters: Filter parameters
+        limit: Maximum number of rows to return (ignored if dimension_values is provided)
+        offset: Number of rows to skip (ignored if dimension_values is provided)
+        dimension_values: Optional list of specific dimension values to fetch (for multi-table matching)
+    """
     bq_service = get_bigquery_service()
     if bq_service is None:
         raise ValueError("BigQuery not initialized. Please configure BigQuery connection.")
+
+    # Load all metrics dynamically from schema
+    metrics_data = _get_all_metrics_for_pivot()
+    select_clause = _build_pivot_select_clause(metrics_data)
 
     # Check if any dimension is a custom dimension (starts with "custom_")
     if dimensions and len(dimensions) > 0:
@@ -897,27 +676,18 @@ def get_pivot_data(dimensions: List[str], filters: FilterParams, limit: int = 50
             else:
                 raise ValueError(f"Custom dimension {custom_dim_id} not found")
 
-    # Dimension map for available dimensions
-    dimension_map = {
-        'n_words_normalized': 'n_words_normalized',
-        'n_attributes': 'n_attributes',
-        'channel': 'channel',
-        'country': 'country',
-        'gcategory_name': 'gcategory_name'
-    }
+    # Build dimension map dynamically from schema
+    dimension_map = {}
+    if metrics_data['schema_config'] and metrics_data['schema_config'].dimensions:
+        for dim in metrics_data['schema_config'].dimensions:
+            # Map dimension ID to column name
+            dimension_map[dim.id] = dim.column_name
 
     # Query actual date range from filtered data for accurate avg_queries_per_day calculation
     where_clause_for_dates = bq_service.build_filter_clause(
         start_date=filters.start_date,
         end_date=filters.end_date,
-        country=filters.country,
-        channel=filters.channel,
-        gcategory=filters.gcategory,
-        query_intent_classification=filters.query_intent_classification,
-        n_words_normalized=filters.n_words_normalized,
-        n_attributes=filters.n_attributes,
-        n_attributes_min=filters.n_attributes_min,
-        n_attributes_max=filters.n_attributes_max
+        dimension_filters=filters.dimension_filters
     )
     date_range_query = f"""
         SELECT MIN(date) as min_date, MAX(date) as max_date
@@ -939,109 +709,76 @@ def get_pivot_data(dimensions: List[str], filters: FilterParams, limit: int = 50
         where_clause = bq_service.build_filter_clause(
             start_date=filters.start_date,
             end_date=filters.end_date,
-            country=filters.country,
-            channel=filters.channel,
-            gcategory=filters.gcategory,
-            n_words_normalized=filters.n_words_normalized,
-            n_attributes=filters.n_attributes,
-            n_attributes_min=filters.n_attributes_min,
-            n_attributes_max=filters.n_attributes_max
+            dimension_filters=filters.dimension_filters
         )
 
         # Query for aggregated totals
         query = f"""
             SELECT
-                SUM(queries) as queries,
-                SUM(queries_pdp) as queries_pdp,
-                SUM(queries_a2c) as queries_a2c,
-                SUM(purchases) as purchases,
-                SUM(gross_purchase) as revenue,
-                COUNT(DISTINCT search_term) as search_term_count
+                {select_clause}
             FROM `{bq_service.table_path}`
             {where_clause}
         """
 
+        # DEBUG: Print the query to see what SQL is being generated
+        print(f"\n=== PIVOT QUERY DEBUG ===")
+        print(f"SELECT CLAUSE:\n{select_clause}")
+        print(f"\nFULL QUERY:\n{query}")
+        print(f"=== END DEBUG ===\n")
+
         df = bq_service._execute_and_log_query(query, query_type="pivot", endpoint="data_service")
 
-        if df.empty or df['queries'].iloc[0] == 0:
-            # Return empty response with zero totals
+        if df.empty:
+            # Return empty response with zero totals - use empty metrics dict
+            empty_metrics = {metric_id: 0 for metric_id in metrics_data['all_metric_ids']}
             total_row = PivotRow(
                 dimension_value="Total",
-                queries=0,
-                queries_pdp=0,
-                queries_a2c=0,
-                purchases=0,
-                revenue=0.0,
-                ctr=0.0,
-                a2c_rate=0.0,
-                conversion_rate=0.0,
-                pdp_conversion=0.0,
-                revenue_per_query=0.0,
-                aov=0.0,
-                avg_queries_per_day=0.0,
+                metrics=empty_metrics,
                 percentage_of_total=100.0,
-                search_term_count=0,
                 has_children=False
             )
             return PivotResponse(
                 rows=[total_row],
                 total=total_row,
-                available_dimensions=list(dimension_map.keys())
+                available_dimensions=list(dimension_map.keys()),
+                total_count=1
             )
 
-        # Calculate metrics
+        # Extract all metrics dynamically from the row
         row_data = df.iloc[0]
-        queries = int(row_data['queries'])
-        queries_pdp = int(row_data['queries_pdp'])
-        queries_a2c = int(row_data['queries_a2c'])
-        purchases = int(row_data['purchases'])
-        revenue = safe_float(row_data['revenue'])
-        search_term_count = int(row_data['search_term_count'])
+        metrics = _extract_metrics_from_row(row_data, metrics_data)
 
-        ctr = safe_float(queries_pdp / queries) if queries > 0 else 0.0
-        a2c_rate = safe_float(queries_a2c / queries) if queries > 0 else 0.0
-        conversion_rate = safe_float(purchases / queries) if queries > 0 else 0.0
-        pdp_conversion = safe_float(purchases / queries_pdp) if queries_pdp > 0 else 0.0
-        revenue_per_query = safe_float(revenue / queries) if queries > 0 else 0.0
-        aov = safe_float(revenue / purchases) if purchases > 0 else 0.0
-        avg_queries_per_day = safe_float(queries / num_days) if num_days > 0 else 0.0
+        # Add avg per day as a computed metric
+        if metrics_data['avg_per_day_metric']:
+            avg_per_day_metric = metrics_data['avg_per_day_metric']
+        elif metrics_data['primary_sort_metric']:
+            avg_per_day_metric = metrics_data['primary_sort_metric']
+        elif metrics_data['base_metrics']:
+            avg_per_day_metric = metrics_data['base_metrics'][0].id
+        else:
+            raise ValueError("No metrics available in schema")
+        avg_per_day_key = f"{avg_per_day_metric}_per_day"
+        avg_per_day_value = metrics.get(avg_per_day_metric, 0)
+        metrics[avg_per_day_key] = safe_float(avg_per_day_value / num_days) if num_days > 0 and avg_per_day_value > 0 else 0.0
 
         total_row = PivotRow(
             dimension_value="All Data",
-            queries=queries,
-            queries_pdp=queries_pdp,
-            queries_a2c=queries_a2c,
-            purchases=purchases,
-            revenue=revenue,
-            ctr=ctr,
-            a2c_rate=a2c_rate,
-            conversion_rate=conversion_rate,
-            pdp_conversion=pdp_conversion,
-            revenue_per_query=revenue_per_query,
-            aov=aov,
-            avg_queries_per_day=avg_queries_per_day,
+            metrics=metrics,
             percentage_of_total=100.0,
-            search_term_count=search_term_count,
             has_children=False
         )
         return PivotResponse(
             rows=[total_row],
             total=total_row,
-            available_dimensions=list(dimension_map.keys())
+            available_dimensions=list(dimension_map.keys()),
+            total_count=1
         )
 
     # Build filter clause
     where_clause = bq_service.build_filter_clause(
         start_date=filters.start_date,
         end_date=filters.end_date,
-        country=filters.country,
-        channel=filters.channel,
-        gcategory=filters.gcategory,
-        query_intent_classification=filters.query_intent_classification,
-        n_words_normalized=filters.n_words_normalized,
-        n_attributes=filters.n_attributes,
-        n_attributes_min=filters.n_attributes_min,
-        n_attributes_max=filters.n_attributes_max
+        dimension_filters=filters.dimension_filters
     )
 
     # Map all dimensions to their column names
@@ -1057,128 +794,175 @@ def get_pivot_data(dimensions: List[str], filters: FilterParams, limit: int = 50
         concat_args = separator.join(cast_cols)
         dim_value_clause = f"CONCAT({concat_args}) as dimension_value"
     else:
-        dim_value_clause = f"{group_cols[0]} as dimension_value"
+        # Check if dimension is DATE type and cast to STRING
+        dim_def = next((d for d in metrics_data['schema_config'].dimensions if d.column_name == group_cols[0]), None)
+        if dim_def and dim_def.data_type == 'DATE':
+            dim_value_clause = f"CAST({group_cols[0]} AS STRING) as dimension_value"
+        else:
+            dim_value_clause = f"{group_cols[0]} as dimension_value"
 
-    # Query for pivot data
-    query = f"""
-        WITH grouped_data AS (
+    # Query for pivot data with dynamic metrics
+    # Determine which metric to sort by
+    if metrics_data['primary_sort_metric']:
+        primary_sort = metrics_data['primary_sort_metric']
+    elif metrics_data['base_metrics']:
+        primary_sort = metrics_data['base_metrics'][0].id
+    else:
+        raise ValueError("No metrics available in schema")
+
+    # Get the metric to use for avg per day calculation
+    avg_per_day_metric = metrics_data['avg_per_day_metric'] or primary_sort
+    avg_per_day_key = f"{avg_per_day_metric}_per_day"
+
+    # Split into two queries for better performance:
+    # 1. Main query: Get top N rows (no window functions)
+    # 2. Totals query: Get aggregated totals separately
+
+    # Count query - get total count of dimension values for pagination
+    # For multiple dimensions, we need to count distinct combinations using a subquery
+    if len(group_cols) > 1:
+        count_query = f"""
+            SELECT COUNT(*) as total_count
+            FROM (
+                SELECT {group_by_clause}
+                FROM `{bq_service.table_path}`
+                {where_clause}
+                GROUP BY {group_by_clause}
+            )
+        """
+    else:
+        count_query = f"""
+            SELECT COUNT(DISTINCT {group_by_clause}) as total_count
+            FROM `{bq_service.table_path}`
+            {where_clause}
+        """
+
+    count_df = bq_service._execute_and_log_query(count_query, query_type="pivot_count", endpoint="data_service")
+    total_count = int(count_df['total_count'].iloc[0]) if not count_df.empty else 0
+
+    # Build additional filter for specific dimension values if provided
+    dimension_values_filter = ""
+    if dimension_values and len(dimension_values) > 0:
+        # Escape single quotes in dimension values
+        escaped_values = [value.replace("'", "\\'") for value in dimension_values]
+        values_list = "', '".join(escaped_values)
+        # Add to where clause
+        dimension_column = group_cols[0]  # Use the first (and should be only) dimension column
+        dimension_values_filter = f"AND {dimension_column} IN ('{values_list}')"
+
+    # Main query - get top N dimension values with offset (or specific values if provided)
+    if dimension_values and len(dimension_values) > 0:
+        # When fetching specific dimension values, don't use LIMIT/OFFSET and sort alphabetically for consistent ordering
+        query = f"""
             SELECT
                 {dim_value_clause},
-                SUM(queries) as queries,
-                SUM(queries_pdp) as queries_pdp,
-                SUM(queries_a2c) as queries_a2c,
-                SUM(purchases) as purchases,
-                SUM(gross_purchase) as revenue,
-                COUNT(DISTINCT search_term) as search_term_count
+                {select_clause}
+            FROM `{bq_service.table_path}`
+            {where_clause}
+            {dimension_values_filter}
+            GROUP BY {group_by_clause}
+            ORDER BY {group_by_clause}
+        """
+    else:
+        # Normal top-N query
+        query = f"""
+            SELECT
+                {dim_value_clause},
+                {select_clause}
             FROM `{bq_service.table_path}`
             {where_clause}
             GROUP BY {group_by_clause}
-            ORDER BY queries DESC
+            ORDER BY {primary_sort} DESC
             LIMIT {limit}
-        ),
-        total_data AS (
-            SELECT SUM(queries) as total_queries
-            FROM `{bq_service.table_path}`
-            {where_clause}
-        )
-        SELECT
-            grouped_data.*,
-            total_data.total_queries
-        FROM grouped_data
-        CROSS JOIN total_data
-    """
+            OFFSET {offset}
+        """
 
     df = bq_service._execute_and_log_query(query, query_type="pivot", endpoint="data_service")
 
+    # Totals query - get overall totals in a separate, efficient query
+    totals_query = f"""
+        SELECT
+            {select_clause}
+        FROM `{bq_service.table_path}`
+        {where_clause}
+    """
+
+    totals_df = bq_service._execute_and_log_query(totals_query, query_type="pivot_totals", endpoint="data_service")
+
     if df.empty:
-        # Return empty response with zero totals
+        # Return empty response with zero totals - use empty metrics dict
+        empty_metrics = {metric_id: 0 for metric_id in metrics_data['all_metric_ids']}
+        empty_metrics[avg_per_day_key] = 0.0  # Add avg per day metric
         total_row = PivotRow(
             dimension_value="Total",
-            queries=0,
-            queries_pdp=0,
-            queries_a2c=0,
-            purchases=0,
-            revenue=0.0,
-            ctr=0.0,
-            a2c_rate=0.0,
-            conversion_rate=0.0,
-            pdp_conversion=0.0,
-            revenue_per_query=0.0,
-            aov=0.0,
-            avg_queries_per_day=0.0,
+            metrics=empty_metrics,
             percentage_of_total=100.0,
-            search_term_count=0,
             has_children=False
         )
         return PivotResponse(
             rows=[],
             total=total_row,
-            available_dimensions=list(dimension_map.keys())
+            available_dimensions=list(dimension_map.keys()),
+            total_count=total_count
         )
 
-    total_queries = df['total_queries'].iloc[0]
+    # Extract totals from the separate totals query
+    if totals_df.empty:
+        empty_metrics = {metric_id: 0 for metric_id in metrics_data['all_metric_ids']}
+        total_primary_metric = 0
+        total_metrics_from_query = empty_metrics
+    else:
+        totals_row = totals_df.iloc[0]
+        # Extract ALL metrics (base + calculated) from totals query, just like we do for rows
+        total_metrics_from_query = _extract_metrics_from_row(totals_row, metrics_data)
 
-    # Calculate metrics for each row
-    df['ctr'] = df['queries_pdp'] / df['queries']
-    df['a2c_rate'] = df['queries_a2c'] / df['queries']
-    df['conversion_rate'] = df['purchases'] / df['queries']
-    df['pdp_conversion'] = df['purchases'] / df['queries_pdp']
-    df['revenue_per_query'] = df['revenue'] / df['queries']
-    df['aov'] = df['revenue'] / df['purchases']
-    df['avg_queries_per_day'] = df['queries'] / num_days if num_days > 0 else 0
-    df['percentage_of_total'] = (df['queries'] / total_queries * 100) if total_queries > 0 else 0
-    df['has_children'] = True  # All dimension rows have search terms as children
+        # Get total for primary sort metric for percentage calculation
+        total_primary_metric = total_metrics_from_query.get(primary_sort, 0)
 
-    # Fill NaN and infinity with 0
+    # Fill NaN and infinity with 0 for all metric columns
     df = df.fillna(0)
     df = df.replace([np.inf, -np.inf], 0)
 
-    # Convert to PivotRow objects
+    # Convert to PivotRow objects using dynamic metrics
     rows = []
     for _, row in df.iterrows():
+        # Extract all metrics dynamically from this row
+        metrics = _extract_metrics_from_row(row, metrics_data)
+
+        # Add avg per day as a computed metric
+        avg_per_day_value = metrics.get(avg_per_day_metric, 0)
+        metrics[avg_per_day_key] = safe_float(avg_per_day_value / num_days) if num_days > 0 and avg_per_day_value > 0 else 0.0
+
+        # Calculate percentage of total based on primary sort metric
+        primary_metric_value = metrics.get(primary_sort, 0)
+        percentage_of_total = safe_float((primary_metric_value / total_primary_metric * 100)) if total_primary_metric > 0 else 0.0
+
         rows.append(PivotRow(
             dimension_value=str(row['dimension_value']),
-            queries=int(row['queries']),
-            queries_pdp=int(row['queries_pdp']),
-            queries_a2c=int(row['queries_a2c']),
-            purchases=int(row['purchases']),
-            revenue=safe_float(row['revenue']),
-            ctr=safe_float(row['ctr']),
-            a2c_rate=safe_float(row['a2c_rate']),
-            conversion_rate=safe_float(row['conversion_rate']),
-            pdp_conversion=safe_float(row['pdp_conversion']),
-            revenue_per_query=safe_float(row['revenue_per_query']),
-            aov=safe_float(row['aov']),
-            avg_queries_per_day=safe_float(row['avg_queries_per_day']),
-            percentage_of_total=safe_float(row['percentage_of_total']),
-            search_term_count=int(row['search_term_count']),
-            has_children=True
+            metrics=metrics,
+            percentage_of_total=percentage_of_total,
+            has_children=False
         ))
 
-    # Calculate totals
+    # Use metrics extracted from totals query (already includes both base and calculated metrics)
+    total_metrics = total_metrics_from_query
+
+    # Add avg per day to total metrics
+    total_avg_per_day_value = total_metrics.get(avg_per_day_metric, 0)
+    total_metrics[avg_per_day_key] = safe_float(total_avg_per_day_value / num_days) if num_days > 0 else 0.0
+
     total_row = PivotRow(
         dimension_value="Total",
-        queries=int(df['queries'].sum()),
-        queries_pdp=int(df['queries_pdp'].sum()),
-        queries_a2c=int(df['queries_a2c'].sum()),
-        purchases=int(df['purchases'].sum()),
-        revenue=safe_float(df['revenue'].sum()),
-        ctr=safe_float(df['queries_pdp'].sum() / df['queries'].sum()) if df['queries'].sum() > 0 else 0.0,
-        a2c_rate=safe_float(df['queries_a2c'].sum() / df['queries'].sum()) if df['queries'].sum() > 0 else 0.0,
-        conversion_rate=safe_float(df['purchases'].sum() / df['queries'].sum()) if df['queries'].sum() > 0 else 0.0,
-        pdp_conversion=safe_float(df['purchases'].sum() / df['queries_pdp'].sum()) if df['queries_pdp'].sum() > 0 else 0.0,
-        revenue_per_query=safe_float(df['revenue'].sum() / df['queries'].sum()) if df['queries'].sum() > 0 else 0.0,
-        aov=safe_float(df['revenue'].sum() / df['purchases'].sum()) if df['purchases'].sum() > 0 else 0.0,
-        avg_queries_per_day=safe_float(df['queries'].sum() / num_days) if num_days > 0 else 0.0,
+        metrics=total_metrics,
         percentage_of_total=100.0,
-        search_term_count=int(df['search_term_count'].sum()),
         has_children=False
     )
 
     return PivotResponse(
         rows=rows,
         total=total_row,
-        available_dimensions=list(dimension_map.keys())
+        available_dimensions=list(dimension_map.keys()),
+        total_count=total_count
     )
 
 
@@ -1197,6 +981,17 @@ def get_pivot_children(
     bq_service = get_bigquery_service()
     if bq_service is None:
         raise ValueError("BigQuery not initialized. Please configure BigQuery connection.")
+
+    # Load all metrics dynamically from schema
+    metrics_data = _get_all_metrics_for_pivot()
+    select_clause = _build_pivot_select_clause(metrics_data)
+    if metrics_data['primary_sort_metric']:
+        primary_sort = metrics_data['primary_sort_metric']
+    elif metrics_data['base_metrics']:
+        primary_sort = metrics_data['base_metrics'][0].id
+    else:
+        raise ValueError("No metrics available in schema")
+    avg_per_day_metric = metrics_data['avg_per_day_metric'] or primary_sort
 
     # Check if this is a custom dimension (starts with "custom_")
     if dimension and dimension.startswith("custom_"):
@@ -1230,174 +1025,14 @@ def get_pivot_children(
             dimension = ""
 
         elif custom_dim.type == "metric_condition":
-            # For metric_condition type, we need to filter search terms based on metric conditions
-            # The children query will be built differently - we'll return early
+            raise ValueError(f"Custom dimension type 'metric_condition' is not supported for children queries. This feature was removed because it contained hardcoded references to 'search_term' column.")
 
-            # Find the metric value that matches the label
-            metric_value = None
-            for val in custom_dim.metric_values:
-                if val.label == value:
-                    metric_value = val
-                    break
-
-            if not metric_value:
-                raise ValueError(f"Value '{value}' not found in custom dimension {custom_dim.name}")
-
-            # Get metric expression map
-            metric_expression_map = {
-                'queries': 'SUM(queries)',
-                'purchases': 'SUM(purchases)',
-                'revenue': 'SUM(gross_purchase)',
-                'queries_pdp': 'SUM(queries_pdp)',
-                'queries_a2c': 'SUM(queries_a2c)',
-                'ctr': 'SAFE_DIVIDE(SUM(queries_pdp), SUM(queries))',
-                'conversion_rate': 'SAFE_DIVIDE(SUM(purchases), SUM(queries))',
-                'a2c_rate': 'SAFE_DIVIDE(SUM(queries_a2c), SUM(queries))',
-                'pdp_conversion': 'SAFE_DIVIDE(SUM(purchases), SUM(queries_pdp))',
-                'revenue_per_query': 'SAFE_DIVIDE(SUM(gross_purchase), SUM(queries))',
-                'aov': 'SAFE_DIVIDE(SUM(gross_purchase), SUM(purchases))',
-                'avg_queries_per_day': 'SAFE_DIVIDE(SUM(queries), COUNT(DISTINCT date))'
-            }
-
-            metric_expression = metric_expression_map.get(custom_dim.metric, f'SUM({custom_dim.metric})')
-
-            # Build condition SQL
-            conditions_list = [
-                {
-                    'operator': cond.operator,
-                    'value': cond.value,
-                    'value_max': cond.value_max
-                }
-                for cond in metric_value.conditions
-            ]
-            metric_condition_sql = bq_service.build_metric_condition_sql("metric_value", conditions_list)
-
-            # Build filter clause
-            try:
-                where_clause = bq_service.build_filter_clause(
-                    start_date=filters.start_date,
-                    end_date=filters.end_date,
-                    country=filters.country,
-                    channel=filters.channel,
-                    gcategory=filters.gcategory,
-                    query_intent_classification=filters.query_intent_classification,
-                    n_words_normalized=filters.n_words_normalized,
-                    n_attributes=filters.n_attributes,
-                    n_attributes_min=filters.n_attributes_min,
-                    n_attributes_max=filters.n_attributes_max
-                )
-            except Exception as e:
-                raise
-
-            # Query for search terms that match the metric condition
-            query = f"""
-                WITH search_term_metrics AS (
-                    SELECT
-                        search_term,
-                        SUM(queries) as queries,
-                        SUM(queries_pdp) as queries_pdp,
-                        SUM(purchases) as purchases,
-                        SUM(gross_purchase) as revenue,
-                        {metric_expression} as metric_value,
-                        MIN(date) as min_date,
-                        MAX(date) as max_date
-                    FROM `{bq_service.table_path}`
-                    {where_clause}
-                    GROUP BY search_term
-                    HAVING {metric_condition_sql}
-                )
-                SELECT
-                    search_term,
-                    queries,
-                    queries_pdp,
-                    purchases,
-                    revenue,
-                    min_date,
-                    max_date
-                FROM search_term_metrics
-                ORDER BY queries DESC
-                LIMIT {limit}
-                OFFSET {offset}
-            """
-
-            try:
-                df = bq_service._execute_and_log_query(query, query_type="pivot", endpoint="data_service")
-            except Exception as e:
-                raise
-
-            if df.empty:
-                return []
-
-            # Calculate date range for avg_queries_per_day
-            if not df.empty and df['min_date'].iloc[0] is not None and df['max_date'].iloc[0] is not None:
-                min_date = df['min_date'].min()
-                max_date = df['max_date'].max()
-                num_days = (max_date - min_date).days + 1
-            else:
-                num_days = 1
-
-            # Get grand total for percentage calculation
-            total_query = f"""
-                SELECT SUM(queries) as total_queries
-                FROM `{bq_service.table_path}`
-                {where_clause}
-            """
-            total_df = bq_service._execute_and_log_query(total_query, query_type="pivot", endpoint="data_service")
-            grand_total_queries = float(total_df['total_queries'].iloc[0]) if not total_df.empty and total_df['total_queries'].iloc[0] is not None else 0
-
-            # Drop date columns (they have db_dtypes that don't support fillna with numeric values)
-            df = df.drop(columns=['min_date', 'max_date'])
-
-            # Calculate metrics
-            try:
-                df['ctr'] = df['queries_pdp'] / df['queries']
-                df['conversion_rate'] = df['purchases'] / df['queries']
-                df['pdp_conversion'] = df['purchases'] / df['queries_pdp']
-                # Use pandas division (will handle division by zero with NaN, which fillna will fix)
-                df['avg_queries_per_day'] = df['queries'] / num_days
-                df['percentage_of_total'] = df['queries'] / grand_total_queries
-                df['aov'] = df['revenue'] / df['purchases']
-
-                # Fill NaN and infinity with 0
-                df = df.fillna(0)
-                df = df.replace([np.inf, -np.inf], 0)
-            except Exception as e:
-                raise
-
-            # Convert to PivotChildRow objects
-            children = []
-            for idx, row in df.iterrows():
-                try:
-                    children.append(PivotChildRow(
-                        search_term=str(row['search_term']),
-                        queries=int(row['queries']),
-                        queries_pdp=int(row['queries_pdp']),
-                        purchases=int(row['purchases']),
-                        revenue=safe_float(row['revenue']),
-                        ctr=safe_float(row['ctr']),
-                        conversion_rate=safe_float(row['conversion_rate']),
-                        pdp_conversion=safe_float(row['pdp_conversion']),
-                        avg_queries_per_day=safe_float(row['avg_queries_per_day']),
-                        percentage_of_total=safe_float(row['percentage_of_total']),
-                        aov=safe_float(row['aov'])
-                    ))
-                except Exception as e:
-                    raise
-
-            return children
 
     # Query actual date range from filtered data for accurate avg_queries_per_day calculation
     where_clause_for_dates = bq_service.build_filter_clause(
         start_date=filters.start_date,
         end_date=filters.end_date,
-        country=filters.country,
-        channel=filters.channel,
-        gcategory=filters.gcategory,
-        query_intent_classification=filters.query_intent_classification,
-        n_words_normalized=filters.n_words_normalized,
-        n_attributes=filters.n_attributes,
-        n_attributes_min=filters.n_attributes_min,
-        n_attributes_max=filters.n_attributes_max
+        dimension_filters=filters.dimension_filters
     )
     date_range_query = f"""
         SELECT MIN(date) as min_date, MAX(date) as max_date
@@ -1413,106 +1048,61 @@ def get_pivot_children(
         max_date = date_range_df['max_date'].iloc[0]
         num_days = (max_date - min_date).days + 1
 
-    # Build base filter clause
-    where_conditions = []
-
-    # Apply same date clamping as parent query to ensure consistency
-    clamped_start, clamped_end = bq_service._clamp_dates(filters.start_date, filters.end_date)
-
-    if clamped_start and clamped_end:
-        where_conditions.append(f"date BETWEEN '{clamped_start}' AND '{clamped_end}'")
-    elif clamped_start:
-        where_conditions.append(f"date >= '{clamped_start}'")
-    elif clamped_end:
-        where_conditions.append(f"date <= '{clamped_end}'")
-    if filters.country:
-        where_conditions.append(f"country = '{filters.country}'")
-    if filters.channel:
-        where_conditions.append(f"channel = '{filters.channel}'")
-    if filters.gcategory:
-        where_conditions.append(f"gcategory_name = '{filters.gcategory}'")
-    if filters.query_intent_classification:
-        where_conditions.append(f"query_intent_classification = '{filters.query_intent_classification}'")
-    if filters.n_attributes_min is not None:
-        where_conditions.append(f"n_attributes >= {filters.n_attributes_min}")
-    if filters.n_attributes_max is not None:
-        where_conditions.append(f"n_attributes <= {filters.n_attributes_max}")
-    # Exact dimension filters (for table dimensions in pivot)
-    if filters.n_words_normalized is not None:
-        where_conditions.append(f"n_words_normalized = {filters.n_words_normalized}")
-    if filters.n_attributes is not None:
-        where_conditions.append(f"n_attributes = {filters.n_attributes}")
+    # Build base filter clause using the centralized method
+    where_clause = bq_service.build_filter_clause(
+        start_date=filters.start_date,
+        end_date=filters.end_date,
+        dimension_filters=filters.dimension_filters
+    )
 
     # Add dimension filter only if dimension is specified
     if dimension:  # If dimension is provided (not empty string)
-        # Built-in dimensions - map to actual column names
-        dimension_map = {
-            'n_words_normalized': 'n_words_normalized',  # Actual column name in BigQuery
-            'n_attributes': 'n_attributes',
-            'channel': 'channel',
-            'country': 'country',
-            'gcategory_name': 'gcategory_name'
-        }
-        group_col = dimension_map.get(dimension, dimension)
+        # Map dimension ID to column name using schema
+        group_col = dimension
+        is_numeric = False
+
+        if metrics_data['schema_config'] and metrics_data['schema_config'].dimensions:
+            dim_def = next((d for d in metrics_data['schema_config'].dimensions if d.id == dimension), None)
+            if dim_def:
+                group_col = dim_def.column_name
+                # Numeric dimensions: INTEGER, FLOAT
+                is_numeric = dim_def.data_type in ['INTEGER', 'FLOAT']
 
         # Numeric dimensions don't need quotes, string dimensions do
-        numeric_dimensions = {'n_words_normalized', 'n_attributes', 'n_words_normalized'}
-        if dimension in numeric_dimensions or group_col in numeric_dimensions:
-            where_conditions.append(f"{group_col} = {value}")
-        else:
-            where_conditions.append(f"{group_col} = '{value}'")
+        dimension_condition = f"{group_col} = {value}" if is_numeric else f"{group_col} = '{value}'"
 
-    where_clause = "WHERE " + " AND ".join(where_conditions) if where_conditions else ""
+        # Append dimension filter to existing WHERE clause
+        if where_clause:
+            where_clause = f"{where_clause} AND {dimension_condition}"
+        else:
+            where_clause = f"WHERE {dimension_condition}"
 
     # First, get the grand total queries for percentage calculation (same filters, no dimension restriction)
-    base_where_conditions = []
-    if clamped_start and clamped_end:
-        base_where_conditions.append(f"date BETWEEN '{clamped_start}' AND '{clamped_end}'")
-    elif clamped_start:
-        base_where_conditions.append(f"date >= '{clamped_start}'")
-    elif clamped_end:
-        base_where_conditions.append(f"date <= '{clamped_end}'")
-    if filters.country:
-        base_where_conditions.append(f"country = '{filters.country}'")
-    if filters.channel:
-        base_where_conditions.append(f"channel = '{filters.channel}'")
-    if filters.gcategory:
-        base_where_conditions.append(f"gcategory_name = '{filters.gcategory}'")
-    if filters.query_intent_classification:
-        base_where_conditions.append(f"query_intent_classification = '{filters.query_intent_classification}'")
-    if filters.n_attributes_min is not None:
-        base_where_conditions.append(f"n_attributes >= {filters.n_attributes_min}")
-    if filters.n_attributes_max is not None:
-        base_where_conditions.append(f"n_attributes <= {filters.n_attributes_max}")
-    # Exact dimension filters (for table dimensions in pivot)
-    if filters.n_words_normalized is not None:
-        base_where_conditions.append(f"n_words_normalized = {filters.n_words_normalized}")
-    if filters.n_attributes is not None:
-        base_where_conditions.append(f"n_attributes = {filters.n_attributes}")
+    base_where_clause = bq_service.build_filter_clause(
+        start_date=filters.start_date,
+        end_date=filters.end_date,
+        dimension_filters=filters.dimension_filters
+    )
 
-    base_where_clause = "WHERE " + " AND ".join(base_where_conditions) if base_where_conditions else ""
-
+    # Get grand total for percentage calculation (using primary sort metric)
     total_query = f"""
-        SELECT SUM(queries) as total_queries
+        SELECT SUM({primary_sort}) as total_primary_metric
         FROM `{bq_service.table_path}`
         {base_where_clause}
     """
 
     total_df = bq_service._execute_and_log_query(total_query, query_type="pivot", endpoint="data_service")
-    grand_total_queries = float(total_df['total_queries'].iloc[0]) if not total_df.empty and total_df['total_queries'].iloc[0] is not None else 0
+    grand_total_primary = float(total_df['total_primary_metric'].iloc[0]) if not total_df.empty and total_df['total_primary_metric'].iloc[0] is not None else 0
 
-    # Query for search terms within this dimension value
+    # Query for search terms within this dimension value using dynamic metrics
     query = f"""
         SELECT
             search_term,
-            SUM(queries) as queries,
-            SUM(queries_pdp) as queries_pdp,
-            SUM(purchases) as purchases,
-            SUM(gross_purchase) as revenue
+            {select_clause}
         FROM `{bq_service.table_path}`
         {where_clause}
         GROUP BY search_term
-        ORDER BY queries DESC
+        ORDER BY {primary_sort} DESC
         LIMIT {limit}
         OFFSET {offset}
     """
@@ -1522,37 +1112,29 @@ def get_pivot_children(
     if df.empty:
         return []
 
-    # Calculate rates
-    df['ctr'] = df['queries_pdp'] / df['queries']
-    df['conversion_rate'] = df['purchases'] / df['queries']
-    df['pdp_conversion'] = df['purchases'] / df['queries_pdp']
-    df['avg_queries_per_day'] = df['queries'] / num_days if num_days > 0 else 0
-
-    # Calculate percentage of total (relative to grand total)
-    df['percentage_of_total'] = df['queries'] / grand_total_queries if grand_total_queries > 0 else 0
-
-    # Calculate AOV (Average Order Value)
-    df['aov'] = df['revenue'] / df['purchases']
-
-    # Fill NaN and infinity with 0
+    # Fill NaN and infinity with 0 for all metric columns
     df = df.fillna(0)
     df = df.replace([np.inf, -np.inf], 0)
 
-    # Convert to PivotChildRow objects
+    # Convert to PivotChildRow objects using dynamic metrics
     children = []
     for _, row in df.iterrows():
+        # Extract all metrics dynamically from this row
+        metrics = _extract_metrics_from_row(row, metrics_data)
+
+        # Calculate avg_per_day - uses the configured metric
+        avg_per_day_value = metrics.get(avg_per_day_metric, 0)
+        avg_queries_per_day = safe_float(avg_per_day_value / num_days) if num_days > 0 and avg_per_day_value > 0 else 0.0
+
+        # Calculate percentage of total based on primary sort metric
+        primary_metric_value = metrics.get(primary_sort, 0)
+        percentage_of_total = safe_float((primary_metric_value / grand_total_primary * 100)) if grand_total_primary > 0 else 0.0
+
         children.append(PivotChildRow(
             search_term=str(row['search_term']),
-            queries=int(row['queries']),
-            queries_pdp=int(row['queries_pdp']),
-            purchases=int(row['purchases']),
-            revenue=safe_float(row['revenue']),
-            ctr=safe_float(row['ctr']),
-            conversion_rate=safe_float(row['conversion_rate']),
-            pdp_conversion=safe_float(row['pdp_conversion']),
-            avg_queries_per_day=safe_float(row['avg_queries_per_day']),
-            percentage_of_total=safe_float(row['percentage_of_total']),
-            aov=safe_float(row['aov'])
+            metrics=metrics,
+            avg_queries_per_day=avg_queries_per_day,
+            percentage_of_total=percentage_of_total
         ))
 
     return children
@@ -1582,12 +1164,5 @@ def get_dimension_values(dimension: str, filters: FilterParams) -> List[str]:
 
     return bq_service.query_dimension_values(
         dimension=dimension,
-        start_date=filters.start_date,
-        end_date=filters.end_date,
-        country=filters.country,
-        channel=filters.channel,
-        gcategory=filters.gcategory,
-        query_intent_classification=filters.query_intent_classification,
-        n_attributes_min=filters.n_attributes_min,
-        n_attributes_max=filters.n_attributes_max
+        filters=filters
     )

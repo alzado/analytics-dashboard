@@ -1,5 +1,4 @@
 import { useState, useEffect, useCallback } from 'react'
-import { DEFAULT_METRICS } from '@/lib/pivot-metrics'
 import type { DateRange } from '@/lib/types'
 
 const STORAGE_KEY = 'pivot-table-config'
@@ -24,10 +23,11 @@ export interface PivotConfig {
   // UI state (persisted)
   isConfigOpen?: boolean
   expandedRows?: string[]
-  selectedDisplayMetric?: string
+  selectedDisplayMetrics?: string[] // Changed from single metric to array
   sortColumn?: string | number
   sortSubColumn?: 'value' | 'diff' | 'pctDiff'
   sortDirection?: 'asc' | 'desc'
+  sortMetric?: string // Which metric to sort by
 }
 
 interface UsePivotConfigReturn {
@@ -54,8 +54,9 @@ interface UsePivotConfigReturn {
   // UI state methods
   setConfigOpen: (open: boolean) => void
   setExpandedRows: (rows: string[]) => void
-  setSelectedDisplayMetric: (metric: string) => void
-  setSortConfig: (column: string | number, subColumn?: 'value' | 'diff' | 'pctDiff', direction?: 'asc' | 'desc') => void
+  setSelectedDisplayMetrics: (metrics: string[]) => void
+  toggleDisplayMetric: (metric: string) => void
+  setSortConfig: (column: string | number, subColumn?: 'value' | 'diff' | 'pctDiff', direction?: 'asc' | 'desc', metric?: string) => void
 }
 
 const DEFAULT_CONFIG: PivotConfig = {
@@ -67,12 +68,12 @@ const DEFAULT_CONFIG: PivotConfig = {
   isDateRangeDropped: false,
   selectedDimensions: [],
   selectedTableDimensions: [],
-  selectedMetrics: DEFAULT_METRICS,
+  selectedMetrics: [], // Will be populated by components using usePivotMetrics
   selectedFilters: [],
   // UI state defaults
   isConfigOpen: true,
   expandedRows: [],
-  selectedDisplayMetric: 'queries',
+  selectedDisplayMetrics: [], // Will be populated by component based on available metrics
   sortColumn: undefined,
   sortSubColumn: undefined,
   sortDirection: undefined,
@@ -86,19 +87,37 @@ export function usePivotConfig(): UsePivotConfigReturn {
     try {
       const stored = localStorage.getItem(STORAGE_KEY)
       if (stored) {
-        const parsed = JSON.parse(stored) as Partial<PivotConfig>
-        // Merge with defaults to ensure all fields exist (handles migration from old versions)
+        const parsed = JSON.parse(stored) as Partial<PivotConfig> & { selectedDisplayMetric?: string }
+        // Only restore configuration data, not UI state
+        // Handle migration from old selectedDisplayMetric (string) to new selectedDisplayMetrics (array)
+        let displayMetrics = DEFAULT_CONFIG.selectedDisplayMetrics
+        if (Array.isArray((parsed as any).selectedDisplayMetrics)) {
+          displayMetrics = (parsed as any).selectedDisplayMetrics
+        } else if (typeof (parsed as any).selectedDisplayMetric === 'string') {
+          // Migrate from old single metric to array
+          displayMetrics = [(parsed as any).selectedDisplayMetric]
+        }
+
         const migratedConfig: PivotConfig = {
           ...DEFAULT_CONFIG,
-          ...parsed,
-          // Ensure new fields have defaults if missing
-          isDataSourceDropped: parsed.isDataSourceDropped ?? false,
-          isDateRangeDropped: parsed.isDateRangeDropped ?? false,
+          // Configuration data (persist these)
+          selectedTable: parsed.selectedTable ?? null,
+          selectedDateRange: parsed.selectedDateRange ?? null,
           startDate: parsed.startDate ?? null,
           endDate: parsed.endDate ?? null,
+          isDataSourceDropped: parsed.isDataSourceDropped ?? false,
+          isDateRangeDropped: parsed.isDateRangeDropped ?? false,
           selectedDimensions: Array.isArray(parsed.selectedDimensions) ? parsed.selectedDimensions : [],
           selectedTableDimensions: Array.isArray(parsed.selectedTableDimensions) ? parsed.selectedTableDimensions : [],
+          selectedMetrics: Array.isArray(parsed.selectedMetrics) ? parsed.selectedMetrics : [],
           selectedFilters: Array.isArray(parsed.selectedFilters) ? parsed.selectedFilters : [],
+          // UI state (always use defaults, don't persist)
+          isConfigOpen: DEFAULT_CONFIG.isConfigOpen,
+          expandedRows: DEFAULT_CONFIG.expandedRows,
+          selectedDisplayMetrics: displayMetrics,
+          sortColumn: DEFAULT_CONFIG.sortColumn,
+          sortSubColumn: DEFAULT_CONFIG.sortSubColumn,
+          sortDirection: DEFAULT_CONFIG.sortDirection,
         }
         setConfig(migratedConfig)
       }
@@ -107,10 +126,23 @@ export function usePivotConfig(): UsePivotConfigReturn {
     }
   }, [])
 
-  // Save config to localStorage whenever it changes
+  // Save only configuration data to localStorage, not UI state
   useEffect(() => {
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(config))
+      const configToSave = {
+        selectedTable: config.selectedTable,
+        selectedDateRange: config.selectedDateRange,
+        startDate: config.startDate,
+        endDate: config.endDate,
+        isDataSourceDropped: config.isDataSourceDropped,
+        isDateRangeDropped: config.isDateRangeDropped,
+        selectedDimensions: config.selectedDimensions,
+        selectedTableDimensions: config.selectedTableDimensions,
+        selectedMetrics: config.selectedMetrics,
+        selectedFilters: config.selectedFilters,
+        // Explicitly exclude UI state from persistence
+      }
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(configToSave))
     } catch (error) {
       console.error('Failed to save pivot config to localStorage:', error)
     }
@@ -261,16 +293,31 @@ export function usePivotConfig(): UsePivotConfigReturn {
     setConfig((prev) => ({ ...prev, expandedRows: rows }))
   }, [])
 
-  const setSelectedDisplayMetric = useCallback((metric: string) => {
-    setConfig((prev) => ({ ...prev, selectedDisplayMetric: metric }))
+  const setSelectedDisplayMetrics = useCallback((metrics: string[]) => {
+    setConfig((prev) => ({ ...prev, selectedDisplayMetrics: metrics }))
   }, [])
 
-  const setSortConfig = useCallback((column: string | number, subColumn?: 'value' | 'diff' | 'pctDiff', direction?: 'asc' | 'desc') => {
+  const toggleDisplayMetric = useCallback((metric: string) => {
+    setConfig((prev) => {
+      const currentMetrics = prev.selectedDisplayMetrics || []
+      if (currentMetrics.includes(metric)) {
+        // Remove if already selected (but keep at least one metric)
+        const newMetrics = currentMetrics.filter(m => m !== metric)
+        return { ...prev, selectedDisplayMetrics: newMetrics.length > 0 ? newMetrics : currentMetrics }
+      } else {
+        // Add to selection
+        return { ...prev, selectedDisplayMetrics: [...currentMetrics, metric] }
+      }
+    })
+  }, [])
+
+  const setSortConfig = useCallback((column: string | number, subColumn?: 'value' | 'diff' | 'pctDiff', direction?: 'asc' | 'desc', metric?: string) => {
     setConfig((prev) => ({
       ...prev,
       sortColumn: column,
       sortSubColumn: subColumn,
       sortDirection: direction,
+      sortMetric: metric,
     }))
   }, [])
 
@@ -298,7 +345,8 @@ export function usePivotConfig(): UsePivotConfigReturn {
     // UI state methods
     setConfigOpen,
     setExpandedRows,
-    setSelectedDisplayMetric,
+    setSelectedDisplayMetrics,
+    toggleDisplayMetric,
     setSortConfig,
   }
 }

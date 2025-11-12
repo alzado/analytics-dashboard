@@ -1,7 +1,9 @@
 'use client'
 
 import { useState, useEffect } from 'react'
+import { createPortal } from 'react-dom'
 import { X, Plus, Trash2, Calendar, TrendingUp } from 'lucide-react'
+import { usePivotMetrics } from '@/hooks/use-pivot-metrics'
 import type {
   CustomDimension,
   CustomDimensionValue,
@@ -19,21 +21,6 @@ interface CustomDimensionModalProps {
   editingDimension?: CustomDimension | null
   mode: 'create' | 'edit'
 }
-
-const AVAILABLE_METRICS = [
-  { value: 'queries', label: 'Queries' },
-  { value: 'purchases', label: 'Purchases' },
-  { value: 'revenue', label: 'Revenue' },
-  { value: 'conversion_rate', label: 'Conversion Rate' },
-  { value: 'ctr', label: 'CTR (Click-Through Rate)' },
-  { value: 'a2c_rate', label: 'Add-to-Cart Rate' },
-  { value: 'pdp_conversion', label: 'PDP Conversion' },
-  { value: 'revenue_per_query', label: 'Revenue per Query' },
-  { value: 'aov', label: 'Average Order Value' },
-  { value: 'avg_queries_per_day', label: 'Average Queries per Day' },
-  { value: 'queries_pdp', label: 'Queries with PDP' },
-  { value: 'queries_a2c', label: 'Queries with Add-to-Cart' }
-]
 
 const OPERATORS: { value: MetricConditionOperator; label: string; requiresValue: boolean; requiresMaxValue: boolean }[] = [
   { value: '>', label: 'Greater than (>)', requiresValue: true, requiresMaxValue: false },
@@ -53,6 +40,15 @@ export default function CustomDimensionModal({
   editingDimension,
   mode
 }: CustomDimensionModalProps) {
+  // Load dynamic metrics from schema
+  const { metrics } = usePivotMetrics()
+
+  // Transform metrics to dropdown format
+  const AVAILABLE_METRICS = metrics.map(m => ({
+    value: m.id,
+    label: m.label
+  }))
+
   const [dimensionType, setDimensionType] = useState<'date_range' | 'metric_condition'>('date_range')
   const [dimensionName, setDimensionName] = useState('')
 
@@ -279,8 +275,8 @@ export default function CustomDimensionModal({
 
   if (!isOpen) return null
 
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+  const modalContent = (
+    <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/50">
       <div className="bg-white rounded-lg shadow-xl w-full max-w-4xl max-h-[90vh] overflow-hidden flex flex-col">
         {/* Header */}
         <div className="flex items-center justify-between p-6 border-b">
@@ -658,4 +654,7 @@ export default function CustomDimensionModal({
       </div>
     </div>
   )
+
+  // Use portal to render modal at document body level, bypassing any overflow-hidden containers
+  return typeof window !== 'undefined' ? createPortal(modalContent, document.body) : null
 }

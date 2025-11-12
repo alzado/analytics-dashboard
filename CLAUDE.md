@@ -75,14 +75,101 @@ npm start      # Run production server
 - **Pagination for children**: Expanded rows paginate through search terms (100 per page)
 - **Row expansion state**: Tracked in parent component to persist expand/collapse across re-renders
 
+#### Dynamic Schema System (NEW)
+The application uses a **fully dynamic schema system** that automatically detects and adapts to any BigQuery table structure without code changes.
+
+**Key Features:**
+- **Auto-Detection**: Automatically classifies columns as metrics or dimensions based on type and naming
+- **Custom Calculated Metrics**: Users can create formulas like `{queries_pdp} / {queries}` via API
+- **Dynamic SQL Generation**: All queries built dynamically from schema configuration
+- **API-Driven Schema Management**: Full CRUD operations for metrics and dimensions
+- **Backward Compatible**: Default schema maintains original hardcoded metrics/dimensions
+
+**Schema Configuration Files:**
+- **Schema Storage**: `/app/config/schema_config.json` (persisted in Docker volume)
+- **Auto-Created**: Schema automatically detected and created on first BigQuery connection
+- **Format**: JSON with base metrics, calculated metrics, and dimensions
+
+**Schema Architecture:**
+```
+SchemaConfig
+├── base_metrics[]         # Direct column aggregations (SUM, AVG, COUNT, etc.)
+│   ├── id, display_name
+│   ├── column_name, aggregation
+│   └── format_type, decimal_places, category
+├── calculated_metrics[]   # Computed from base metrics
+│   ├── id, display_name
+│   ├── formula: "{metric1} / {metric2}"
+│   ├── sql_expression: "SAFE_DIVIDE(SUM(col1), SUM(col2))"
+│   └── depends_on[], format_type
+└── dimensions[]           # Grouping/filtering columns
+    ├── id, column_name, display_name
+    ├── data_type, filter_type
+    └── is_filterable, is_groupable
+```
+
+**Formula Syntax:**
+- Reference metrics: `{metric_id}`
+- Operations: `+`, `-`, `*`, `/` (division auto-converted to SAFE_DIVIDE)
+- Example: `{purchases} / {queries}` → `SAFE_DIVIDE(SUM(purchases), SUM(queries))`
+
+**Auto-Detection Logic:**
+- **Numeric columns** with keywords (queries, purchases, revenue) → Base Metrics (SUM aggregation)
+- **String/categorical columns** → Dimensions (STRING type)
+- **Boolean/attr_ prefix columns** → Boolean filter dimensions
+- **DATE columns** → Date dimensions with date_range filter
+
+**API Endpoints** (24 new endpoints):
+```bash
+# Schema Management
+GET  /api/schema                    # Get current schema
+POST /api/schema/detect             # Auto-detect from BigQuery
+POST /api/schema/reset              # Reset to defaults
+
+# Base Metrics CRUD
+GET    /api/metrics/base
+POST   /api/metrics/base
+PUT    /api/metrics/base/{id}
+DELETE /api/metrics/base/{id}
+
+# Calculated Metrics CRUD
+GET    /api/metrics/calculated
+POST   /api/metrics/calculated       # Includes formula validation
+POST   /api/metrics/validate-formula # Test formula before saving
+
+# Dimensions CRUD
+GET    /api/dimensions
+POST   /api/dimensions
+PUT    /api/dimensions/{id}
+DELETE /api/dimensions/{id}
+GET    /api/dimensions/filterable   # Get filterable dimensions only
+GET    /api/dimensions/groupable    # Get groupable dimensions only
+```
+
+**Dynamic Query Building:**
+All BigQuery queries now built dynamically:
+1. `BigQueryService._build_metric_select_clause()` - Generates SELECT with all metrics from schema
+2. `BigQueryService._load_schema()` - Loads schema on service initialization
+3. `DataService._compute_calculated_metrics()` - Evaluates formulas post-aggregation
+
+**Example Workflow:**
+1. Connect to BigQuery → Schema auto-detected and saved
+2. View metrics via `GET /api/metrics/base` and `/api/metrics/calculated`
+3. Create custom metric: `POST /api/metrics/calculated` with `{"formula": "{revenue} / {queries}"}`
+4. All dashboard queries automatically include new metric
+5. Frontend fetches metrics dynamically (no hardcoded lists needed)
+
 ### Critical Files
 
 **Backend:**
-- `backend/main.py` - FastAPI app with all API endpoints
-- `backend/services/bigquery_service.py` - BigQuery client wrapper, builds SQL queries, handles authentication
-- `backend/services/data_service.py` - Business logic layer, data aggregation, metric calculations
-- `backend/config.py` - Configuration management (loads from env vars or saved JSON)
-- `backend/models/schemas.py` - Pydantic models for request/response validation
+- `backend/main.py` - FastAPI app with all API endpoints (includes 24 schema management endpoints)
+- `backend/services/bigquery_service.py` - BigQuery client with dynamic SQL generation (refactored for schema)
+- `backend/services/data_service.py` - Business logic layer, metric calculations (includes calculated metrics support)
+- `backend/services/schema_service.py` - **NEW** Schema auto-detection, persistence, CRUD (450 lines)
+- `backend/services/metric_service.py` - **NEW** Metric management and formula parsing (350 lines)
+- `backend/services/dimension_service.py` - **NEW** Dimension management (100 lines)
+- `backend/config.py` - Configuration management (includes `SCHEMA_CONFIG_FILE` path)
+- `backend/models/schemas.py` - Pydantic models including 15 new schema models (BaseMetric, CalculatedMetric, etc.)
 
 **Frontend:**
 - `frontend/app/page.tsx` - Main dashboard page with tab navigation
