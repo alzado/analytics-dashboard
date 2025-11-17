@@ -11,13 +11,15 @@ import {
   updateCustomDimension,
   deleteCustomDimension,
   duplicateCustomDimension,
-  fetchDimensionValues
+  fetchDimensionValues,
+  fetchTables
 } from '@/lib/api'
 import type { PivotConfig } from '@/hooks/use-pivot-config'
-import type { CustomDimension, CustomDimensionCreate, CustomDimensionUpdate } from '@/lib/types'
+import type { CustomDimension, CustomDimensionCreate, CustomDimensionUpdate, DateRangeType, RelativeDatePreset } from '@/lib/types'
 import { usePivotMetrics, type MetricDefinition } from '@/hooks/use-pivot-metrics'
 import { useSchema } from '@/hooks/use-schema'
 import CustomDimensionModal from '@/components/modals/custom-dimension-modal'
+import { DateRangeSelector } from '@/components/ui/date-range-selector'
 
 interface PivotConfigPanelProps {
   isOpen: boolean
@@ -41,6 +43,15 @@ interface PivotConfigPanelProps {
   onDimensionFilterChange?: (dimensionId: string, values: string[]) => void
   onClearDimensionFilters?: () => void
   currentFilters?: any
+  // Date range props
+  dateRangeType?: DateRangeType
+  relativeDatePreset?: RelativeDatePreset | null
+  onDateRangeChange?: (
+    type: DateRangeType,
+    preset: RelativeDatePreset | null,
+    startDate: string | null,
+    endDate: string | null
+  ) => void
 }
 
 interface AvailableMetricProps {
@@ -78,6 +89,7 @@ interface DimensionFilterInlineProps {
   selectedValues: string[]
   onFilterChange: (values: string[]) => void
   currentFilters?: any
+  tableId?: string
 }
 
 function DimensionFilterInline({
@@ -85,6 +97,7 @@ function DimensionFilterInline({
   selectedValues,
   onFilterChange,
   currentFilters,
+  tableId,
 }: DimensionFilterInlineProps) {
   const [isOpen, setIsOpen] = useState(false)
   const [availableValues, setAvailableValues] = useState<string[]>([])
@@ -94,7 +107,7 @@ function DimensionFilterInline({
   useEffect(() => {
     if (isOpen && availableValues.length === 0) {
       setIsLoadingValues(true)
-      fetchDimensionValues(dimension.id, currentFilters || {})
+      fetchDimensionValues(dimension.id, currentFilters || {}, tableId)
         .then(values => {
           setAvailableValues(values)
         })
@@ -234,10 +247,13 @@ export function PivotConfigPanel({
   onDimensionFilterChange,
   onClearDimensionFilters,
   currentFilters,
+  dateRangeType = 'absolute',
+  relativeDatePreset = null,
+  onDateRangeChange,
 }: PivotConfigPanelProps) {
-  // Load dynamic metrics and dimensions from schema
-  const { metrics: AVAILABLE_METRICS, dimensions: AVAILABLE_DIMENSIONS } = usePivotMetrics()
-  const { schema } = useSchema()
+  // Load dynamic metrics and dimensions from schema (pass selectedTable to load table-specific schema)
+  const { schema } = useSchema(config.selectedTable || undefined)
+  const { metrics: AVAILABLE_METRICS, dimensions: AVAILABLE_DIMENSIONS } = usePivotMetrics(config.selectedTable || undefined)
 
   // Get filterable dimensions
   const filterableDimensions = schema?.dimensions?.filter(d => d.is_filterable) || []
@@ -252,6 +268,14 @@ export function PivotConfigPanel({
   const [isModalOpen, setIsModalOpen] = useState(false)
   const [modalMode, setModalMode] = useState<'create' | 'edit'>('create')
   const [editingDimension, setEditingDimension] = useState<CustomDimension | null>(null)
+
+  // Pending filter changes (not yet applied)
+  const [pendingFilters, setPendingFilters] = useState<Record<string, string[]>>(dimensionFilters || {})
+
+  // Sync pending filters when actual filters change externally
+  useEffect(() => {
+    setPendingFilters(dimensionFilters || {})
+  }, [dimensionFilters])
 
   const queryClient = useQueryClient()
 
@@ -328,19 +352,57 @@ export function PivotConfigPanel({
     duplicateMutation.mutate(id)
   }
 
-  // Fetch BigQuery info to get the configured table
-  const { data: bqInfo, isLoading: bqInfoLoading } = useQuery({
-    queryKey: ['bigquery-info'],
-    queryFn: fetchBigQueryInfo,
-    retry: false,
+  // Filter handlers
+  const handlePendingFilterChange = (dimensionId: string, values: string[]) => {
+    setPendingFilters(prev => {
+      const updated = { ...prev }
+      if (values.length === 0) {
+        delete updated[dimensionId]
+      } else {
+        updated[dimensionId] = values
+      }
+      return updated
+    })
+  }
+
+  const applyPendingFilters = () => {
+    if (onDimensionFilterChange) {
+      // Apply all pending filter changes
+      Object.entries(pendingFilters).forEach(([dimensionId, values]) => {
+        onDimensionFilterChange(dimensionId, values)
+      })
+      // Clear any filters that were removed
+      if (dimensionFilters) {
+        Object.keys(dimensionFilters).forEach(dimensionId => {
+          if (!pendingFilters[dimensionId]) {
+            onDimensionFilterChange(dimensionId, [])
+          }
+        })
+      }
+    }
+  }
+
+  const clearPendingFilters = () => {
+    setPendingFilters({})
+  }
+
+  const hasPendingChanges = JSON.stringify(pendingFilters) !== JSON.stringify(dimensionFilters || {})
+
+  // Fetch available tables
+  const { data: tablesData } = useQuery({
+    queryKey: ['tables'],
+    queryFn: fetchTables,
   })
 
-  // Auto-select the configured table if not already selected
-  useEffect(() => {
-    if (bqInfo && bqInfo.table && !config.selectedTable && bqInfo.connection_status === 'connected') {
-      updateTable(bqInfo.table)
-    }
-  }, [bqInfo, config.selectedTable, updateTable])
+  const tables = tablesData?.tables || []
+
+  // Fetch BigQuery info for the dropped table
+  const { data: bqInfo, isLoading: bqInfoLoading } = useQuery({
+    queryKey: ['bigquery-info', config.selectedTable],
+    queryFn: () => fetchBigQueryInfo(config.selectedTable || undefined),
+    enabled: !!config.selectedTable || tables.length === 0,
+    retry: false,
+  })
 
   // Fetch date range for selected table
   const { data: dateRangeInfo, isLoading: dateRangeLoading } = useQuery({
@@ -350,16 +412,14 @@ export function PivotConfigPanel({
     retry: false,
   })
 
-  // Auto-set start and end dates when table is selected (for the first time only)
+  // Auto-set start and end dates when table is selected or changed
   useEffect(() => {
     if (dateRangeInfo?.has_date_column && dateRangeInfo.min_date && dateRangeInfo.max_date) {
-      // Only auto-set if both dates are not already set
-      if (!config.startDate && !config.endDate) {
-        updateStartDate(dateRangeInfo.min_date)
-        updateEndDate(dateRangeInfo.max_date)
-      }
+      // Always update dates to match the table's available range
+      updateStartDate(dateRangeInfo.min_date)
+      updateEndDate(dateRangeInfo.max_date)
     }
-  }, [dateRangeInfo])
+  }, [dateRangeInfo?.min_date, dateRangeInfo?.max_date, config.selectedTable])
 
   // Filter out metrics that are already selected
   const selectedMetrics = config.selectedMetrics || []
@@ -426,50 +486,57 @@ export function PivotConfigPanel({
           </button>
           {isDataSourceExpanded && (
             <>
-              {bqInfoLoading ? (
-                <div className="p-3 text-center bg-white border border-gray-200 rounded">
-                  <p className="text-xs text-gray-500">Loading...</p>
-                </div>
-              ) : bqInfo?.connection_status === 'connected' && bqInfo.table ? (
-                <div
-                  draggable
-                  onDragStart={(e) => {
-                    e.dataTransfer.setData('type', 'datasource')
-                    e.dataTransfer.setData('table', bqInfo.table)
-                    e.dataTransfer.setData('tablePath', bqInfo.table_full_path || '')
-                  }}
-                  className="p-3 bg-blue-50 border-2 border-blue-300 rounded cursor-move hover:bg-blue-100 transition-colors"
-                >
-                  <div className="flex items-center gap-2 mb-2">
-                    <GripVertical className="h-3 w-3 text-blue-600" />
-                    <span className="text-green-600">✓</span>
-                    <div className="text-xs font-medium text-gray-900">{bqInfo.table}</div>
-                  </div>
-                  {bqInfo.table_full_path && (
-                    <div className="text-xs text-gray-500 mb-2">
-                      {bqInfo.table_full_path}
-                    </div>
-                  )}
-                  <div className="text-xs text-gray-400">
-                    {bqInfo.total_rows?.toLocaleString()} rows • {bqInfo.table_size_mb} MB
-                  </div>
-                  <div className="text-xs text-blue-600 mt-2">Drag to table</div>
-                </div>
-              ) : (
+              {tables.length === 0 ? (
                 <div className="p-3 text-center bg-yellow-50 border border-yellow-200 rounded">
                   <p className="text-xs text-yellow-700">
-                    No BigQuery connection configured
+                    No tables configured
                   </p>
                   <p className="text-xs text-yellow-600 mt-1">
-                    Configure BigQuery in Settings first
+                    Create a table in the Tables tab first
                   </p>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {/* List of all tables as draggable cards */}
+                  {tables.map((table) => {
+                    const isSelected = config.selectedTable === table.table_id
+                    return (
+                      <div
+                        key={table.table_id}
+                        draggable
+                        onDragStart={(e) => {
+                          e.dataTransfer.setData('type', 'datasource')
+                          e.dataTransfer.setData('table', table.table)
+                          e.dataTransfer.setData('tableId', table.table_id)
+                          e.dataTransfer.setData('tablePath', `${table.project_id}.${table.dataset}.${table.table}`)
+                        }}
+                        className={`p-3 border-2 rounded cursor-move hover:bg-blue-50 transition-colors ${
+                          isSelected
+                            ? 'bg-blue-50 border-blue-400'
+                            : 'bg-white border-gray-200 hover:border-blue-300'
+                        }`}
+                      >
+                        <div className="flex items-center gap-2 mb-1">
+                          <GripVertical className="h-3 w-3 text-gray-400" />
+                          {isSelected && <span className="text-green-600">✓</span>}
+                          <div className="text-xs font-medium text-gray-900">{table.name}</div>
+                        </div>
+                        <div className="text-xs text-gray-500 ml-5">
+                          {table.project_id}.{table.dataset}.{table.table}
+                        </div>
+                        <div className="text-xs text-blue-600 mt-1 ml-5">
+                          {isSelected ? 'Selected • Drag to table' : 'Drag to table'}
+                        </div>
+                      </div>
+                    )
+                  })}
                 </div>
               )}
             </>
           )}
         </div>
 
-        {/* Date Range Selection */}
+        {/* Date Range Selection - Only show when data source is dropped */}
         {config.selectedTable && (
           <div>
             <button
@@ -508,40 +575,58 @@ export function PivotConfigPanel({
                       </div>
                     </div>
 
-                    {/* Date Pickers */}
-                    <div className="p-3 bg-white border border-gray-200 rounded space-y-2">
-                      <div>
-                        <label className="text-xs text-gray-600 block mb-1">Start Date</label>
-                        <input
-                          type="date"
-                          value={config.startDate || ''}
-                          onChange={(e) => updateStartDate(e.target.value)}
-                          min={dateRangeInfo.min_date || undefined}
-                          max={config.endDate || dateRangeInfo.max_date || undefined}
-                          className="w-full text-xs border border-gray-300 rounded px-2 py-1"
+                    {/* Date Range Selector */}
+                    <div className="p-3 bg-white border border-gray-200 rounded">
+                      {onDateRangeChange ? (
+                        <DateRangeSelector
+                          dateRangeType={dateRangeType || 'absolute'}
+                          relativeDatePreset={relativeDatePreset || null}
+                          startDate={config.startDate}
+                          endDate={config.endDate}
+                          onDateRangeChange={onDateRangeChange}
                         />
-                      </div>
-                      <div>
-                        <label className="text-xs text-gray-600 block mb-1">End Date</label>
-                        <input
-                          type="date"
-                          value={config.endDate || ''}
-                          onChange={(e) => updateEndDate(e.target.value)}
-                          min={config.startDate || dateRangeInfo.min_date || undefined}
-                          max={dateRangeInfo.max_date || undefined}
-                          className="w-full text-xs border border-gray-300 rounded px-2 py-1"
-                        />
-                      </div>
+                      ) : (
+                        <div className="space-y-2">
+                          <div>
+                            <label className="text-xs text-gray-600 block mb-1">Start Date</label>
+                            <input
+                              type="date"
+                              value={config.startDate || ''}
+                              onChange={(e) => updateStartDate(e.target.value)}
+                              min={dateRangeInfo.min_date || undefined}
+                              max={config.endDate || dateRangeInfo.max_date || undefined}
+                              className="w-full text-xs border border-gray-300 rounded px-2 py-1"
+                            />
+                          </div>
+                          <div>
+                            <label className="text-xs text-gray-600 block mb-1">End Date</label>
+                            <input
+                              type="date"
+                              value={config.endDate || ''}
+                              onChange={(e) => updateEndDate(e.target.value)}
+                              min={config.startDate || dateRangeInfo.min_date || undefined}
+                              max={dateRangeInfo.max_date || undefined}
+                              className="w-full text-xs border border-gray-300 rounded px-2 py-1"
+                            />
+                          </div>
+                        </div>
+                      )}
                     </div>
 
                     {/* Draggable Date Range Chip */}
-                    {config.startDate && config.endDate && (
+                    {((dateRangeType === 'relative' && relativeDatePreset) || (config.startDate && config.endDate)) && (
                       <div
                         draggable
                         onDragStart={(e) => {
                           e.dataTransfer.setData('type', 'daterange')
-                          e.dataTransfer.setData('startDate', config.startDate)
-                          e.dataTransfer.setData('endDate', config.endDate)
+                          if (dateRangeType === 'relative' && relativeDatePreset) {
+                            e.dataTransfer.setData('dateRangeType', 'relative')
+                            e.dataTransfer.setData('relativeDatePreset', relativeDatePreset)
+                          } else {
+                            e.dataTransfer.setData('dateRangeType', 'absolute')
+                            e.dataTransfer.setData('startDate', config.startDate || '')
+                            e.dataTransfer.setData('endDate', config.endDate || '')
+                          }
                         }}
                         className="p-2 bg-purple-50 border-2 border-purple-300 rounded cursor-move hover:bg-purple-100 transition-colors"
                       >
@@ -549,7 +634,14 @@ export function PivotConfigPanel({
                           <GripVertical className="h-3 w-3 text-purple-600" />
                           <div className="flex-1">
                             <div className="text-xs font-medium text-purple-900">
-                              {config.startDate} → {config.endDate}
+                              {dateRangeType === 'relative' && relativeDatePreset ? (
+                                <>
+                                  {relativeDatePreset.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase())}
+                                  <span className="ml-1 text-purple-600">(relative)</span>
+                                </>
+                              ) : (
+                                `${config.startDate} → ${config.endDate}`
+                              )}
                             </div>
                             <div className="text-xs text-purple-600">Drag to table</div>
                           </div>
@@ -567,7 +659,8 @@ export function PivotConfigPanel({
           </div>
         )}
 
-        {/* Dimension Selection */}
+        {/* Dimension Selection - Only show when data source is dropped */}
+        {config.selectedTable && (
         <div>
           <button
             onClick={() => setIsDimensionsExpanded(!isDimensionsExpanded)}
@@ -701,8 +794,10 @@ export function PivotConfigPanel({
             </div>
           )}
         </div>
+        )}
 
-        {/* Filters */}
+        {/* Filters - Only show when data source is dropped */}
+        {config.selectedTable && (
         <div>
           <button
             onClick={() => setIsFiltersExpanded(!isFiltersExpanded)}
@@ -721,20 +816,12 @@ export function PivotConfigPanel({
             <div className="space-y-2">
               {filterableDimensions.length > 0 ? (
                 <>
-                  {/* Active filter count and clear button */}
-                  {Object.keys(dimensionFilters).length > 0 && (
-                    <div className="flex items-center justify-between px-2 py-1 bg-blue-50 rounded">
+                  {/* Active filter count */}
+                  {Object.keys(dimensionFilters || {}).length > 0 && (
+                    <div className="px-2 py-1 bg-blue-50 rounded">
                       <span className="text-xs text-blue-700 font-medium">
-                        {Object.keys(dimensionFilters).length} dimension filter(s) active
+                        {Object.keys(dimensionFilters || {}).length} dimension filter(s) active
                       </span>
-                      {onClearDimensionFilters && (
-                        <button
-                          onClick={onClearDimensionFilters}
-                          className="text-xs text-blue-600 hover:text-blue-800"
-                        >
-                          Clear all
-                        </button>
-                      )}
                     </div>
                   )}
 
@@ -743,15 +830,38 @@ export function PivotConfigPanel({
                     <DimensionFilterInline
                       key={dimension.id}
                       dimension={dimension}
-                      selectedValues={dimensionFilters[dimension.id] || []}
-                      onFilterChange={(values) => {
-                        if (onDimensionFilterChange) {
-                          onDimensionFilterChange(dimension.id, values)
-                        }
-                      }}
+                      selectedValues={pendingFilters[dimension.id] || []}
+                      onFilterChange={(values) => handlePendingFilterChange(dimension.id, values)}
                       currentFilters={currentFilters}
+                      tableId={config.selectedTable || undefined}
                     />
                   ))}
+
+                  {/* Apply/Clear buttons */}
+                  <div className="flex gap-2 pt-2">
+                    <button
+                      onClick={applyPendingFilters}
+                      disabled={!hasPendingChanges}
+                      className={`flex-1 px-3 py-2 text-xs font-medium rounded transition-colors ${
+                        hasPendingChanges
+                          ? 'bg-blue-600 text-white hover:bg-blue-700'
+                          : 'bg-gray-200 text-gray-400 cursor-not-allowed'
+                      }`}
+                    >
+                      Apply Filters
+                    </button>
+                    <button
+                      onClick={clearPendingFilters}
+                      disabled={Object.keys(pendingFilters).length === 0}
+                      className={`flex-1 px-3 py-2 text-xs font-medium rounded transition-colors ${
+                        Object.keys(pendingFilters).length > 0
+                          ? 'bg-gray-600 text-white hover:bg-gray-700'
+                          : 'bg-gray-200 text-gray-400 cursor-not-allowed'
+                      }`}
+                    >
+                      Clear Pending
+                    </button>
+                  </div>
                 </>
               ) : (
                 <div className="p-3 text-center bg-pink-50 border border-pink-200 rounded">
@@ -764,8 +874,10 @@ export function PivotConfigPanel({
             </div>
           )}
         </div>
+        )}
 
-        {/* Metrics - Available to Add */}
+        {/* Metrics - Available to Add - Only show when data source is dropped */}
+        {config.selectedTable && (
         <div>
           <button
             onClick={() => setIsMetricsExpanded(!isMetricsExpanded)}
@@ -811,6 +923,7 @@ export function PivotConfigPanel({
             </div>
           )}
         </div>
+        )}
       </div>
 
       {/* Footer */}
@@ -833,6 +946,7 @@ export function PivotConfigPanel({
         onSave={handleModalSave}
         editingDimension={editingDimension}
         mode={modalMode}
+        tableId={config.selectedTable || undefined}
       />
     </div>
   )

@@ -5,10 +5,11 @@ import os
 import json
 import tempfile
 import time
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 from google.cloud import bigquery
 from google.oauth2 import service_account
 import pandas as pd
+from .date_resolver import resolve_relative_date
 
 
 class BigQueryService:
@@ -41,6 +42,12 @@ class BigQueryService:
         # Date limits (optional)
         self.allowed_min_date: Optional[str] = None
         self.allowed_max_date: Optional[str] = None
+
+        # Date range cache: {cache_key: (min_date, max_date, num_days)}
+        self._date_range_cache: Dict[str, tuple] = {}
+
+        # Count cache: {cache_key: total_count}
+        self._count_cache: Dict[str, int] = {}
 
         # Create BigQuery client
         if credentials_path and os.path.exists(credentials_path):
@@ -157,8 +164,6 @@ class BigQueryService:
         # Import here to avoid circular dependency
         from services.query_logger import get_query_logger
 
-        print(f"[QUERY LOGGER DEBUG] _execute_and_log_query called: endpoint={endpoint}, type={query_type}")
-
         start_time = time.time()
         error_msg = None
         bytes_processed = 0
@@ -178,13 +183,10 @@ class BigQueryService:
 
             row_count = len(df)
 
-            print(f"[QUERY LOGGER DEBUG] Query executed: bytes_processed={bytes_processed}, bytes_billed={bytes_billed}, rows={row_count}")
-
             return df
 
         except Exception as e:
             error_msg = str(e)
-            print(f"[QUERY LOGGER DEBUG] Query error: {error_msg}")
             raise
 
         finally:
@@ -192,7 +194,6 @@ class BigQueryService:
             execution_time_ms = int((time.time() - start_time) * 1000)
 
             logger = get_query_logger()
-            print(f"[QUERY LOGGER DEBUG] Logger instance: {logger}")
             if logger:
                 try:
                     logger.log_query(
@@ -205,10 +206,220 @@ class BigQueryService:
                         row_count=row_count,
                         error=error_msg
                     )
-                    print(f"[QUERY LOGGER DEBUG] Log written successfully")
                 except Exception as log_error:
                     # Don't fail the query if logging fails
-                    print(f"[QUERY LOGGER DEBUG] Failed to log query: {log_error}")
+                    pass
+
+    def get_date_range_cached(
+        self,
+        start_date: Optional[str],
+        end_date: Optional[str],
+        dimension_filters: Optional[Dict] = None,
+        dimensions: Optional[List[str]] = None,
+        date_range_type: Optional[str] = "absolute",
+        relative_date_preset: Optional[str] = None
+    ) -> tuple:
+        """
+        Get date range with caching to avoid redundant queries.
+        Cache key includes table_id, table_path, dates, filters, and dimensions
+        to support multiple widgets with different configurations on the same table.
+
+        Args:
+            start_date: Filter start date
+            end_date: Filter end date
+            dimension_filters: Dimension filters to include in cache key
+            dimensions: Dimensions being selected/grouped (affects query results)
+            date_range_type: 'absolute' or 'relative'
+            relative_date_preset: Relative date preset
+
+        Returns:
+            Tuple of (min_date, max_date, num_days)
+        """
+        import hashlib
+
+        # Create cache key from all parameters that affect the date range query
+        # Include dimensions because different groupings can affect available date ranges
+        filter_str = (
+            f"{self.table_id or 'default'}|"
+            f"{self.table_path}|"
+            f"{start_date or 'none'}|"
+            f"{end_date or 'none'}|"
+            f"{str(sorted(dimension_filters.items()) if dimension_filters else 'none')}|"
+            f"{str(sorted(dimensions) if dimensions else 'none')}"
+        )
+        cache_key = hashlib.md5(filter_str.encode()).hexdigest()
+
+        # Check cache - DISABLED FOR DEBUGGING
+        # if cache_key in self._date_range_cache:
+        #     min_date, max_date, num_days = self._date_range_cache[cache_key]
+        #     return min_date, max_date, num_days
+
+        # Cache miss - execute query
+        where_clause = self.build_filter_clause(
+            start_date=start_date,
+            end_date=end_date,
+            dimension_filters=dimension_filters,
+            date_range_type=date_range_type if 'date_range_type' in locals() else "absolute",
+            relative_date_preset=relative_date_preset if 'relative_date_preset' in locals() else None
+        )
+
+        date_range_query = f"""
+            SELECT MIN(date) as min_date, MAX(date) as max_date
+            FROM `{self.table_path}`
+            {where_clause}
+        """
+
+        date_range_df = self._execute_and_log_query(
+            date_range_query,
+            query_type="pivot_date_range",
+            endpoint="date_range_cache"
+        )
+
+        # Calculate number of days
+        num_days = 1
+        min_date = None
+        max_date = None
+
+        if not date_range_df.empty and date_range_df['min_date'].iloc[0] is not None and date_range_df['max_date'].iloc[0] is not None:
+            min_date = date_range_df['min_date'].iloc[0]
+            max_date = date_range_df['max_date'].iloc[0]
+            num_days = (max_date - min_date).days + 1
+
+        # Store in cache - DISABLED FOR DEBUGGING
+        # self._date_range_cache[cache_key] = (min_date, max_date, num_days)
+
+        return min_date, max_date, num_days
+
+    def get_count_cached(
+        self,
+        group_cols: List[str],
+        start_date: Optional[str],
+        end_date: Optional[str],
+        dimension_filters: Optional[Dict] = None,
+        use_approx: bool = False
+    ) -> int:
+        """
+        Get count of distinct dimension values with caching to avoid redundant queries.
+        Cache key includes table_id, table_path, dates, filters, and dimensions.
+
+        Args:
+            group_cols: List of columns to group by (dimension columns)
+            start_date: Filter start date
+            end_date: Filter end date
+            dimension_filters: Dimension filters to include in cache key
+            use_approx: Use APPROX_COUNT_DISTINCT for very large datasets (faster but approximate)
+
+        Returns:
+            Total count of dimension value combinations
+        """
+        import hashlib
+
+        # Create cache key from all parameters that affect the count query
+        filter_str = (
+            f"{self.table_id or 'default'}|"
+            f"{self.table_path}|"
+            f"count|"
+            f"{','.join(sorted(group_cols))}|"
+            f"{start_date or 'none'}|"
+            f"{end_date or 'none'}|"
+            f"{str(sorted(dimension_filters.items()) if dimension_filters else 'none')}|"
+            f"approx={use_approx}"
+        )
+        cache_key = hashlib.md5(filter_str.encode()).hexdigest()
+
+        # Check cache - DISABLED FOR DEBUGGING
+        # if cache_key in self._count_cache:
+        #     total_count = self._count_cache[cache_key]
+        #     return total_count
+
+        # Cache miss - execute query
+        where_clause = self.build_filter_clause(
+            start_date=start_date,
+            end_date=end_date,
+            dimension_filters=dimension_filters,
+            date_range_type=date_range_type if 'date_range_type' in locals() else "absolute",
+            relative_date_preset=relative_date_preset if 'relative_date_preset' in locals() else None
+        )
+
+        group_by_clause = ", ".join(group_cols)
+
+        # Build count query - use approximate or exact based on parameter
+        if len(group_cols) > 1:
+            # For multiple dimensions, count distinct combinations
+            if use_approx:
+                count_query = f"""
+                    SELECT APPROX_COUNT_DISTINCT(CONCAT({', "-", '.join(group_cols)})) as total_count
+                    FROM `{self.table_path}`
+                    {where_clause}
+                """
+            else:
+                count_query = f"""
+                    SELECT COUNT(*) as total_count
+                    FROM (
+                        SELECT {group_by_clause}
+                        FROM `{self.table_path}`
+                        {where_clause}
+                        GROUP BY {group_by_clause}
+                    )
+                """
+        else:
+            # For single dimension, use COUNT DISTINCT or APPROX_COUNT_DISTINCT
+            if use_approx:
+                count_query = f"""
+                    SELECT APPROX_COUNT_DISTINCT({group_by_clause}) as total_count
+                    FROM `{self.table_path}`
+                    {where_clause}
+                """
+            else:
+                count_query = f"""
+                    SELECT COUNT(DISTINCT {group_by_clause}) as total_count
+                    FROM `{self.table_path}`
+                    {where_clause}
+                """
+
+        count_df = self._execute_and_log_query(
+            count_query,
+            query_type="pivot_count",
+            endpoint="count_cache"
+        )
+
+        total_count = int(count_df['total_count'].iloc[0]) if not count_df.empty else 0
+
+        # Store in cache - DISABLED FOR DEBUGGING
+        # self._count_cache[cache_key] = total_count
+
+        return total_count
+
+    def _resolve_dates(
+        self,
+        start_date: Optional[str],
+        end_date: Optional[str],
+        date_range_type: Optional[str] = "absolute",
+        relative_date_preset: Optional[str] = None
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Resolve dates from either absolute or relative date range.
+
+        Args:
+            start_date: Absolute start date (YYYY-MM-DD)
+            end_date: Absolute end date (YYYY-MM-DD)
+            date_range_type: 'absolute' or 'relative'
+            relative_date_preset: Relative preset (e.g., 'last_7_days')
+
+        Returns:
+            Tuple of (resolved_start_date, resolved_end_date)
+        """
+        # If relative date type, resolve the preset
+        if date_range_type == "relative" and relative_date_preset:
+            try:
+                return resolve_relative_date(relative_date_preset)
+            except ValueError as e:
+                # If invalid preset, fall back to provided absolute dates
+                print(f"Warning: Invalid relative date preset '{relative_date_preset}': {e}")
+                return start_date, end_date
+
+        # Otherwise use absolute dates
+        return start_date, end_date
 
     def _clamp_dates(
         self,
@@ -251,6 +462,8 @@ class BigQueryService:
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         dimension_filters: Optional[Dict[str, List[str]]] = None,
+        date_range_type: Optional[str] = "absolute",
+        relative_date_preset: Optional[str] = None,
     ) -> str:
         """
         Build WHERE clause from filter parameters - fully dynamic.
@@ -260,19 +473,29 @@ class BigQueryService:
             end_date: End date for date range filter (YYYY-MM-DD)
             dimension_filters: Dictionary mapping dimension IDs to lists of values for multi-select filtering
                               Example: {"country": ["USA", "Canada"], "channel": ["Web"]}
+            date_range_type: 'absolute' or 'relative'
+            relative_date_preset: Relative date preset (e.g., 'last_7_days')
 
         Returns:
             WHERE clause string (includes "WHERE" keyword if non-empty)
         """
         conditions = []
 
+        # Resolve relative dates to absolute dates
+        resolved_start, resolved_end = self._resolve_dates(
+            start_date, end_date, date_range_type, relative_date_preset
+        )
+
+        # Apply date clamping
+        clamped_start, clamped_end = self._clamp_dates(resolved_start, resolved_end)
+
         # Date range filter (special handling for date dimension)
-        if start_date and end_date:
-            conditions.append(f"date BETWEEN '{start_date}' AND '{end_date}'")
-        elif start_date:
-            conditions.append(f"date >= '{start_date}'")
-        elif end_date:
-            conditions.append(f"date <= '{end_date}'")
+        if clamped_start and clamped_end:
+            conditions.append(f"date BETWEEN '{clamped_start}' AND '{clamped_end}'")
+        elif clamped_start:
+            conditions.append(f"date >= '{clamped_start}'")
+        elif clamped_end:
+            conditions.append(f"date <= '{clamped_end}'")
 
         # Dynamic dimension filters
         if dimension_filters:
@@ -319,9 +542,8 @@ class BigQueryService:
                         values_str = ", ".join(values)
                         conditions.append(f"{column_name} IN ({values_str})")
 
-        if conditions:
-            return "WHERE " + " AND ".join(conditions)
-        return ""
+        where_clause = "WHERE " + " AND ".join(conditions) if conditions else ""
+        return where_clause
 
     def build_metric_condition_sql(
         self,
@@ -380,7 +602,9 @@ class BigQueryService:
         where_clause = self.build_filter_clause(
             start_date=filters.start_date,
             end_date=filters.end_date,
-            dimension_filters=filters.dimension_filters
+            dimension_filters=filters.dimension_filters,
+            date_range_type=filters.date_range_type,
+            relative_date_preset=filters.relative_date_preset
         )
 
         query = f"""
@@ -418,7 +642,9 @@ class BigQueryService:
         where_clause = self.build_filter_clause(
             start_date=filters.start_date,
             end_date=filters.end_date,
-            dimension_filters=filters.dimension_filters
+            dimension_filters=filters.dimension_filters,
+            date_range_type=filters.date_range_type,
+            relative_date_preset=filters.relative_date_preset
         )
 
         # Build dynamic SELECT clause from schema
@@ -484,7 +710,9 @@ class BigQueryService:
         where_clause = self.build_filter_clause(
             start_date=filters.start_date,
             end_date=filters.end_date,
-            dimension_filters=filters.dimension_filters
+            dimension_filters=filters.dimension_filters,
+            date_range_type=filters.date_range_type,
+            relative_date_preset=filters.relative_date_preset
         )
 
         # Map granularity to BigQuery date truncation
@@ -542,7 +770,9 @@ class BigQueryService:
         where_clause = self.build_filter_clause(
             start_date=filters.start_date,
             end_date=filters.end_date,
-            dimension_filters=filters.dimension_filters
+            dimension_filters=filters.dimension_filters,
+            date_range_type=filters.date_range_type,
+            relative_date_preset=filters.relative_date_preset
         )
 
         # Find dimension column name from schema
@@ -605,7 +835,9 @@ class BigQueryService:
         where_clause = self.build_filter_clause(
             start_date=filters.start_date,
             end_date=filters.end_date,
-            dimension_filters=filters.dimension_filters
+            dimension_filters=filters.dimension_filters,
+            date_range_type=filters.date_range_type,
+            relative_date_preset=filters.relative_date_preset
         )
 
         # Build dynamic SELECT clause from schema (including search_term)
@@ -664,7 +896,9 @@ class BigQueryService:
         where_clause = self.build_filter_clause(
             start_date=filters.start_date,
             end_date=filters.end_date,
-            dimension_filters=filters.dimension_filters
+            dimension_filters=filters.dimension_filters,
+            date_range_type=filters.date_range_type,
+            relative_date_preset=filters.relative_date_preset
         )
 
         # Find dimension column name from schema
@@ -727,17 +961,14 @@ class BigQueryService:
 
         return table_list
 
-    def get_table_date_range(self, table_name: str) -> Dict:
+    def get_table_date_range(self) -> Dict:
         """
-        Get the date range for a specific table.
-
-        Args:
-            table_name: Name of the table to query
+        Get the date range for this service's configured table.
 
         Returns:
             Dictionary with min_date, max_date, and total_rows
         """
-        table_path = f"{self.project_id}.{self.dataset}.{table_name}"
+        table_path = self.table_path
 
         # Check if table has a 'date' column
         table_ref = self.client.get_table(table_path)
@@ -780,16 +1011,11 @@ def get_bigquery_service(table_id: Optional[str] = None) -> Optional[BigQuerySer
     Get BigQuery service instance for a specific table.
 
     Args:
-        table_id: Table ID to get service for. If None, uses active table.
+        table_id: Table ID to get service for. If None, returns None.
 
     Returns:
         BigQuery service instance or None
     """
-    from config import table_registry
-
-    if table_id is None:
-        table_id = table_registry.get_active_table_id()
-
     if table_id is None:
         return None
 
@@ -833,14 +1059,9 @@ def initialize_bigquery_service(
         BigQuery service instance
     """
     global _bq_services
-    from config import table_registry
-
-    # Use active table if not specified
-    if table_id is None:
-        table_id = table_registry.get_active_table_id()
 
     if table_id is None:
-        raise ValueError("No table_id specified and no active table set")
+        raise ValueError("No table_id specified")
 
     service = BigQueryService(project_id, dataset, table, credentials_path, table_id)
     _bq_services[table_id] = service
@@ -868,14 +1089,9 @@ def initialize_bigquery_with_json(
         BigQuery service instance
     """
     global _bq_services
-    from config import table_registry
-
-    # Use active table if not specified
-    if table_id is None:
-        table_id = table_registry.get_active_table_id()
 
     if table_id is None:
-        raise ValueError("No table_id specified and no active table set")
+        raise ValueError("No table_id specified")
 
     # Parse JSON and create credentials
     try:
@@ -910,49 +1126,54 @@ def initialize_bigquery_with_json(
         raise ValueError(f"Failed to initialize BigQuery: {e}")
 
 
-def get_bigquery_info() -> dict:
+def get_bigquery_info(table_id: Optional[str] = None) -> dict:
     """
     Get comprehensive BigQuery connection and data information.
+
+    Args:
+        table_id: Optional table ID to get info for. If None, uses first available table.
 
     Returns:
         Dictionary with BigQuery metadata
     """
-    bq_service = get_bigquery_service()
+    bq_service = get_bigquery_service(table_id)
     if bq_service is None:
         # Return not-configured status instead of raising error
         from config import table_registry
-        active_id = table_registry.get_active_table_id()
-        if active_id:
-            table_info = table_registry.get_table(active_id)
-            return {
-                "project_id": table_info.project_id,
-                "dataset": table_info.dataset,
-                "table": table_info.table,
-                "table_full_path": f"{table_info.project_id}.{table_info.dataset}.{table_info.table}",
-                "connection_status": "configured but not connected",
-                "date_range": {"min": "", "max": ""},
-                "total_rows": 0,
-                "table_size_mb": 0.0,
-                "last_modified": "",
-                "schema_columns": [],
-                "allowed_min_date": table_info.allowed_min_date,
-                "allowed_max_date": table_info.allowed_max_date
-            }
-        else:
-            return {
-                "project_id": "",
-                "dataset": "",
-                "table": "",
-                "table_full_path": "",
-                "connection_status": "not configured",
-                "date_range": {"min": "", "max": ""},
-                "total_rows": 0,
-                "table_size_mb": 0.0,
-                "last_modified": "",
-                "schema_columns": [],
-                "allowed_min_date": None,
-                "allowed_max_date": None
-            }
+        # If no table_id provided, try first available table
+        if not table_id:
+            tables = table_registry.list_tables()
+            if tables:
+                table_info = tables[0]
+                return {
+                    "project_id": table_info.project_id,
+                    "dataset": table_info.dataset,
+                    "table": table_info.table,
+                    "table_full_path": f"{table_info.project_id}.{table_info.dataset}.{table_info.table}",
+                    "connection_status": "configured but not connected",
+                    "date_range": {"min": "", "max": ""},
+                    "total_rows": 0,
+                    "table_size_mb": 0.0,
+                    "last_modified": "",
+                    "schema_columns": [],
+                    "allowed_min_date": table_info.allowed_min_date,
+                    "allowed_max_date": table_info.allowed_max_date
+                }
+        # No tables configured at all
+        return {
+            "project_id": "",
+            "dataset": "",
+            "table": "",
+            "table_full_path": "",
+            "connection_status": "not configured",
+            "date_range": {"min": "", "max": ""},
+            "total_rows": 0,
+            "table_size_mb": 0.0,
+            "last_modified": "",
+            "schema_columns": [],
+            "allowed_min_date": None,
+            "allowed_max_date": None
+        }
 
     try:
         # Get table metadata

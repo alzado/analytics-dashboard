@@ -1,18 +1,23 @@
 'use client'
 
-import React, { useState, useMemo, useEffect } from 'react'
-import { useQuery } from '@tanstack/react-query'
-import { fetchPivotData, fetchPivotChildren, fetchDimensionValues, fetchCustomDimensions } from '@/lib/api'
-import type { PivotRow, PivotChildRow, CustomDimension } from '@/lib/types'
-import { ChevronRight, ChevronDown, Settings2, ArrowUp, ArrowDown } from 'lucide-react'
+import React, { useState, useMemo, useEffect, useCallback } from 'react'
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { fetchPivotData, fetchPivotChildren, fetchDimensionValues, fetchCustomDimensions, fetchTables, updateWidget } from '@/lib/api'
+import type { PivotRow, PivotChildRow, CustomDimension, DateRangeType, RelativeDatePreset } from '@/lib/types'
+import { ChevronRight, ChevronDown, Settings2, ArrowUp, ArrowDown, Database, Save, GripVertical } from 'lucide-react'
 import { usePivotConfig } from '@/hooks/use-pivot-config'
 import { usePivotMetrics } from '@/hooks/use-pivot-metrics'
 import { useSchema } from '@/hooks/use-schema'
 import { usePivotFilters } from '@/hooks/use-pivot-filters'
+import { useWidgetEditing } from '@/lib/contexts/widget-editing-context'
+import { useDashboard } from '@/lib/contexts/dashboard-context'
 import type { MetricDefinition, DimensionDefinition } from '@/hooks/use-pivot-metrics'
 import { PivotConfigPanel } from '@/components/pivot/pivot-config-panel'
 import { PivotChartVisualization } from '@/components/pivot/pivot-chart-visualization'
 import { PivotFilterPanel } from '@/components/pivot/pivot-filter-panel'
+import DashboardSelectorModal from '@/components/modals/dashboard-selector-modal'
+import { WidgetSelectorModal, type WidgetSelection } from '@/components/modals/widget-selector-modal'
+import type { WidgetCreateRequest } from '@/lib/api'
 
 // Multi-Pivot Table Card Component
 interface MultiPivotTableCardProps {
@@ -23,9 +28,10 @@ interface MultiPivotTableCardProps {
   limit: number
   getMetricById: (id: string) => MetricDefinition | undefined
   getDimensionByValue: (value: string) => DimensionDefinition | undefined
+  tableId?: string
 }
 
-function MultiPivotTableCard({ headerLabel, filters, rowDimensions, metricId, limit, getMetricById, getDimensionByValue }: MultiPivotTableCardProps) {
+function MultiPivotTableCard({ headerLabel, filters, rowDimensions, metricId, limit, getMetricById, getDimensionByValue, tableId }: MultiPivotTableCardProps) {
   const metric = getMetricById(metricId)
   const [page, setPage] = useState(0)
 
@@ -36,15 +42,15 @@ function MultiPivotTableCard({ headerLabel, filters, rowDimensions, metricId, li
 
   // Fetch data for this specific table
   const { data, isLoading, error } = useQuery({
-    queryKey: ['multi-pivot', headerLabel, rowDimensions, filters, limit, page],
+    queryKey: ['multi-pivot', headerLabel, rowDimensions, filters, limit, page, tableId],
     queryFn: () => {
       const offset = page * limit
       // If no row dimensions, just show totals
       if (rowDimensions.length === 0) {
-        return fetchPivotData([], filters, 1, 0)
+        return fetchPivotData([], filters, 1, 0, undefined, tableId)
       }
       // Otherwise fetch by first row dimension
-      return fetchPivotData([rowDimensions[0]], filters, limit, offset)
+      return fetchPivotData([rowDimensions[0]], filters, limit, offset, undefined, tableId)
     },
   })
 
@@ -141,13 +147,21 @@ function MultiPivotTableCard({ headerLabel, filters, rowDimensions, metricId, li
   )
 }
 
-export function PivotTableSection() {
+interface PivotTableSectionProps {
+  widgetMode?: boolean
+  widgetConfig?: any
+  onTabChange?: (tab: string) => void
+}
+
+export function PivotTableSection(props: PivotTableSectionProps = {}) {
+  const { widgetMode = false, widgetConfig, onTabChange } = props
   const {
     config,
     updateTable,
     updateDateRange,
     updateStartDate,
     updateEndDate,
+    updateFullDateRange,
     setDataSourceDropped,
     setDateRangeDropped,
     addDimension,
@@ -165,11 +179,18 @@ export function PivotTableSection() {
     setSelectedDisplayMetrics,
     toggleDisplayMetric,
     setSortConfig,
+    setChartType,
   } = usePivotConfig()
 
+  // Widget editing context
+  const { editingWidget, editingDashboardId, stopEditingWidget, isEditingWidget } = useWidgetEditing()
+
+  // Dashboard context for navigation
+  const { setCurrentDashboardId } = useDashboard()
+
   // Load dynamic metrics and dimensions from schema
-  const { metrics, dimensions, getMetricById, getDimensionByValue, isLoading: isLoadingSchema } = usePivotMetrics()
-  const { schema } = useSchema()
+  const { metrics, dimensions, getMetricById, getDimensionByValue, isLoading: isLoadingSchema } = usePivotMetrics(config.selectedTable || undefined)
+  const { schema } = useSchema(config.selectedTable || undefined)
 
   // Initialize pivot filters hook
   const {
@@ -181,12 +202,165 @@ export function PivotTableSection() {
   } = usePivotFilters({
     start_date: config.startDate,
     end_date: config.endDate,
+    date_range_type: config.dateRangeType,
+    relative_date_preset: config.relativeDatePreset,
+  })
+
+  // Query client for cache invalidation
+  const queryClient = useQueryClient()
+
+  // Fix invalid filter values
+  useEffect(() => {
+    // Fix corrupted filter values
+    if (pivotFilters.date_range_type !== 'absolute' && pivotFilters.date_range_type !== 'relative') {
+      // Reset to absolute with the dates that are in config
+      updateFilterDateRange('absolute', null, config.startDate, config.endDate)
+      updateFullDateRange('absolute', null, config.startDate, config.endDate)
+    }
+  }, [config.startDate, config.endDate, config.dateRangeType, config.relativeDatePreset, pivotFilters, updateFilterDateRange, updateFullDateRange])
+
+  // Wrapper function to update both config and filters when date range changes
+  const handleDateRangeChange = useCallback((
+    type: DateRangeType,
+    preset: RelativeDatePreset | null,
+    startDate: string | null,
+    endDate: string | null
+  ) => {
+    // Update filters state
+    updateFilterDateRange(type, preset, startDate, endDate)
+
+    // Update config state (which persists to localStorage)
+    updateFullDateRange(type, preset, startDate, endDate)
+  }, [updateFilterDateRange, updateFullDateRange])
+
+  // Update widget mutation
+  const updateWidgetMutation = useMutation({
+    mutationFn: ({ dashboardId, widgetId, updates }: { dashboardId: string; widgetId: string; updates: any }) =>
+      updateWidget(dashboardId, widgetId, updates),
+    onSuccess: async (updatedDashboard) => {
+      // Invalidate and refetch dashboard data
+      await queryClient.invalidateQueries({ queryKey: ['dashboards'] })
+      await queryClient.invalidateQueries({ queryKey: ['dashboard', editingDashboardId] })
+
+      // Wait for refetch to complete
+      await queryClient.refetchQueries({ queryKey: ['dashboard', editingDashboardId] })
+
+      setSuccessMessage(`Widget updated successfully! Redirecting to dashboard...`)
+
+      // Navigate to the dashboard after ensuring data is fresh
+      setTimeout(() => {
+        setSuccessMessage(null)
+        stopEditingWidget()
+
+        if (editingDashboardId && onTabChange) {
+          setCurrentDashboardId(editingDashboardId)
+          onTabChange('dashboards')
+        }
+      }, 500)
+    },
   })
 
   // Sync date changes from config to filter state
   useEffect(() => {
     updateFilterDateRange(config.startDate, config.endDate)
   }, [config.startDate, config.endDate, updateFilterDateRange])
+
+  // Load widget configuration when editing a widget
+  useEffect(() => {
+    if (editingWidget) {
+      // Load table
+      updateTable(editingWidget.table_id)
+      setDataSourceDropped(true)
+
+      // Load dates
+      if (editingWidget.start_date) updateStartDate(editingWidget.start_date)
+      if (editingWidget.end_date) updateEndDate(editingWidget.end_date)
+      if (editingWidget.start_date && editingWidget.end_date) {
+        setDateRangeDropped(true)
+      }
+
+      // Load expanded rows state
+      if (editingWidget.expanded_rows) {
+        setExpandedRows(editingWidget.expanded_rows)
+      }
+
+      // Load column order and sort state
+      if (editingWidget.column_order) {
+        setColumnOrder(editingWidget.column_order)
+      }
+      if (editingWidget.column_sort) {
+        setColumnSortConfig(editingWidget.column_sort)
+      }
+
+      // Clear existing dimensions and metrics
+      // Then add from widget
+      setTimeout(() => {
+        // Load dimensions
+        editingWidget.dimensions.forEach(dim => addDimension(dim))
+        editingWidget.table_dimensions.forEach(dim => addTableDimension(dim))
+
+        // Load metrics
+        editingWidget.metrics.forEach(metric => addMetric(metric))
+
+        // Load filters
+        Object.entries(editingWidget.filters).forEach(([dimensionId, values]) => {
+          values.forEach(value => {
+            updateDimensionFilter(dimensionId, value, true)
+          })
+        })
+      }, 100)
+    }
+  }, [editingWidget])
+
+  // Load widget configuration when in widget mode
+  useEffect(() => {
+    if (widgetMode && widgetConfig) {
+      // Set table
+      if (widgetConfig.table_id) {
+        updateTable(widgetConfig.table_id)
+        setDataSourceDropped(true)
+      }
+
+      // Set date range
+      if (widgetConfig.start_date || widgetConfig.end_date) {
+        updateStartDate(widgetConfig.start_date || '')
+        updateEndDate(widgetConfig.end_date || '')
+        setDateRangeDropped(true)
+      }
+
+      // Load expanded rows state
+      if (widgetConfig.expanded_rows) {
+        setExpandedRows(widgetConfig.expanded_rows)
+      }
+
+      // Load column order and sort state
+      if (widgetConfig.column_order && widgetConfig.column_sort) {
+        setColumnOrder(widgetConfig.column_order)
+        setColumnSortConfig(widgetConfig.column_sort as { metric: string; direction: 'asc' | 'desc' })
+      }
+
+      // Load configuration
+      setTimeout(() => {
+        // Load dimensions
+        widgetConfig.dimensions?.forEach((dim: string) => addDimension(dim))
+        widgetConfig.table_dimensions?.forEach((dim: string) => addTableDimension(dim))
+
+        // Load metrics
+        widgetConfig.metrics?.forEach((metric: string) => addMetric(metric))
+
+        // Load filters
+        if (widgetConfig.filters) {
+          Object.entries(widgetConfig.filters).forEach(([dimensionId, values]: [string, any]) => {
+            if (Array.isArray(values)) {
+              values.forEach(value => {
+                updateDimensionFilter(dimensionId, value, true)
+              })
+            }
+          })
+        }
+      }, 100)
+    }
+  }, [widgetMode, widgetConfig])
 
   // Get primary sort metric from schema (fallback to first base metric if not set)
   const primarySortMetric = schema?.primary_sort_metric || metrics[0]?.id
@@ -195,7 +369,6 @@ export function PivotTableSection() {
   const isConfigOpen = config.isConfigOpen ?? true
   const expandedRowsArray = config.expandedRows ?? []
   const expandedRows = new Set(expandedRowsArray)
-  const selectedDisplayMetrics = config.selectedDisplayMetrics ?? (primarySortMetric ? [primarySortMetric] : (metrics[0]?.id ? [metrics[0].id] : []))
   const sortConfig = config.sortColumn !== undefined ? {
     column: config.sortColumn,
     subColumn: config.sortSubColumn,
@@ -253,19 +426,26 @@ export function PivotTableSection() {
   const [columnOrder, setColumnOrder] = useState<number[]>([])
   const [draggedColumnIndex, setDraggedColumnIndex] = useState<number | null>(null)
   const [dimensionSortOrder, setDimensionSortOrder] = useState<'asc' | 'desc'>('desc')
+  const [columnSortConfig, setColumnSortConfig] = useState<{ metric: string; direction: 'asc' | 'desc' } | null>(null)
   const [childrenSortConfig, setChildrenSortConfig] = useState<{column: string, direction: 'asc' | 'desc'} | null>(null)
+  const [isDashboardModalOpen, setIsDashboardModalOpen] = useState(false)
+  const [isWidgetSelectorOpen, setIsWidgetSelectorOpen] = useState(false)
+  const [selectedWidgetType, setSelectedWidgetType] = useState<WidgetSelection | null>(null)
+  const [isUpdatingWidget, setIsUpdatingWidget] = useState(false) // Track if we're updating vs creating new
+  const [successMessage, setSuccessMessage] = useState<string | null>(null)
   const CHILDREN_PAGE_SIZE = 10
 
   // Check if we have required configuration
-  const isConfigured = !!(config.isDataSourceDropped && config.isDateRangeDropped)
+  // Require data source, date range, and at least one metric to be configured
+  const isConfigured = !!(config.isDataSourceDropped && config.isDateRangeDropped && selectedMetrics.length > 0)
 
   // Fetch all dimension values in a single query
   const { data: allDimensionValues } = useQuery({
-    queryKey: ['all-dimension-values', selectedTableDimensions, filters],
+    queryKey: ['all-dimension-values', selectedTableDimensions, filters, selectedTable],
     queryFn: async () => {
       const results: Record<string, string[]> = {}
       for (const dimension of selectedTableDimensions) {
-        results[dimension] = await fetchDimensionValues(dimension, filters)
+        results[dimension] = await fetchDimensionValues(dimension, filters, selectedTable || undefined)
       }
       return results
     },
@@ -315,56 +495,79 @@ export function PivotTableSection() {
 
   // Fetch data for all column combinations
   const { data: allColumnData, isLoading: isLoadingColumnData } = useQuery({
-    queryKey: ['all-columns', tableCombinations, filters, selectedDimensions, customDimensions],
+    queryKey: ['all-columns', tableCombinations, filters, selectedDimensions, customDimensions, selectedMetrics],
     queryFn: async () => {
       const results: Record<string, any> = {}
-      let firstColumnDimensionValues: string[] | undefined = undefined
 
-      for (let i = 0; i < tableCombinations.length; i++) {
-        const combination = tableCombinations[i]
+      if (tableCombinations.length === 0) {
+        return results
+      }
 
+      const dims = selectedDimensions.length > 0 ? [selectedDimensions[0]] : []
+
+      // Helper function to build table filters for a combination
+      const buildTableFilters = (combination: any) => {
         // Start with base filters
         const tableFilters: Record<string, any> = { ...filters }
 
-        // Convert combination values to appropriate types and handle custom dimensions
+        // Get the dimension keys that are being used as table dimensions
+        const tableDimensionKeys = Object.keys(combination)
+
+        // Remove table dimensions from dimension_filters to avoid conflicts
+        if (tableFilters.dimension_filters) {
+          const cleanedDimensionFilters = { ...tableFilters.dimension_filters }
+          tableDimensionKeys.forEach(key => {
+            if (!key.startsWith('custom_')) {
+              delete cleanedDimensionFilters[key]
+            }
+          })
+          tableFilters.dimension_filters = cleanedDimensionFilters
+        }
+
+        // Apply the specific values for this combination
         Object.entries(combination).forEach(([key, value]) => {
-          // Check if this is a custom dimension
           if (key.startsWith('custom_') && customDimensions) {
             const customDimId = key.replace('custom_', '')
             const customDim = customDimensions.find(d => d.id === customDimId)
             if (customDim) {
-              // Find the value with this label
               const dimValue = customDim.values.find(v => v.label === value)
               if (dimValue) {
-                // Override the date range with this custom dimension's date range
-                tableFilters.start_date = dimValue.start_date
-                tableFilters.end_date = dimValue.end_date
+                // Set date fields - handle both relative and absolute dates
+                tableFilters.start_date = dimValue.start_date || null
+                tableFilters.end_date = dimValue.end_date || null
+                tableFilters.date_range_type = dimValue.date_range_type || 'absolute'
+                tableFilters.relative_date_preset = dimValue.relative_date_preset || null
               }
             }
           } else {
-            // Handle standard dimensions
-            if (key === 'n_words_normalized' || key === 'n_attributes') {
-              tableFilters[key] = parseInt(value as string, 10)
-            } else {
-              tableFilters[key] = value
+            // For regular dimensions, add to dimension_filters
+            if (!tableFilters.dimension_filters) {
+              tableFilters.dimension_filters = {}
             }
+            tableFilters.dimension_filters[key] = [value as string]
           }
         })
 
-        const dims = selectedDimensions.length > 0 ? [selectedDimensions[0]] : []
-
-        // First column: fetch top 50 normally
-        if (i === 0) {
-          results[i] = await fetchPivotData(dims, tableFilters, 50)
-          // Extract dimension values for subsequent columns
-          if (results[i]?.rows) {
-            firstColumnDimensionValues = results[i].rows.map((row: any) => row.dimension_value)
-          }
-        } else {
-          // Subsequent columns: fetch only the dimension values from first column
-          results[i] = await fetchPivotData(dims, tableFilters, 50, 0, firstColumnDimensionValues)
-        }
+        return tableFilters
       }
+
+      // Fetch ALL columns in parallel (no sequential dependency)
+      const allFetches = tableCombinations.map(async (combination, index) => {
+        const tableFilters = buildTableFilters(combination)
+        return {
+          index,
+          data: await fetchPivotData(dims, tableFilters, 50, 0, undefined, selectedTable || undefined, true, selectedMetrics)
+        }
+      })
+
+      // Wait for all fetches to complete
+      const allResults = await Promise.all(allFetches)
+
+      // Store results
+      allResults.forEach(({ index, data }) => {
+        results[index] = data
+      })
+
       return results
     },
     enabled: isConfigured && selectedTableDimensions.length > 0 && tableCombinations.length > 0,
@@ -374,11 +577,11 @@ export function PivotTableSection() {
   const firstDimension = selectedDimensions.length > 0 ? [selectedDimensions[0]] : []
 
   const { data: pivotData, isLoading, error } = useQuery({
-    queryKey: ['pivot', firstDimension, filters, selectedTable],
+    queryKey: ['pivot', firstDimension, filters, selectedTable, selectedMetrics],
     queryFn: () => {
       // If no dimensions, create a single "All Data" row manually
       if (selectedDimensions.length === 0) {
-        return fetchPivotData([], filters, 1).then(data => {
+        return fetchPivotData([], filters, 1, 0, undefined, selectedTable || undefined, true, selectedMetrics).then(data => {
           // Return single row representing all data
           return {
             ...data,
@@ -390,7 +593,7 @@ export function PivotTableSection() {
           }
         })
       }
-      return fetchPivotData(firstDimension, filters, 50)
+      return fetchPivotData(firstDimension, filters, 50, 0, undefined, selectedTable || undefined, true, selectedMetrics)
     },
     enabled: isConfigured, // Only fetch when data source and date range are configured
   })
@@ -519,16 +722,20 @@ export function PivotTableSection() {
 
     switch (type) {
       case 'datasource':
-        const table = e.dataTransfer.getData('table')
-        updateTable(table)
+        const tableId = e.dataTransfer.getData('tableId')
+        updateTable(tableId)
         setDataSourceDropped(true)
         break
 
       case 'daterange':
-        const startDate = e.dataTransfer.getData('startDate')
-        const endDate = e.dataTransfer.getData('endDate')
-        updateStartDate(startDate)
-        updateEndDate(endDate)
+        const dateRangeType = e.dataTransfer.getData('dateRangeType') as DateRangeType || 'absolute'
+        const relativeDatePreset = e.dataTransfer.getData('relativeDatePreset') as RelativeDatePreset || null
+        const startDate = e.dataTransfer.getData('startDate') || null
+        const endDate = e.dataTransfer.getData('endDate') || null
+
+        // Use the new full update function
+        updateFullDateRange(dateRangeType, relativeDatePreset, startDate, endDate)
+        updateFilterDateRange(dateRangeType, relativeDatePreset, startDate, endDate)
         setDateRangeDropped(true)
         break
 
@@ -682,7 +889,7 @@ export function PivotTableSection() {
               if (nextDepth < selectedDimensions.length) {
                 // Fetch next dimension level
                 const dimensionsToFetch = selectedDimensions.slice(0, nextDepth + 1)
-                const pivotChildren = await fetchPivotData(dimensionsToFetch, filters, 1000)
+                const pivotChildren = await fetchPivotData(dimensionsToFetch, filters, 1000, 0, undefined, selectedTable || undefined, true, selectedMetrics)
 
                 // Filter to only children of this parent
                 const prefix = `${dimensionPath} - `
@@ -884,7 +1091,7 @@ export function PivotTableSection() {
     setSortConfig(undefined as any, undefined, undefined)
   }, [selectedDimensions, selectedTableDimensions, selectedMetrics, setSortConfig])
 
-  // Handle column sort click
+  // Handle column sort click (sorts rows within columns)
   const handleSort = (column: string | number, subColumn?: 'value' | 'diff' | 'pctDiff', metric?: string) => {
     // If clicking same column/subColumn/metric, toggle direction or clear
     if (sortConfig && sortConfig.column === column && sortConfig.subColumn === subColumn && sortConfig.metric === metric) {
@@ -896,9 +1103,66 @@ export function PivotTableSection() {
       }
     } else {
       // New column or metric, start with descending (highest first for numbers)
-      setSortConfig(column, subColumn, 'desc', metric || selectedDisplayMetrics[0] || primarySortMetric)
+      setSortConfig(column, subColumn, 'desc', metric || selectedMetrics[0] || primarySortMetric)
     }
   }
+
+  // Handle column order sort (reorders columns by metric values)
+  const handleColumnSort = (metricId: string) => {
+    // If clicking same metric, toggle direction or clear
+    if (columnSortConfig && columnSortConfig.metric === metricId) {
+      if (columnSortConfig.direction === 'desc') {
+        setColumnSortConfig({ metric: metricId, direction: 'asc' })
+      } else {
+        // Clear column sort
+        setColumnSortConfig(null)
+        // Reset to original order
+        setColumnOrder(tableCombinations.map((_, i) => i))
+      }
+    } else {
+      // New metric, start with descending
+      setColumnSortConfig({ metric: metricId, direction: 'desc' })
+    }
+  }
+
+  // Effect to reorder columns when column sort config changes
+  useEffect(() => {
+    // Skip auto-sorting entirely in widget mode - widgets always use saved columnOrder
+    if (widgetMode) {
+      return
+    }
+
+    if (!columnSortConfig || !allColumnData || Object.keys(allColumnData).length === 0) return
+
+    // Get all column indices from allColumnData
+    const availableIndices = Object.keys(allColumnData).map(k => parseInt(k))
+    if (availableIndices.length === 0) return
+
+    // Get total metric values for each column
+    const columnValues = availableIndices.map(colIndex => {
+      const colData = allColumnData[colIndex]
+      if (!colData || !colData.total) return { colIndex, value: 0 }
+      const value = colData.total.metrics?.[columnSortConfig.metric] ?? 0
+      return { colIndex, value }
+    })
+
+    // Sort by metric value
+    const sorted = [...columnValues].sort((a, b) => {
+      if (columnSortConfig.direction === 'desc') {
+        return b.value - a.value
+      } else {
+        return a.value - b.value
+      }
+    })
+
+    // Update column order
+    const newOrder = sorted.map(item => item.colIndex)
+    setColumnOrder(newOrder)
+
+    // Clear children cache to refetch for new first column
+    setChildrenCache({})
+    setExpandedRows([])
+  }, [columnSortConfig, allColumnData, widgetMode])
 
   // Sort rows based on current sort config
   const sortRows = (rows: PivotRow[]): PivotRow[] => {
@@ -924,7 +1188,7 @@ export function PivotTableSection() {
         const bRow = columnData.rows.find((r: any) => r.dimension_value === b.dimension_value)
 
         // Use configured sort metric, or fall back to first selected metric
-        const sortMetric = sortConfig.metric || selectedDisplayMetrics[0] || primarySortMetric
+        const sortMetric = sortConfig.metric || selectedMetrics[0] || primarySortMetric
 
         if (sortConfig.subColumn === 'value') {
           aValue = aRow?.metrics?.[sortMetric] ?? null
@@ -1208,6 +1472,9 @@ export function PivotTableSection() {
             onDimensionFilterChange={updateDimensionFilter}
             onClearDimensionFilters={clearDimensionFilters}
             currentFilters={filters}
+            dateRangeType={pivotFilters.date_range_type}
+            relativeDatePreset={pivotFilters.relative_date_preset}
+            onDateRangeChange={handleDateRangeChange}
           />
 
           <div
@@ -1288,6 +1555,242 @@ export function PivotTableSection() {
     return null
   }
 
+  // Handler for "Save to Dashboard" button (creating new widget)
+  const handleSaveToDashboard = () => {
+    // Only allow saving if we have a configured pivot with metrics
+    if (!isConfigured || selectedMetrics.length === 0) {
+      return
+    }
+
+    setIsUpdatingWidget(false) // We're creating a new widget
+
+    // In multi-table mode, show widget selector first
+    if (selectedTableDimensions.length > 0) {
+      setIsWidgetSelectorOpen(true)
+    } else {
+      // In pivot mode, go directly to dashboard selector (only one option: pivot table)
+      setSelectedWidgetType({ type: 'table' })
+      setIsDashboardModalOpen(true)
+    }
+  }
+
+  // Handler for "Update Widget" button (updating existing widget)
+  const handleUpdateWidgetClick = () => {
+    if (!isEditingWidget || !editingWidget || !editingDashboardId) return
+    if (!isConfigured || selectedMetrics.length === 0) return
+
+    setIsUpdatingWidget(true) // We're updating existing widget
+
+    // In multi-table mode, show widget selector to choose what to update
+    if (selectedTableDimensions.length > 0) {
+      setIsWidgetSelectorOpen(true)
+    } else {
+      // In pivot mode, update directly (only one option: pivot table)
+      setSelectedWidgetType({ type: 'table' })
+      performWidgetUpdate({ type: 'table' })
+    }
+  }
+
+  // Handler for widget selection
+  const handleWidgetSelection = (selection: WidgetSelection) => {
+    setSelectedWidgetType(selection)
+    setIsWidgetSelectorOpen(false)
+
+    if (isUpdatingWidget) {
+      // Update existing widget
+      performWidgetUpdate(selection)
+    } else {
+      // Create new widget
+      setIsDashboardModalOpen(true)
+    }
+  }
+
+  // Perform the actual widget update
+  const performWidgetUpdate = (selection: WidgetSelection) => {
+    if (!isEditingWidget || !editingWidget || !editingDashboardId) return
+
+    // Build updates based on selection
+    let widgetType: 'table' | 'chart'
+    let displayMode: 'pivot-table' | 'multi-table' | 'single-metric-chart'
+    let widgetMetrics: string[]
+    let widgetDimensions: string[]
+    let widgetTableDimensions: string[]
+    let widgetTitle: string
+
+    if (selection.type === 'chart' && 'metricId' in selection) {
+      widgetType = 'chart'
+      displayMode = 'single-metric-chart'
+      widgetMetrics = [selection.metricId]
+      widgetDimensions = selectedDimensions
+      widgetTableDimensions = selectedTableDimensions // Keep table dimensions for charts
+      const metricLabel = getMetricById(selection.metricId)?.label || selection.metricId
+      widgetTitle = `${selectedDimensions.map(d => getDimensionLabel(d)).join(' > ')} - ${metricLabel}`
+    } else if (selection.type === 'multi-table') {
+      widgetType = 'table'
+      displayMode = 'multi-table'
+      widgetMetrics = selectedMetrics
+      widgetDimensions = selectedDimensions
+      widgetTableDimensions = selectedTableDimensions
+      const dimensionLabels = selectedDimensions.map(d => getDimensionLabel(d)).join(' > ')
+      const tableDimensionLabels = selectedTableDimensions.map(d => getDimensionLabel(d)).join(' × ')
+      widgetTitle = `${dimensionLabels} - ${tableDimensionLabels} - ${selectedMetrics.map(m => getMetricById(m)?.label || m).join(', ')}`
+    } else {
+      widgetType = 'table'
+      displayMode = 'pivot-table'
+      widgetMetrics = selectedMetrics
+      widgetDimensions = selectedDimensions
+      widgetTableDimensions = []
+      widgetTitle = `${selectedDimensions.map(d => getDimensionLabel(d)).join(' > ')} - ${selectedMetrics.map(m => getMetricById(m)?.label || m).join(', ')}`
+    }
+
+    const updates = {
+      type: widgetType,
+      display_mode: displayMode,
+      title: widgetTitle,
+      dimensions: widgetDimensions,
+      table_dimensions: widgetTableDimensions,
+      metrics: widgetMetrics,
+      filters: Object.fromEntries(
+        Object.entries(pivotFilters.dimension_filters)
+          .filter(([_, values]) => values && values.length > 0)
+      ),
+      start_date: config.startDate || null,
+      end_date: config.endDate || null,
+      chart_type: widgetType === 'chart' ? (config.chartType || 'bar') : null,
+      // UI state - complete persistence
+      expanded_rows: config.expandedRows || [],
+      column_order: columnOrder.length > 0 ? columnOrder : undefined,
+      column_sort: columnSortConfig || undefined,
+      // Additional editor state for complete persistence
+      date_range_type: config.dateRangeType || null,
+      relative_date_preset: config.relativeDatePreset || null,
+      visible_metrics: config.selectedDisplayMetrics || null,
+      merge_threshold: mergeThreshold || null,
+      dimension_sort_order: dimensionSortOrder || null,
+      children_sort_config: childrenSortConfig || null,
+    }
+
+    updateWidgetMutation.mutate({
+      dashboardId: editingDashboardId,
+      widgetId: editingWidget.id,
+      updates,
+    })
+  }
+
+  const handleDashboardSuccess = async (dashboardId: string, dashboardName: string) => {
+    // Invalidate and refetch dashboard data
+    await queryClient.invalidateQueries({ queryKey: ['dashboards'] })
+    await queryClient.invalidateQueries({ queryKey: ['dashboard', dashboardId] })
+
+    // Wait for refetch to complete
+    await queryClient.refetchQueries({ queryKey: ['dashboard', dashboardId] })
+
+    setSuccessMessage(`Widget added to "${dashboardName}" successfully! Redirecting to dashboard...`)
+
+    // Navigate to the dashboard after ensuring data is fresh
+    setTimeout(() => {
+      setSuccessMessage(null)
+      // Reset widget selection state
+      setSelectedWidgetType(null)
+
+      if (onTabChange) {
+        setCurrentDashboardId(dashboardId)
+        onTabChange('dashboards')
+      }
+    }, 500)
+  }
+
+  const handleDashboardModalClose = () => {
+    setIsDashboardModalOpen(false)
+    // Reset widget selection state when closing
+    setSelectedWidgetType(null)
+  }
+
+
+  // Build widget config from current pivot state and selected widget type
+  const currentWidgetConfig: Omit<WidgetCreateRequest, 'position'> = (() => {
+    // Determine widget type and metrics based on selection
+    let widgetType: 'table' | 'chart'
+    let widgetMetrics: string[]
+    let widgetTitle: string
+    let widgetDimensions: string[]
+    let widgetTableDimensions: string[]
+
+    if (selectedWidgetType?.type === 'chart' && 'metricId' in selectedWidgetType) {
+      // Single metric chart
+      widgetType = 'chart'
+      widgetMetrics = [selectedWidgetType.metricId]
+      widgetDimensions = selectedDimensions
+      widgetTableDimensions = selectedTableDimensions
+      const metricLabel = getMetricById(selectedWidgetType.metricId)?.label || selectedWidgetType.metricId
+      widgetTitle = `${selectedDimensions.map(d => getDimensionLabel(d)).join(' > ')} - ${metricLabel}`
+    } else if (selectedWidgetType?.type === 'multi-table') {
+      // Multi-table view with all metrics and table dimensions
+      widgetType = 'table'
+      widgetMetrics = selectedMetrics
+      widgetDimensions = selectedDimensions
+      widgetTableDimensions = selectedTableDimensions
+      const dimensionLabels = selectedDimensions.map(d => getDimensionLabel(d)).join(' > ')
+      const tableDimensionLabels = selectedTableDimensions.map(d => getDimensionLabel(d)).join(' × ')
+      widgetTitle = `${dimensionLabels} - ${tableDimensionLabels} - ${selectedMetrics.map(m => getMetricById(m)?.label || m).join(', ')}`
+    } else if (selectedWidgetType?.type === 'table') {
+      // Standard pivot table with all metrics (no table dimensions)
+      widgetType = 'table'
+      widgetMetrics = selectedMetrics
+      widgetDimensions = selectedDimensions
+      widgetTableDimensions = [] // Clear table dimensions for standard pivot
+      widgetTitle = `${selectedDimensions.map(d => getDimensionLabel(d)).join(' > ')} - ${selectedMetrics.map(m => getMetricById(m)?.label || m).join(', ')}`
+    } else {
+      // Default (shouldn't happen, but fallback)
+      widgetType = selectedTableDimensions.length > 0 ? 'chart' : 'table'
+      widgetMetrics = selectedMetrics
+      widgetDimensions = selectedDimensions
+      widgetTableDimensions = selectedTableDimensions
+      widgetTitle = `${selectedDimensions.map(d => getDimensionLabel(d)).join(' > ')} - ${selectedMetrics.map(m => getMetricById(m)?.label || m).join(', ')}`
+    }
+
+    // Determine display mode based on selection
+    let displayMode: 'pivot-table' | 'multi-table' | 'single-metric-chart'
+    if (selectedWidgetType?.type === 'chart') {
+      displayMode = 'single-metric-chart'
+    } else if (selectedWidgetType?.type === 'multi-table') {
+      displayMode = 'multi-table'
+    } else {
+      displayMode = 'pivot-table'
+    }
+
+    return {
+      type: widgetType,
+      display_mode: displayMode,
+      table_id: selectedTable || '',
+      title: widgetTitle,
+      dimensions: widgetDimensions,
+      table_dimensions: widgetTableDimensions,
+      metrics: widgetMetrics,
+      filters: Object.fromEntries(
+        Object.entries(pivotFilters.dimension_filters)
+          .filter(([_, values]) => values && values.length > 0)
+      ),
+      start_date: config.startDate || null,
+      end_date: config.endDate || null,
+      chart_type: widgetType === 'chart' ? (config.chartType || 'bar') : null,
+      // UI state - complete persistence
+      expanded_rows: config.expandedRows || [],
+      column_order: columnOrder.length > 0 ? columnOrder : undefined,
+      column_sort: columnSortConfig || undefined,
+      // Additional editor state for complete persistence
+      date_range_type: config.dateRangeType || null,
+      relative_date_preset: config.relativeDatePreset || null,
+      visible_metrics: config.selectedDisplayMetrics || null,
+      merge_threshold: mergeThreshold || null,
+      dimension_sort_order: dimensionSortOrder || null,
+      children_sort_config: childrenSortConfig || null,
+    }
+  })()
+
+  // Check if configuration is valid for saving
+  const canSaveToDashboard = isConfigured && selectedMetrics.length > 0 && selectedTable
+
   return (
     <div className="space-y-4 h-full">
       <div className="flex justify-between items-center">
@@ -1305,71 +1808,89 @@ export function PivotTableSection() {
             )}
           </p>
         </div>
-        <div className="flex items-center gap-3">
-          {/* Multi-Metric Selector for Multi-Table Mode */}
-          {selectedTableDimensions.length > 0 && (
+        {!widgetMode && (
+          <div className="flex items-center gap-3">
             <div className="flex items-center gap-2">
-              <label className="text-sm text-gray-600">Display Metrics:</label>
-              <div className="relative">
-                <select
-                  multiple
-                  value={selectedDisplayMetrics}
-                  onChange={(e) => {
-                    const selected = Array.from(e.target.selectedOptions, option => option.value)
-                    if (selected.length > 0) {
-                      setSelectedDisplayMetrics(selected)
-                    }
-                  }}
-                  className="px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm min-w-[200px] max-h-[120px]"
-                  size={Math.min(5, metrics.length)}
+              <label className="text-sm text-gray-600">Show top:</label>
+              <input
+                type="number"
+                min="0"
+                max="100"
+                step="1"
+                value={mergeThreshold}
+                onChange={(e) => setMergeThreshold(parseFloat(e.target.value) || 0)}
+                className="w-20 px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                placeholder="100"
+              />
+              <span className="text-sm text-gray-600">%</span>
+              {mergeThreshold > 0 && mergeThreshold < 100 && (
+                <button
+                  onClick={() => setMergeThreshold(0)}
+                  className="text-sm text-blue-600 hover:text-blue-800"
                 >
-                  {metrics.map((metric) => (
-                    <option key={metric.id} value={metric.id}>
-                      {metric.label}
-                    </option>
-                  ))}
-                </select>
-                <p className="text-xs text-gray-500 mt-1">
-                  Hold Ctrl/Cmd to select multiple ({selectedDisplayMetrics.length} selected)
-                </p>
-              </div>
+                  Clear
+                </button>
+              )}
             </div>
-          )}
-          <div className="flex items-center gap-2">
-            <label className="text-sm text-gray-600">Show top:</label>
-            <input
-              type="number"
-              min="0"
-              max="100"
-              step="1"
-              value={mergeThreshold}
-              onChange={(e) => setMergeThreshold(parseFloat(e.target.value) || 0)}
-              className="w-20 px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-              placeholder="100"
-            />
-            <span className="text-sm text-gray-600">%</span>
-            {mergeThreshold > 0 && mergeThreshold < 100 && (
+            {isEditingWidget && (
+              // Update Widget button (when editing an existing widget)
               <button
-                onClick={() => setMergeThreshold(0)}
-                className="text-sm text-blue-600 hover:text-blue-800"
+                onClick={handleUpdateWidgetClick}
+                disabled={!canSaveToDashboard}
+                className={`flex items-center gap-2 px-4 py-2 rounded-lg transition-colors ${
+                  canSaveToDashboard
+                    ? 'bg-purple-600 text-white hover:bg-purple-700'
+                    : 'bg-gray-300 text-gray-500 cursor-not-allowed'
+                }`}
+                title={!canSaveToDashboard ? 'Configure data source, date range, and select at least one metric' : 'Update widget with current configuration'}
               >
-                Clear
+                <Save className="h-4 w-4" />
+                Update Widget
               </button>
             )}
+            {/* Add to Dashboard button - always show (for creating new or copying) */}
+            <button
+              onClick={handleSaveToDashboard}
+              disabled={!canSaveToDashboard}
+              className={`flex items-center gap-2 px-4 py-2 rounded-lg transition-colors ${
+                canSaveToDashboard
+                  ? 'bg-green-600 text-white hover:bg-green-700'
+                  : 'bg-gray-300 text-gray-500 cursor-not-allowed'
+              }`}
+              title={!canSaveToDashboard ? 'Configure data source, date range, and select at least one metric' : isEditingWidget ? 'Copy this configuration to a new widget' : 'Save this visualization to a dashboard'}
+            >
+              <Save className="h-4 w-4" />
+              {isEditingWidget ? 'Copy to Dashboard' : 'Add to Dashboard'}
+            </button>
+            <button
+              onClick={() => setConfigOpen(!isConfigOpen)}
+              className={`flex items-center gap-2 px-4 py-2 rounded-lg transition-colors ${
+                isConfigOpen
+                  ? 'bg-gray-200 text-gray-700'
+                  : 'bg-blue-600 text-white hover:bg-blue-700'
+              }`}
+            >
+              <Settings2 className="h-4 w-4" />
+              {isConfigOpen ? 'Hide' : 'Configure'}
+            </button>
           </div>
+        )}
+      </div>
+
+      {/* Success Message */}
+      {!widgetMode && successMessage && (
+        <div className="bg-green-50 border border-green-200 text-green-700 px-4 py-3 rounded flex items-center justify-between">
+          <span>{successMessage}</span>
           <button
-            onClick={() => setConfigOpen(!isConfigOpen)}
-            className={`flex items-center gap-2 px-4 py-2 rounded-lg transition-colors ${
-              isConfigOpen
-                ? 'bg-gray-200 text-gray-700'
-                : 'bg-blue-600 text-white hover:bg-blue-700'
-            }`}
+            onClick={() => setSuccessMessage(null)}
+            className="text-green-700 hover:text-green-900"
           >
-            <Settings2 className="h-4 w-4" />
-            {isConfigOpen ? 'Hide' : 'Configure'}
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+            </svg>
           </button>
         </div>
-      </div>
+      )}
 
       {/* Combination Error Message */}
       {combinationError && (
@@ -1379,32 +1900,37 @@ export function PivotTableSection() {
       )}
 
       <div className="flex gap-4">
-        <PivotConfigPanel
-          isOpen={isConfigOpen}
-          onClose={() => setConfigOpen(false)}
-          config={config}
-          updateTable={updateTable}
-          updateDateRange={updateDateRange}
-          updateStartDate={updateStartDate}
-          updateEndDate={updateEndDate}
-          setDataSourceDropped={setDataSourceDropped}
-          setDateRangeDropped={setDateRangeDropped}
-          addDimension={addDimension}
-          removeDimension={removeDimension}
-          addMetric={addMetric}
-          removeMetric={removeMetric}
-          addFilter={addFilter}
-          removeFilter={removeFilter}
-          resetToDefaults={resetToDefaults}
-          dimensionFilters={pivotFilters.dimension_filters}
-          onDimensionFilterChange={updateDimensionFilter}
-          onClearDimensionFilters={clearDimensionFilters}
-          currentFilters={filters}
-        />
+        {!widgetMode && (
+          <PivotConfigPanel
+            isOpen={isConfigOpen}
+            onClose={() => setConfigOpen(false)}
+            config={config}
+            updateTable={updateTable}
+            updateDateRange={updateDateRange}
+            updateStartDate={updateStartDate}
+            updateEndDate={updateEndDate}
+            setDataSourceDropped={setDataSourceDropped}
+            setDateRangeDropped={setDateRangeDropped}
+            addDimension={addDimension}
+            removeDimension={removeDimension}
+            addMetric={addMetric}
+            removeMetric={removeMetric}
+            addFilter={addFilter}
+            removeFilter={removeFilter}
+            resetToDefaults={resetToDefaults}
+            dimensionFilters={pivotFilters.dimension_filters}
+            onDimensionFilterChange={updateDimensionFilter}
+            onClearDimensionFilters={clearDimensionFilters}
+            currentFilters={filters}
+            dateRangeType={pivotFilters.date_range_type}
+            relativeDatePreset={pivotFilters.relative_date_preset}
+            onDateRangeChange={handleDateRangeChange}
+          />
+        )}
 
         <div className="flex-1 min-w-0 space-y-4">
           {/* Configuration Bar */}
-          {isConfigured && (
+          {!widgetMode && isConfigured && (
             <div className="bg-white shadow rounded-lg p-4">
               <div className="flex flex-wrap gap-2">
                 {/* Data Source Chip */}
@@ -1487,7 +2013,7 @@ export function PivotTableSection() {
 
                 {/* Dimension Filter Chips */}
                 {Object.entries(pivotFilters.dimension_filters).map(([dimensionId, values]) => {
-                  if (!values || values.length === 0) return null
+                  if (!values || !Array.isArray(values) || values.length === 0) return null
                   const dimension = schema?.dimensions?.find(d => d.id === dimensionId)
                   const dimensionLabel = dimension?.display_name || dimensionId
 
@@ -1534,7 +2060,6 @@ export function PivotTableSection() {
                       className={`transition-all ${isDragOverHeader ? 'bg-yellow-100 ring-2 ring-yellow-400' : ''}`}
                     >
                       <th
-                        rowSpan={2}
                         className={`px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider transition-all border-r-2 border-gray-300 cursor-pointer hover:bg-gray-100 ${
                           isDragOverFirstColumn ? 'bg-green-100 ring-2 ring-green-400' : ''
                         }`}
@@ -1605,11 +2130,13 @@ export function PivotTableSection() {
                               setDraggedColumnIndex(null)
                             }}
                             onDragEnd={() => setDraggedColumnIndex(null)}
-                            className={`px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider cursor-move transition-colors ${
+                            className={`px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider cursor-move transition-all duration-200 ${
                               orderIndex === 0 ? 'border-r-2 border-gray-300' : 'border-r border-gray-200'
-                            } ${draggedColumnIndex === orderIndex ? 'bg-blue-200' : ''} ${orderIndex === 0 ? 'bg-green-50' : ''}`}
+                            } ${draggedColumnIndex === orderIndex ? 'bg-blue-300 opacity-50 scale-95' : 'hover:bg-gray-200'} ${orderIndex === 0 ? 'bg-green-50' : ''}`}
+                            title="Drag to reorder columns"
                           >
                             <div className="flex items-center justify-center gap-2">
+                              <GripVertical className="h-4 w-4 text-gray-400" />
                               {orderIndex === 0 && <span className="text-green-600 text-sm">★</span>}
                               <div>{headerLabel}</div>
                             </div>
@@ -1619,6 +2146,38 @@ export function PivotTableSection() {
                     </tr>
                     {/* Second header row - metric sub-columns */}
                     <tr className="bg-gray-100">
+                      {/* Row dimension column - Sort columns by metric */}
+                      <th className="px-6 py-2 text-left text-xs font-medium text-gray-600 uppercase tracking-wider border-r-2 border-gray-300">
+                        <div className="flex flex-col items-start gap-1">
+                          <span className="text-gray-500">Sort columns:</span>
+                          <div className="flex flex-wrap gap-1">
+                            {selectedMetrics.map((metricId) => {
+                              const metric = getMetricById(metricId)
+                              const isActiveColumnSort = columnSortConfig && columnSortConfig.metric === metricId
+                              return (
+                                <button
+                                  key={metricId}
+                                  onClick={(e) => {
+                                    e.stopPropagation()
+                                    handleColumnSort(metricId)
+                                  }}
+                                  className={`px-2 py-0.5 rounded text-xs transition-colors ${
+                                    isActiveColumnSort
+                                      ? 'bg-purple-600 text-white'
+                                      : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+                                  }`}
+                                  title={`Reorder columns by ${metric?.label}`}
+                                >
+                                  {metric?.label}
+                                  {isActiveColumnSort && (
+                                    <span className="ml-1">{columnSortConfig.direction === 'desc' ? '↓' : '↑'}</span>
+                                  )}
+                                </button>
+                              )
+                            })}
+                          </div>
+                        </div>
+                      </th>
                       {columnOrder.map((originalColIndex, orderIndex) => {
                         if (orderIndex === 0) {
                           // First column - show metric badges for sorting selection
@@ -1630,7 +2189,7 @@ export function PivotTableSection() {
                               <div className="flex flex-col items-end gap-1">
                                 <span className="text-gray-500">Sort by:</span>
                                 <div className="flex flex-wrap gap-1 justify-end">
-                                  {selectedDisplayMetrics.map((metricId) => {
+                                  {selectedMetrics.map((metricId) => {
                                     const metric = getMetricById(metricId)
                                     const isActiveSortMetric = sortConfig && sortConfig.column === originalColIndex && sortConfig.subColumn === 'value' && sortConfig.metric === metricId
                                     return (
@@ -1664,7 +2223,7 @@ export function PivotTableSection() {
                                 <div className="flex flex-col items-end gap-1">
                                   <span className="text-gray-500">Value</span>
                                   <div className="flex flex-wrap gap-1 justify-end">
-                                    {selectedDisplayMetrics.map((metricId) => {
+                                    {selectedMetrics.map((metricId) => {
                                       const metric = getMetricById(metricId)
                                       const isActiveSortMetric = sortConfig && sortConfig.column === originalColIndex && sortConfig.subColumn === 'value' && sortConfig.metric === metricId
                                       return (
@@ -1693,7 +2252,7 @@ export function PivotTableSection() {
                                 <div className="flex flex-col items-end gap-1">
                                   <span className="text-gray-500">Diff</span>
                                   <div className="flex flex-wrap gap-1 justify-end">
-                                    {selectedDisplayMetrics.map((metricId) => {
+                                    {selectedMetrics.map((metricId) => {
                                       const metric = getMetricById(metricId)
                                       const isActiveSortMetric = sortConfig && sortConfig.column === originalColIndex && sortConfig.subColumn === 'diff' && sortConfig.metric === metricId
                                       return (
@@ -1722,7 +2281,7 @@ export function PivotTableSection() {
                                 <div className="flex flex-col items-end gap-1">
                                   <span className="text-gray-500">% Diff</span>
                                   <div className="flex flex-wrap gap-1 justify-end">
-                                    {selectedDisplayMetrics.map((metricId) => {
+                                    {selectedMetrics.map((metricId) => {
                                       const metric = getMetricById(metricId)
                                       const isActiveSortMetric = sortConfig && sortConfig.column === originalColIndex && sortConfig.subColumn === 'pctDiff' && sortConfig.metric === metricId
                                       return (
@@ -1783,7 +2342,7 @@ export function PivotTableSection() {
                                         className="px-6 py-4 text-sm text-gray-900 text-right border-r-2 border-gray-300"
                                       >
                                         <div className="space-y-1">
-                                          {selectedDisplayMetrics.map((metricId) => {
+                                          {selectedMetrics.map((metricId) => {
                                             const value = columnData?.total?.metrics?.[metricId] ?? null
                                             const metric = getMetricById(metricId)
                                             return (
@@ -1805,7 +2364,7 @@ export function PivotTableSection() {
                                       <React.Fragment key={`col-${originalColIndex}`}>
                                         <td className="px-4 py-4 text-sm text-gray-900 text-right border-l border-gray-200">
                                           <div className="space-y-1">
-                                            {selectedDisplayMetrics.map((metricId) => {
+                                            {selectedMetrics.map((metricId) => {
                                               const value = columnData?.total?.metrics?.[metricId] ?? null
                                               const metric = getMetricById(metricId)
                                               return (
@@ -1819,7 +2378,7 @@ export function PivotTableSection() {
                                         </td>
                                         <td className="px-4 py-4 text-sm text-gray-700 text-right">
                                           <div className="space-y-1">
-                                            {selectedDisplayMetrics.map((metricId) => {
+                                            {selectedMetrics.map((metricId) => {
                                               const value = columnData?.total?.metrics?.[metricId] ?? null
                                               const firstValue = firstColData?.total?.metrics?.[metricId] ?? null
                                               const diff = (value ?? 0) - (firstValue ?? 0)
@@ -1833,7 +2392,7 @@ export function PivotTableSection() {
                                         </td>
                                         <td className="px-4 py-4 text-sm text-gray-700 text-right border-r border-gray-200">
                                           <div className="space-y-1">
-                                            {selectedDisplayMetrics.map((metricId) => {
+                                            {selectedMetrics.map((metricId) => {
                                               const value = columnData?.total?.metrics?.[metricId] ?? null
                                               const firstValue = firstColData?.total?.metrics?.[metricId] ?? null
                                               const pctDiff = (firstValue ?? 0) !== 0
@@ -1892,14 +2451,14 @@ export function PivotTableSection() {
                                               </div>
                                             </th>
                                             {columnOrder.map((originalColIndex, orderIndex) => {
-                                              const metric = getMetricById(selectedDisplayMetrics[0] || primarySortMetric)
+                                              const metric = getMetricById(selectedMetrics[0] || primarySortMetric)
                                               if (orderIndex === 0) {
-                                                const isSorted = childrenSortConfig?.column === selectedDisplayMetric
+                                                const isSorted = childrenSortConfig?.column === (selectedMetrics[0] || primarySortMetric)
                                                 return (
                                                   <th
                                                     key={`child-header-${originalColIndex}`}
                                                     className="px-6 py-2 text-right text-xs font-medium text-gray-700 uppercase tracking-wider border-r-2 border-blue-300 cursor-pointer hover:bg-blue-200"
-                                                    onClick={() => handleChildrenSort(selectedDisplayMetrics[0] || primarySortMetric)}
+                                                    onClick={() => handleChildrenSort(selectedMetrics[0] || primarySortMetric)}
                                                   >
                                                     <div className="flex items-center justify-end gap-1">
                                                       {metric?.label}
@@ -1932,7 +2491,7 @@ export function PivotTableSection() {
                                               {columnOrder.map((originalColIndex, orderIndex) => {
                                                 // Look up the child data for this search term in this column
                                                 const childData = childrenByColumn[originalColIndex][child.search_term]
-                                                const value = childData ? (childData as any)[selectedDisplayMetrics[0] || primarySortMetric] : null
+                                                const value = childData ? (childData as any)[selectedMetrics[0] || primarySortMetric] : null
 
                                                 if (orderIndex === 0) {
                                                   // First column - just show the value
@@ -1941,14 +2500,14 @@ export function PivotTableSection() {
                                                       key={`col-${originalColIndex}`}
                                                       className="px-6 py-4 whitespace-nowrap text-sm text-gray-700 text-right border-r-2 border-gray-300"
                                                     >
-                                                      {value != null ? formatMetricValue(value, selectedDisplayMetrics[0] || primarySortMetric) : '-'}
+                                                      {value != null ? formatMetricValue(value, selectedMetrics[0] || primarySortMetric) : '-'}
                                                     </td>
                                                   )
                                                 } else {
                                                   // Columns 2+ - show value, diff, % diff
                                                   const firstColIndex = columnOrder[0]
                                                   const firstChildData = childrenByColumn[firstColIndex][child.search_term]
-                                                  const firstValue = firstChildData ? (firstChildData as any)[selectedDisplayMetrics[0] || primarySortMetric] : null
+                                                  const firstValue = firstChildData ? (firstChildData as any)[selectedMetrics[0] || primarySortMetric] : null
 
                                                   const diff = (value ?? 0) - (firstValue ?? 0)
                                                   const pctDiff = (firstValue ?? 0) !== 0
@@ -1958,10 +2517,10 @@ export function PivotTableSection() {
                                                   return (
                                                     <React.Fragment key={`col-${originalColIndex}`}>
                                                       <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-700 text-right border-l border-gray-200">
-                                                        {value != null ? formatMetricValue(value, selectedDisplayMetrics[0] || primarySortMetric) : '-'}
+                                                        {value != null ? formatMetricValue(value, selectedMetrics[0] || primarySortMetric) : '-'}
                                                       </td>
                                                       <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-600 text-right">
-                                                        {diff != null ? formatMetricValue(diff, selectedDisplayMetrics[0] || primarySortMetric) : '-'}
+                                                        {diff != null ? formatMetricValue(diff, selectedMetrics[0] || primarySortMetric) : '-'}
                                                       </td>
                                                       <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-600 text-right border-r border-gray-200">
                                                         {pctDiff != null ? `${pctDiff.toFixed(2)}%` : '-'}
@@ -2054,7 +2613,7 @@ export function PivotTableSection() {
                                         className="px-6 py-4 text-sm text-gray-900 text-right border-r-2 border-gray-300"
                                       >
                                         <div className="space-y-1">
-                                          {selectedDisplayMetrics.map((metricId) => {
+                                          {selectedMetrics.map((metricId) => {
                                             const value = rowData?.metrics?.[metricId] ?? null
                                             const metric = getMetricById(metricId)
                                             return (
@@ -2077,7 +2636,7 @@ export function PivotTableSection() {
                                       <React.Fragment key={`col-${originalColIndex}`}>
                                         <td className="px-4 py-4 text-sm text-gray-900 text-right border-l border-gray-200">
                                           <div className="space-y-1">
-                                            {selectedDisplayMetrics.map((metricId) => {
+                                            {selectedMetrics.map((metricId) => {
                                               const value = rowData?.metrics?.[metricId] ?? null
                                               const metric = getMetricById(metricId)
                                               return (
@@ -2091,7 +2650,7 @@ export function PivotTableSection() {
                                         </td>
                                         <td className="px-4 py-4 text-sm text-gray-700 text-right">
                                           <div className="space-y-1">
-                                            {selectedDisplayMetrics.map((metricId) => {
+                                            {selectedMetrics.map((metricId) => {
                                               const value = rowData?.metrics?.[metricId] ?? null
                                               const firstValue = firstRowData?.metrics?.[metricId] ?? null
                                               const diff = (value ?? 0) - (firstValue ?? 0)
@@ -2105,7 +2664,7 @@ export function PivotTableSection() {
                                         </td>
                                         <td className="px-4 py-4 text-sm text-gray-700 text-right border-r border-gray-200">
                                           <div className="space-y-1">
-                                            {selectedDisplayMetrics.map((metricId) => {
+                                            {selectedMetrics.map((metricId) => {
                                               const value = rowData?.metrics?.[metricId] ?? null
                                               const firstValue = firstRowData?.metrics?.[metricId] ?? null
                                               const pctDiff = (firstValue ?? 0) !== 0
@@ -2169,14 +2728,14 @@ export function PivotTableSection() {
                                               </div>
                                             </th>
                                             {columnOrder.map((originalColIndex, orderIndex) => {
-                                              const metric = getMetricById(selectedDisplayMetrics[0] || primarySortMetric)
+                                              const metric = getMetricById(selectedMetrics[0] || primarySortMetric)
                                               if (orderIndex === 0) {
-                                                const isSorted = childrenSortConfig?.column === selectedDisplayMetric
+                                                const isSorted = childrenSortConfig?.column === (selectedMetrics[0] || primarySortMetric)
                                                 return (
                                                   <th
                                                     key={`child-header-${originalColIndex}`}
                                                     className="px-6 py-2 text-right text-xs font-medium text-gray-700 uppercase tracking-wider border-r-2 border-blue-300 cursor-pointer hover:bg-blue-200"
-                                                    onClick={() => handleChildrenSort(selectedDisplayMetrics[0] || primarySortMetric)}
+                                                    onClick={() => handleChildrenSort(selectedMetrics[0] || primarySortMetric)}
                                                   >
                                                     <div className="flex items-center justify-end gap-1">
                                                       {metric?.label}
@@ -2209,7 +2768,7 @@ export function PivotTableSection() {
                                               {columnOrder.map((originalColIndex, orderIndex) => {
                                                 // Look up the child data for this search term in this column
                                                 const childData = childrenByColumn[originalColIndex][child.search_term]
-                                                const value = childData ? (childData as any)[selectedDisplayMetrics[0] || primarySortMetric] : null
+                                                const value = childData ? (childData as any)[selectedMetrics[0] || primarySortMetric] : null
 
                                                 if (orderIndex === 0) {
                                                   // First column - just show the value
@@ -2218,14 +2777,14 @@ export function PivotTableSection() {
                                                       key={`col-${originalColIndex}`}
                                                       className="px-6 py-4 whitespace-nowrap text-sm text-gray-700 text-right border-r-2 border-gray-300"
                                                     >
-                                                      {value != null ? formatMetricValue(value, selectedDisplayMetrics[0] || primarySortMetric) : '-'}
+                                                      {value != null ? formatMetricValue(value, selectedMetrics[0] || primarySortMetric) : '-'}
                                                     </td>
                                                   )
                                                 } else {
                                                   // Columns 2+ - show value, diff, % diff
                                                   const firstColIndex = columnOrder[0]
                                                   const firstChildData = childrenByColumn[firstColIndex][child.search_term]
-                                                  const firstValue = firstChildData ? (firstChildData as any)[selectedDisplayMetrics[0] || primarySortMetric] : null
+                                                  const firstValue = firstChildData ? (firstChildData as any)[selectedMetrics[0] || primarySortMetric] : null
 
                                                   const diff = (value ?? 0) - (firstValue ?? 0)
                                                   const pctDiff = (firstValue ?? 0) !== 0
@@ -2235,10 +2794,10 @@ export function PivotTableSection() {
                                                   return (
                                                     <React.Fragment key={`col-${originalColIndex}`}>
                                                       <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-700 text-right border-l border-gray-200">
-                                                        {value != null ? formatMetricValue(value, selectedDisplayMetrics[0] || primarySortMetric) : '-'}
+                                                        {value != null ? formatMetricValue(value, selectedMetrics[0] || primarySortMetric) : '-'}
                                                       </td>
                                                       <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-600 text-right">
-                                                        {diff != null ? formatMetricValue(diff, selectedDisplayMetrics[0] || primarySortMetric) : '-'}
+                                                        {diff != null ? formatMetricValue(diff, selectedMetrics[0] || primarySortMetric) : '-'}
                                                       </td>
                                                       <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-600 text-right border-r border-gray-200">
                                                         {pctDiff != null ? `${pctDiff.toFixed(2)}%` : '-'}
@@ -2311,7 +2870,7 @@ export function PivotTableSection() {
                         </td>
                         {columnOrder.map((originalColIndex, orderIndex) => {
                           const columnData = allColumnData?.[originalColIndex]
-                          const value = columnData?.total?.metrics?.[selectedDisplayMetrics[0] || primarySortMetric] ?? null
+                          const value = columnData?.total?.metrics?.[selectedMetrics[0] || primarySortMetric] ?? null
 
                           if (orderIndex === 0) {
                             // First column - just show the value
@@ -2320,14 +2879,14 @@ export function PivotTableSection() {
                                 key={`col-${originalColIndex}`}
                                 className="px-6 py-4 whitespace-nowrap text-sm text-gray-900 text-right border-r-2 border-gray-300"
                               >
-                                {value != null ? formatMetricValue(value, selectedDisplayMetrics[0] || primarySortMetric) : '-'}
+                                {value != null ? formatMetricValue(value, selectedMetrics[0] || primarySortMetric) : '-'}
                               </td>
                             )
                           } else {
                             // Columns 2+ - show value, diff, % diff
                             const firstColIndex = columnOrder[0]
                             const firstColData = allColumnData?.[firstColIndex]
-                            const firstValue = firstColData?.total?.metrics?.[selectedDisplayMetrics[0] || primarySortMetric] ?? null
+                            const firstValue = firstColData?.total?.metrics?.[selectedMetrics[0] || primarySortMetric] ?? null
 
                             const diff = (value ?? 0) - (firstValue ?? 0)
                             const pctDiff = (firstValue ?? 0) !== 0
@@ -2337,10 +2896,10 @@ export function PivotTableSection() {
                             return (
                               <React.Fragment key={`col-${originalColIndex}`}>
                                 <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-900 text-right border-l border-gray-200">
-                                  {value != null ? formatMetricValue(value, selectedDisplayMetrics[0] || primarySortMetric) : '-'}
+                                  {value != null ? formatMetricValue(value, selectedMetrics[0] || primarySortMetric) : '-'}
                                 </td>
                                 <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-700 text-right">
-                                  {diff != null ? formatMetricValue(diff, selectedDisplayMetrics[0] || primarySortMetric) : '-'}
+                                  {diff != null ? formatMetricValue(diff, selectedMetrics[0] || primarySortMetric) : '-'}
                                 </td>
                                 <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-700 text-right border-r border-gray-200">
                                   {pctDiff != null ? `${pctDiff.toFixed(2)}%` : '-'}
@@ -2690,12 +3249,12 @@ export function PivotTableSection() {
           </div>
           )}
 
-          {/* Chart Visualization (only in multi-table mode) */}
-          {selectedTableDimensions.length > 0 && tableCombinations.length > 0 && allColumnData && (
+          {/* Chart Visualization (only in multi-table mode AND not in widget mode) */}
+          {!widgetMode && selectedTableDimensions.length > 0 && tableCombinations.length > 0 && allColumnData && (
             <PivotChartVisualization
               allColumnData={allColumnData}
               selectedDimensions={selectedDimensions}
-              selectedMetrics={metrics.map(m => m.id)}
+              selectedMetrics={selectedMetrics}
               tableCombinations={tableCombinations}
               getMetricById={getMetricById}
               columnOrder={columnOrder}
@@ -2709,11 +3268,32 @@ export function PivotTableSection() {
                 return headerParts.join(' | ')
               })}
               sortedDimensionValues={sortRows(processedRows).map(row => row.dimension_value)}
-              selectedDisplayMetrics={selectedDisplayMetrics}
+              chartType={config.chartType || 'bar'}
+              setChartType={setChartType}
             />
           )}
         </div>
       </div>
+
+      {/* Widget Selector Modal */}
+      {!widgetMode && isWidgetSelectorOpen && (
+        <WidgetSelectorModal
+          metrics={selectedMetrics.map(id => getMetricById(id)!).filter(Boolean)}
+          hasTableDimensions={selectedTableDimensions.length > 0}
+          onSelect={handleWidgetSelection}
+          onCancel={() => setIsWidgetSelectorOpen(false)}
+        />
+      )}
+
+      {/* Dashboard Selector Modal */}
+      {!widgetMode && (
+        <DashboardSelectorModal
+          isOpen={isDashboardModalOpen}
+          onClose={handleDashboardModalClose}
+          widgetConfig={currentWidgetConfig}
+          onSuccess={handleDashboardSuccess}
+        />
+      )}
     </div>
   )
 }

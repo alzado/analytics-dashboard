@@ -35,73 +35,73 @@ import type {
   FormulaValidationResult,
 } from '@/lib/types'
 
-export function useSchema() {
+export function useSchema(tableId?: string) {
   const queryClient = useQueryClient()
 
   const schemaQuery = useQuery<SchemaConfig>({
-    queryKey: ['schema'],
-    queryFn: fetchSchema,
+    queryKey: ['schema', tableId],
+    queryFn: () => fetchSchema(tableId),
     staleTime: 5 * 60 * 1000, // 5 minutes
   })
 
   const baseMetricsQuery = useQuery<BaseMetric[]>({
-    queryKey: ['base-metrics'],
-    queryFn: fetchBaseMetrics,
+    queryKey: ['base-metrics', tableId],
+    queryFn: () => fetchBaseMetrics(tableId),
     staleTime: 5 * 60 * 1000,
   })
 
   const calculatedMetricsQuery = useQuery<CalculatedMetric[]>({
-    queryKey: ['calculated-metrics'],
-    queryFn: fetchCalculatedMetrics,
+    queryKey: ['calculated-metrics', tableId],
+    queryFn: () => fetchCalculatedMetrics(tableId),
     staleTime: 5 * 60 * 1000,
   })
 
   const dimensionsQuery = useQuery<DimensionDef[]>({
-    queryKey: ['dimensions'],
-    queryFn: fetchDimensions,
+    queryKey: ['dimensions', tableId],
+    queryFn: () => fetchDimensions(tableId),
     staleTime: 5 * 60 * 1000,
   })
 
   const filterableDimensionsQuery = useQuery<DimensionDef[]>({
-    queryKey: ['filterable-dimensions'],
-    queryFn: fetchFilterableDimensions,
+    queryKey: ['filterable-dimensions', tableId],
+    queryFn: () => fetchFilterableDimensions(tableId),
     staleTime: 5 * 60 * 1000,
   })
 
   const groupableDimensionsQuery = useQuery<DimensionDef[]>({
-    queryKey: ['groupable-dimensions'],
-    queryFn: fetchGroupableDimensions,
+    queryKey: ['groupable-dimensions', tableId],
+    queryFn: () => fetchGroupableDimensions(tableId),
     staleTime: 5 * 60 * 1000,
   })
 
   // Schema-level mutations
   const detectSchemaMutation = useMutation<SchemaDetectionResult, Error>({
-    mutationFn: detectSchema,
+    mutationFn: () => detectSchema(tableId),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['schema'] })
-      queryClient.invalidateQueries({ queryKey: ['base-metrics'] })
-      queryClient.invalidateQueries({ queryKey: ['dimensions'] })
+      queryClient.invalidateQueries({ queryKey: ['schema', tableId] })
+      queryClient.invalidateQueries({ queryKey: ['base-metrics', tableId] })
+      queryClient.invalidateQueries({ queryKey: ['dimensions', tableId] })
     },
   })
 
   const resetSchemaMutation = useMutation<SchemaConfig, Error>({
-    mutationFn: resetSchema,
+    mutationFn: () => resetSchema(tableId),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['schema'] })
-      queryClient.invalidateQueries({ queryKey: ['base-metrics'] })
-      queryClient.invalidateQueries({ queryKey: ['calculated-metrics'] })
-      queryClient.invalidateQueries({ queryKey: ['dimensions'] })
-      queryClient.invalidateQueries({ queryKey: ['filterable-dimensions'] })
-      queryClient.invalidateQueries({ queryKey: ['groupable-dimensions'] })
+      queryClient.invalidateQueries({ queryKey: ['schema', tableId] })
+      queryClient.invalidateQueries({ queryKey: ['base-metrics', tableId] })
+      queryClient.invalidateQueries({ queryKey: ['calculated-metrics', tableId] })
+      queryClient.invalidateQueries({ queryKey: ['dimensions', tableId] })
+      queryClient.invalidateQueries({ queryKey: ['filterable-dimensions', tableId] })
+      queryClient.invalidateQueries({ queryKey: ['groupable-dimensions', tableId] })
     },
   })
 
   // Base metric mutations
   const createBaseMetricMutation = useMutation<BaseMetric, Error, MetricCreate>({
-    mutationFn: createBaseMetric,
+    mutationFn: (data) => createBaseMetric(data, tableId),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['schema'] })
-      queryClient.invalidateQueries({ queryKey: ['base-metrics'] })
+      queryClient.invalidateQueries({ queryKey: ['schema', tableId] })
+      queryClient.invalidateQueries({ queryKey: ['base-metrics', tableId] })
     },
   })
 
@@ -110,28 +110,28 @@ export function useSchema() {
     Error,
     { id: string; data: MetricUpdate }
   >({
-    mutationFn: ({ id, data }) => updateBaseMetric(id, data),
+    mutationFn: ({ id, data }) => updateBaseMetric(id, data, tableId),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['schema'] })
-      queryClient.invalidateQueries({ queryKey: ['base-metrics'] })
-      queryClient.invalidateQueries({ queryKey: ['calculated-metrics'] })
+      queryClient.invalidateQueries({ queryKey: ['schema', tableId], exact: true })
+      queryClient.invalidateQueries({ queryKey: ['base-metrics', tableId], exact: true })
+      queryClient.invalidateQueries({ queryKey: ['calculated-metrics', tableId], exact: true })
     },
   })
 
   const deleteBaseMetricMutation = useMutation<{ success: boolean; message: string }, Error, string>({
-    mutationFn: deleteBaseMetric,
+    mutationFn: (metricId) => deleteBaseMetric(metricId, tableId),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['schema'] })
-      queryClient.invalidateQueries({ queryKey: ['base-metrics'] })
+      queryClient.invalidateQueries({ queryKey: ['schema', tableId] })
+      queryClient.invalidateQueries({ queryKey: ['base-metrics', tableId] })
     },
   })
 
   // Calculated metric mutations
   const createCalculatedMetricMutation = useMutation<CalculatedMetric, Error, CalculatedMetricCreate>({
-    mutationFn: createCalculatedMetric,
+    mutationFn: (data) => createCalculatedMetric(data, tableId),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['schema'] })
-      queryClient.invalidateQueries({ queryKey: ['calculated-metrics'] })
+      queryClient.invalidateQueries({ queryKey: ['schema', tableId] })
+      queryClient.invalidateQueries({ queryKey: ['calculated-metrics', tableId] })
     },
   })
 
@@ -140,49 +140,49 @@ export function useSchema() {
     Error,
     { id: string; data: CalculatedMetricUpdate }
   >({
-    mutationFn: ({ id, data }) => updateCalculatedMetric(id, data),
+    mutationFn: ({ id, data }) => updateCalculatedMetric(id, data, tableId),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['schema'] })
-      queryClient.invalidateQueries({ queryKey: ['calculated-metrics'] })
+      queryClient.invalidateQueries({ queryKey: ['schema', tableId], exact: true })
+      queryClient.invalidateQueries({ queryKey: ['calculated-metrics', tableId], exact: true })
     },
   })
 
   const deleteCalculatedMetricMutation = useMutation<{ success: boolean; message: string }, Error, string>({
-    mutationFn: deleteCalculatedMetric,
+    mutationFn: (metricId) => deleteCalculatedMetric(metricId, tableId),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['schema'] })
-      queryClient.invalidateQueries({ queryKey: ['calculated-metrics'] })
+      queryClient.invalidateQueries({ queryKey: ['schema', tableId] })
+      queryClient.invalidateQueries({ queryKey: ['calculated-metrics', tableId] })
     },
   })
 
   // Dimension mutations
   const createDimensionMutation = useMutation<DimensionDef, Error, DimensionCreate>({
-    mutationFn: createDimension,
+    mutationFn: (data) => createDimension(data, tableId),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['schema'] })
-      queryClient.invalidateQueries({ queryKey: ['dimensions'] })
-      queryClient.invalidateQueries({ queryKey: ['filterable-dimensions'] })
-      queryClient.invalidateQueries({ queryKey: ['groupable-dimensions'] })
+      queryClient.invalidateQueries({ queryKey: ['schema', tableId] })
+      queryClient.invalidateQueries({ queryKey: ['dimensions', tableId] })
+      queryClient.invalidateQueries({ queryKey: ['filterable-dimensions', tableId] })
+      queryClient.invalidateQueries({ queryKey: ['groupable-dimensions', tableId] })
     },
   })
 
   const updateDimensionMutation = useMutation<DimensionDef, Error, { id: string; data: DimensionUpdate }>({
-    mutationFn: ({ id, data }) => updateDimension(id, data),
+    mutationFn: ({ id, data }) => updateDimension(id, data, tableId),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['schema'] })
-      queryClient.invalidateQueries({ queryKey: ['dimensions'] })
-      queryClient.invalidateQueries({ queryKey: ['filterable-dimensions'] })
-      queryClient.invalidateQueries({ queryKey: ['groupable-dimensions'] })
+      queryClient.invalidateQueries({ queryKey: ['schema', tableId], exact: true })
+      queryClient.invalidateQueries({ queryKey: ['dimensions', tableId], exact: true })
+      queryClient.invalidateQueries({ queryKey: ['filterable-dimensions', tableId], exact: true })
+      queryClient.invalidateQueries({ queryKey: ['groupable-dimensions', tableId], exact: true })
     },
   })
 
   const deleteDimensionMutation = useMutation<{ success: boolean; message: string }, Error, string>({
-    mutationFn: deleteDimension,
+    mutationFn: (dimensionId) => deleteDimension(dimensionId, tableId),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['schema'] })
-      queryClient.invalidateQueries({ queryKey: ['dimensions'] })
-      queryClient.invalidateQueries({ queryKey: ['filterable-dimensions'] })
-      queryClient.invalidateQueries({ queryKey: ['groupable-dimensions'] })
+      queryClient.invalidateQueries({ queryKey: ['schema', tableId] })
+      queryClient.invalidateQueries({ queryKey: ['dimensions', tableId] })
+      queryClient.invalidateQueries({ queryKey: ['filterable-dimensions', tableId] })
+      queryClient.invalidateQueries({ queryKey: ['groupable-dimensions', tableId] })
     },
   })
 
@@ -197,9 +197,9 @@ export function useSchema() {
     Error,
     { primary_sort_metric?: string; avg_per_day_metric?: string; pagination_threshold?: number }
   >({
-    mutationFn: updatePivotConfig,
+    mutationFn: (config) => updatePivotConfig(config, tableId),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['schema'] })
+      queryClient.invalidateQueries({ queryKey: ['schema', tableId] })
     },
   })
 

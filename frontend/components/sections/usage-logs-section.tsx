@@ -33,7 +33,6 @@ export function UsageLogsSection() {
   const { data: todayStats } = useQuery({
     queryKey: ['usage-stats-today'],
     queryFn: fetchTodayUsageStats,
-    refetchInterval: 30000, // Refresh every 30 seconds
   })
 
   // Fetch time series data

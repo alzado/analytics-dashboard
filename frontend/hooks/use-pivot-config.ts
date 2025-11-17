@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
-import type { DateRange } from '@/lib/types'
+import type { DateRange, DateRangeType, RelativeDatePreset } from '@/lib/types'
 
 const STORAGE_KEY = 'pivot-table-config'
 
@@ -14,6 +14,8 @@ export interface PivotConfig {
   selectedDateRange: DateRange | null
   startDate: string | null
   endDate: string | null
+  dateRangeType?: DateRangeType
+  relativeDatePreset?: RelativeDatePreset | null
   isDataSourceDropped: boolean
   isDateRangeDropped: boolean
   selectedDimensions: string[]
@@ -28,6 +30,7 @@ export interface PivotConfig {
   sortSubColumn?: 'value' | 'diff' | 'pctDiff'
   sortDirection?: 'asc' | 'desc'
   sortMetric?: string // Which metric to sort by
+  chartType?: 'bar' | 'line' // Chart type for visualizations
 }
 
 interface UsePivotConfigReturn {
@@ -36,6 +39,7 @@ interface UsePivotConfigReturn {
   updateDateRange: (dateRange: DateRange | null) => void
   updateStartDate: (date: string | null) => void
   updateEndDate: (date: string | null) => void
+  updateFullDateRange: (type: DateRangeType, preset: RelativeDatePreset | null, startDate: string | null, endDate: string | null) => void
   setDataSourceDropped: (dropped: boolean) => void
   setDateRangeDropped: (dropped: boolean) => void
   addDimension: (dimension: string) => void
@@ -57,6 +61,7 @@ interface UsePivotConfigReturn {
   setSelectedDisplayMetrics: (metrics: string[]) => void
   toggleDisplayMetric: (metric: string) => void
   setSortConfig: (column: string | number, subColumn?: 'value' | 'diff' | 'pctDiff', direction?: 'asc' | 'desc', metric?: string) => void
+  setChartType: (type: 'bar' | 'line') => void
 }
 
 const DEFAULT_CONFIG: PivotConfig = {
@@ -64,6 +69,8 @@ const DEFAULT_CONFIG: PivotConfig = {
   selectedDateRange: null,
   startDate: null,
   endDate: null,
+  dateRangeType: 'absolute',
+  relativeDatePreset: null,
   isDataSourceDropped: false,
   isDateRangeDropped: false,
   selectedDimensions: [],
@@ -77,6 +84,7 @@ const DEFAULT_CONFIG: PivotConfig = {
   sortColumn: undefined,
   sortSubColumn: undefined,
   sortDirection: undefined,
+  chartType: 'bar', // Default chart type
 }
 
 export function usePivotConfig(): UsePivotConfigReturn {
@@ -98,13 +106,38 @@ export function usePivotConfig(): UsePivotConfigReturn {
           displayMetrics = [(parsed as any).selectedDisplayMetric]
         }
 
+        // Validate and sanitize date range type
+        let dateRangeType: DateRangeType =
+          (parsed.dateRangeType === 'absolute' || parsed.dateRangeType === 'relative')
+            ? parsed.dateRangeType
+            : 'absolute'
+
+        // Fix corrupted data where dates were stored in wrong fields
+        let startDate = parsed.startDate ?? null
+        let endDate = parsed.endDate ?? null
+        let relativeDatePreset = parsed.relativeDatePreset ?? null
+
+        // If dateRangeType looks like a date (YYYY-MM-DD), it's corrupted - recover silently
+        if (parsed.dateRangeType && /^\d{4}-\d{2}-\d{2}$/.test(parsed.dateRangeType as string)) {
+          startDate = parsed.dateRangeType as string
+          dateRangeType = 'absolute'
+        }
+
+        // If relativeDatePreset looks like a date (YYYY-MM-DD), it's corrupted - recover silently
+        if (parsed.relativeDatePreset && /^\d{4}-\d{2}-\d{2}$/.test(parsed.relativeDatePreset as string)) {
+          endDate = parsed.relativeDatePreset as string
+          relativeDatePreset = null
+        }
+
         const migratedConfig: PivotConfig = {
           ...DEFAULT_CONFIG,
           // Configuration data (persist these)
           selectedTable: parsed.selectedTable ?? null,
           selectedDateRange: parsed.selectedDateRange ?? null,
-          startDate: parsed.startDate ?? null,
-          endDate: parsed.endDate ?? null,
+          startDate,
+          endDate,
+          dateRangeType,
+          relativeDatePreset,
           isDataSourceDropped: parsed.isDataSourceDropped ?? false,
           isDateRangeDropped: parsed.isDateRangeDropped ?? false,
           selectedDimensions: Array.isArray(parsed.selectedDimensions) ? parsed.selectedDimensions : [],
@@ -162,6 +195,24 @@ export function usePivotConfig(): UsePivotConfigReturn {
 
   const updateEndDate = useCallback((date: string | null) => {
     setConfig((prev) => ({ ...prev, endDate: date }))
+  }, [])
+
+  const updateFullDateRange = useCallback((
+    type: DateRangeType,
+    preset: RelativeDatePreset | null,
+    startDate: string | null,
+    endDate: string | null
+  ) => {
+    // Validate that type is either 'absolute' or 'relative'
+    const validType: DateRangeType = (type === 'absolute' || type === 'relative') ? type : 'absolute'
+
+    setConfig((prev) => ({
+      ...prev,
+      dateRangeType: validType,
+      relativeDatePreset: preset,
+      startDate,
+      endDate,
+    }))
   }, [])
 
   const setDataSourceDropped = useCallback((dropped: boolean) => {
@@ -321,12 +372,20 @@ export function usePivotConfig(): UsePivotConfigReturn {
     }))
   }, [])
 
+  const setChartType = useCallback((type: 'bar' | 'line') => {
+    setConfig((prev) => ({
+      ...prev,
+      chartType: type,
+    }))
+  }, [])
+
   return {
     config,
     updateTable,
     updateDateRange,
     updateStartDate,
     updateEndDate,
+    updateFullDateRange,
     setDataSourceDropped,
     setDateRangeDropped,
     addDimension,
@@ -348,5 +407,6 @@ export function usePivotConfig(): UsePivotConfigReturn {
     setSelectedDisplayMetrics,
     toggleDisplayMetric,
     setSortConfig,
+    setChartType,
   }
 }

@@ -4,6 +4,7 @@ import { useState, useEffect } from 'react'
 import { createPortal } from 'react-dom'
 import { X, Plus, Trash2, Calendar, TrendingUp } from 'lucide-react'
 import { usePivotMetrics } from '@/hooks/use-pivot-metrics'
+import { DateRangeSelector } from '@/components/ui/date-range-selector'
 import type {
   CustomDimension,
   CustomDimensionValue,
@@ -11,7 +12,9 @@ import type {
   CustomDimensionUpdate,
   MetricDimensionValue,
   MetricCondition,
-  MetricConditionOperator
+  MetricConditionOperator,
+  DateRangeType,
+  RelativeDatePreset
 } from '@/lib/types'
 
 interface CustomDimensionModalProps {
@@ -20,6 +23,7 @@ interface CustomDimensionModalProps {
   onSave: (data: CustomDimensionCreate | { id: string; data: CustomDimensionUpdate }) => void
   editingDimension?: CustomDimension | null
   mode: 'create' | 'edit'
+  tableId?: string
 }
 
 const OPERATORS: { value: MetricConditionOperator; label: string; requiresValue: boolean; requiresMaxValue: boolean }[] = [
@@ -38,10 +42,11 @@ export default function CustomDimensionModal({
   onClose,
   onSave,
   editingDimension,
-  mode
+  mode,
+  tableId,
 }: CustomDimensionModalProps) {
   // Load dynamic metrics from schema
-  const { metrics } = usePivotMetrics()
+  const { metrics } = usePivotMetrics(tableId)
 
   // Transform metrics to dropdown format
   const AVAILABLE_METRICS = metrics.map(m => ({
@@ -54,7 +59,7 @@ export default function CustomDimensionModal({
 
   // Date range state
   const [values, setValues] = useState<CustomDimensionValue[]>([
-    { label: '', start_date: '', end_date: '' }
+    { label: '', start_date: '', end_date: '', date_range_type: 'absolute', relative_date_preset: null }
   ])
 
   // Metric condition state
@@ -82,7 +87,7 @@ export default function CustomDimensionModal({
       setDimensionType('date_range')
       setDimensionName('')
       setValues([
-        { label: '', start_date: '', end_date: '' }
+        { label: '', start_date: '', end_date: '', date_range_type: 'absolute', relative_date_preset: null }
       ])
       setMetric('')
       setMetricValues([{ label: '', conditions: [{ operator: '>', value: null, value_max: null }] }])
@@ -92,7 +97,7 @@ export default function CustomDimensionModal({
 
   // Date range methods
   const addValue = () => {
-    setValues([...values, { label: '', start_date: '', end_date: '' }])
+    setValues([...values, { label: '', start_date: '', end_date: '', date_range_type: 'absolute', relative_date_preset: null }])
   }
 
   const removeValue = (index: number) => {
@@ -104,6 +109,24 @@ export default function CustomDimensionModal({
   const updateValue = (index: number, field: keyof CustomDimensionValue, value: string) => {
     const newValues = [...values]
     newValues[index] = { ...newValues[index], [field]: value }
+    setValues(newValues)
+  }
+
+  const updateValueDateRange = (
+    index: number,
+    type: DateRangeType,
+    preset: RelativeDatePreset | null,
+    startDate: string | null,
+    endDate: string | null
+  ) => {
+    const newValues = [...values]
+    newValues[index] = {
+      ...newValues[index],
+      date_range_type: type,
+      relative_date_preset: preset,
+      start_date: startDate || '',
+      end_date: endDate || ''
+    }
     setValues(newValues)
   }
 
@@ -163,14 +186,23 @@ export default function CustomDimensionModal({
         if (!value.label.trim()) {
           newErrors[`value_${index}_label`] = 'Label is required'
         }
-        if (!value.start_date) {
-          newErrors[`value_${index}_start`] = 'Start date is required'
-        }
-        if (!value.end_date) {
-          newErrors[`value_${index}_end`] = 'End date is required'
-        }
-        if (value.start_date && value.end_date && value.start_date > value.end_date) {
-          newErrors[`value_${index}_date`] = 'End date must be after start date'
+
+        // For relative dates, check if preset is selected
+        if (value.date_range_type === 'relative') {
+          if (!value.relative_date_preset) {
+            newErrors[`value_${index}_start`] = 'Please select a relative date preset'
+          }
+        } else {
+          // For absolute dates, check if dates are filled
+          if (!value.start_date) {
+            newErrors[`value_${index}_start`] = 'Start date is required'
+          }
+          if (!value.end_date) {
+            newErrors[`value_${index}_end`] = 'End date is required'
+          }
+          if (value.start_date && value.end_date && value.start_date > value.end_date) {
+            newErrors[`value_${index}_date`] = 'End date must be after start date'
+          }
         }
       })
 
@@ -236,7 +268,9 @@ export default function CustomDimensionModal({
           values: values.map(v => ({
             label: v.label.trim(),
             start_date: v.start_date,
-            end_date: v.end_date
+            end_date: v.end_date,
+            date_range_type: v.date_range_type,
+            relative_date_preset: v.relative_date_preset
           }))
         } : {
           metric,
@@ -254,7 +288,9 @@ export default function CustomDimensionModal({
           values: values.map(v => ({
             label: v.label.trim(),
             start_date: v.start_date,
-            end_date: v.end_date
+            end_date: v.end_date,
+            date_range_type: v.date_range_type,
+            relative_date_preset: v.relative_date_preset
           }))
         } : {
           metric,
@@ -408,48 +444,22 @@ export default function CustomDimensionModal({
                       )}
                     </div>
 
-                    <div className="grid grid-cols-2 gap-3">
-                      <div>
-                        <label className="block text-xs font-medium text-gray-600 mb-1">
-                          Start Date *
-                        </label>
-                        <input
-                          type="date"
-                          value={value.start_date}
-                          onChange={(e) => updateValue(index, 'start_date', e.target.value)}
-                          className={`w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent ${
-                            errors[`value_${index}_start`] || errors[`value_${index}_date`]
-                              ? 'border-red-500'
-                              : 'border-gray-300'
-                          }`}
-                        />
-                        {errors[`value_${index}_start`] && (
-                          <p className="text-red-500 text-xs mt-1">{errors[`value_${index}_start`]}</p>
-                        )}
-                      </div>
-
-                      <div>
-                        <label className="block text-xs font-medium text-gray-600 mb-1">
-                          End Date *
-                        </label>
-                        <input
-                          type="date"
-                          value={value.end_date}
-                          onChange={(e) => updateValue(index, 'end_date', e.target.value)}
-                          className={`w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent ${
-                            errors[`value_${index}_end`] || errors[`value_${index}_date`]
-                              ? 'border-red-500'
-                              : 'border-gray-300'
-                          }`}
-                        />
-                        {errors[`value_${index}_end`] && (
-                          <p className="text-red-500 text-xs mt-1">{errors[`value_${index}_end`]}</p>
-                        )}
-                      </div>
+                    <div>
+                      <DateRangeSelector
+                        dateRangeType={(value.date_range_type as DateRangeType) || 'absolute'}
+                        relativeDatePreset={(value.relative_date_preset as RelativeDatePreset) || null}
+                        startDate={value.start_date}
+                        endDate={value.end_date}
+                        onDateRangeChange={(type, preset, startDate, endDate) =>
+                          updateValueDateRange(index, type, preset, startDate, endDate)
+                        }
+                      />
+                      {(errors[`value_${index}_start`] || errors[`value_${index}_end`] || errors[`value_${index}_date`]) && (
+                        <p className="text-red-500 text-xs mt-1">
+                          {errors[`value_${index}_start`] || errors[`value_${index}_end`] || errors[`value_${index}_date`]}
+                        </p>
+                      )}
                     </div>
-                    {errors[`value_${index}_date`] && (
-                      <p className="text-red-500 text-xs mt-1">{errors[`value_${index}_date`]}</p>
-                    )}
                   </div>
                 ))}
               </div>

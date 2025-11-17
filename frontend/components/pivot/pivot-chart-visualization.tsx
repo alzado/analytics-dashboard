@@ -14,7 +14,8 @@ interface PivotChartVisualizationProps {
   columnOrder: number[]
   tableHeaders: string[]
   sortedDimensionValues: string[]
-  selectedDisplayMetrics: string[] // Changed from single to array
+  chartType: 'bar' | 'line' // Get from config
+  setChartType: (type: 'bar' | 'line') => void // Update config
 }
 
 // Color palette for chart series
@@ -38,21 +39,21 @@ export function PivotChartVisualization({
   columnOrder,
   tableHeaders,
   sortedDimensionValues,
-  selectedDisplayMetrics,
+  chartType,
+  setChartType,
 }: PivotChartVisualizationProps) {
-  const [chartType, setChartType] = useState<'line' | 'bar'>('bar')
   const [showChart, setShowChart] = useState<boolean>(true)
 
   // Transform data for Recharts - one dataset per metric
   const chartDataByMetric = useMemo(() => {
-    if (!allColumnData || Object.keys(allColumnData).length === 0 || !selectedDisplayMetrics || selectedDisplayMetrics.length === 0 || !sortedDimensionValues) {
+    if (!allColumnData || Object.keys(allColumnData).length === 0 || !selectedMetrics || selectedMetrics.length === 0 || !sortedDimensionValues) {
       return {}
     }
 
     const dataByMetric: Record<string, any[]> = {}
 
     // Create a separate chart dataset for each selected metric
-    selectedDisplayMetrics.forEach(metricId => {
+    selectedMetrics.forEach(metricId => {
       const transformedData = sortedDimensionValues.map((dimensionValue) => {
         const dataPoint: any = {
           dimension_value: dimensionValue,
@@ -83,7 +84,7 @@ export function PivotChartVisualization({
     })
 
     return dataByMetric
-  }, [allColumnData, selectedDisplayMetrics, columnOrder, tableHeaders, sortedDimensionValues])
+  }, [allColumnData, selectedMetrics, columnOrder, tableHeaders, sortedDimensionValues])
 
   // Get series names (column headers)
   const seriesNames = useMemo(() => {
@@ -146,7 +147,7 @@ export function PivotChartVisualization({
       <div className="bg-white shadow rounded-lg p-4">
         <div className="flex items-center justify-between">
           <h3 className="text-lg font-semibold text-gray-900">
-            Visualizations ({selectedDisplayMetrics.length} {selectedDisplayMetrics.length === 1 ? 'metric' : 'metrics'})
+            Visualizations ({selectedMetrics.length} {selectedMetrics.length === 1 ? 'metric' : 'metrics'})
           </h3>
 
           {/* Chart Type Toggle */}
@@ -186,7 +187,7 @@ export function PivotChartVisualization({
       </div>
 
       {/* Render one chart per selected metric */}
-      {showChart && selectedDisplayMetrics.map((metricId) => {
+      {showChart && selectedMetrics.map((metricId) => {
         const chartData = chartDataByMetric[metricId] || []
         const selectedMetric = getMetricById(metricId)
 

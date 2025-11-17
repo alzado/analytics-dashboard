@@ -4,13 +4,26 @@ import { useState, useEffect } from 'react'
 import { X, Filter, ChevronDown, Check } from 'lucide-react'
 import { useSchema } from '@/hooks/use-schema'
 import { fetchDimensionValues } from '@/lib/api'
-import type { DimensionDef, FilterParams } from '@/lib/types'
+import { DateRangeSelector } from '@/components/ui/date-range-selector'
+import type { DimensionDef, FilterParams, DateRangeType, RelativeDatePreset } from '@/lib/types'
 
 interface PivotFilterPanelProps {
   filters: Record<string, string[]>
   onFilterChange: (dimensionId: string, values: string[]) => void
   onClearFilters: () => void
   currentFilters?: FilterParams
+  tableId?: string
+  // Date range props
+  dateRangeType?: DateRangeType
+  relativeDatePreset?: RelativeDatePreset | null
+  startDate?: string | null
+  endDate?: string | null
+  onDateRangeChange?: (
+    type: DateRangeType,
+    preset: RelativeDatePreset | null,
+    startDate: string | null,
+    endDate: string | null
+  ) => void
 }
 
 export function PivotFilterPanel({
@@ -18,17 +31,19 @@ export function PivotFilterPanel({
   onFilterChange,
   onClearFilters,
   currentFilters,
+  tableId,
+  dateRangeType = 'absolute',
+  relativeDatePreset = null,
+  startDate = null,
+  endDate = null,
+  onDateRangeChange,
 }: PivotFilterPanelProps) {
-  const { schema, isLoading: schemaLoading } = useSchema()
+  const { schema, isLoading: schemaLoading } = useSchema(tableId)
 
   // Get only filterable dimensions from schema
   const filterableDimensions = schema?.dimensions?.filter(d => d.is_filterable) || []
 
   const activeFilterCount = Object.keys(filters).length
-
-  console.log('PivotFilterPanel - Schema:', schema)
-  console.log('PivotFilterPanel - Filterable dimensions:', filterableDimensions)
-  console.log('PivotFilterPanel - Active filters:', filters)
 
   if (schemaLoading) {
     return (
@@ -68,6 +83,20 @@ export function PivotFilterPanel({
           </button>
         )}
       </div>
+
+      {/* Date Range Selector */}
+      {onDateRangeChange && (
+        <div className="mb-4">
+          <h4 className="text-sm font-medium text-gray-700 mb-2">Date Range</h4>
+          <DateRangeSelector
+            dateRangeType={dateRangeType}
+            relativeDatePreset={relativeDatePreset}
+            startDate={startDate}
+            endDate={endDate}
+            onDateRangeChange={onDateRangeChange}
+          />
+        </div>
+      )}
 
       <div className="space-y-3">
         {filterableDimensions.length > 0 ? (
@@ -114,7 +143,7 @@ function DimensionFilter({
   useEffect(() => {
     if (isOpen && availableValues.length === 0) {
       setIsLoadingValues(true)
-      fetchDimensionValues(dimension.id, currentFilters || {})
+      fetchDimensionValues(dimension.id, currentFilters || {}, tableId)
         .then(values => {
           setAvailableValues(values)
         })

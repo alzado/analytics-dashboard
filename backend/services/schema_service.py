@@ -366,7 +366,6 @@ class SchemaService:
                 if needs_migration:
                     # Save the migrated schema
                     self.save_schema(schema)
-                    print("✓ Migrated schema: populated depends_on_base and depends_on_calculated fields")
 
                 self._schema_cache = schema
                 return schema
@@ -401,7 +400,6 @@ class SchemaService:
                 calc_metric.depends_on_base = depends_on_base
                 calc_metric.depends_on_calculated = depends_on_calculated
                 needs_migration = True
-                print(f"  Migrated '{calc_metric.id}': base={depends_on_base}, calculated={depends_on_calculated}")
 
         return needs_migration
 
@@ -572,11 +570,9 @@ class SchemaService:
             with open(target_schema_path, 'w') as f:
                 json.dump(schema_data, f, indent=2)
 
-            print(f"Schema copied from {source_table_id} to {target_table_id}")
             return True
 
         except Exception as e:
-            print(f"Failed to copy schema: {e}")
             return False
 
     def apply_template(self, template_name: str) -> bool:
@@ -595,7 +591,6 @@ class SchemaService:
             elif template_name.lower() == 'marketing':
                 schema = self._create_marketing_template()
             else:
-                print(f"Unknown template: {template_name}")
                 return False
 
             # Update timestamps
@@ -607,7 +602,6 @@ class SchemaService:
             return True
 
         except Exception as e:
-            print(f"Failed to apply template: {e}")
             return False
 
     def _create_ecommerce_template(self) -> SchemaConfig:

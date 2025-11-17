@@ -1,12 +1,41 @@
 from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import Optional, List, Union, Literal, Dict
 from datetime import date
+from enum import Enum
+
+
+class DateRangeType(str, Enum):
+    """Type of date range selection"""
+    ABSOLUTE = "absolute"
+    RELATIVE = "relative"
+
+
+class RelativeDatePreset(str, Enum):
+    """Supported relative date presets"""
+    TODAY = "today"
+    YESTERDAY = "yesterday"
+    LAST_7_DAYS = "last_7_days"
+    LAST_30_DAYS = "last_30_days"
+    LAST_90_DAYS = "last_90_days"
+    THIS_WEEK = "this_week"
+    LAST_WEEK = "last_week"
+    THIS_MONTH = "this_month"
+    LAST_MONTH = "last_month"
+    THIS_QUARTER = "this_quarter"
+    LAST_QUARTER = "last_quarter"
+    THIS_YEAR = "this_year"
+    LAST_YEAR = "last_year"
+
 
 class FilterParams(BaseModel):
     """Filter parameters for queries - fully dynamic dimension-based filtering"""
     # Date range filters (special handling for date dimension)
     start_date: Optional[str] = None
     end_date: Optional[str] = None
+
+    # Relative date support
+    date_range_type: Optional[str] = "absolute"  # 'absolute' or 'relative'
+    relative_date_preset: Optional[str] = None  # e.g., 'last_7_days', 'this_month'
 
     # Dynamic dimension filters
     # Format: { "dimension_id": ["value1", "value2"], ... }
@@ -105,12 +134,10 @@ class TableInfoResponse(BaseModel):
     table: str
     created_at: str
     last_used_at: str
-    is_active: bool = False
 
 class TableListResponse(BaseModel):
     """List of all configured tables"""
     tables: List[TableInfoResponse]
-    active_table_id: Optional[str] = None
 
 class TableCreateRequest(BaseModel):
     """Request to create a new table configuration"""
@@ -154,6 +181,9 @@ class CustomDimensionValue(BaseModel):
     label: str = Field(..., description="Display name for this value (e.g., 'Holiday Season')")
     start_date: str = Field(..., description="Start date in YYYY-MM-DD format")
     end_date: str = Field(..., description="End date in YYYY-MM-DD format")
+    # Relative date support
+    date_range_type: Optional[str] = Field(default="absolute", description="'absolute' or 'relative'")
+    relative_date_preset: Optional[str] = Field(default=None, description="Relative date preset (e.g., 'last_7_days')")
 
 class MetricCondition(BaseModel):
     """A condition to evaluate a metric (e.g., conversion_rate > 0.05)"""
@@ -387,7 +417,7 @@ class MetricCreate(BaseModel):
 
 class CalculatedMetricCreate(BaseModel):
     """Request to create a calculated metric"""
-    id: str
+    id: Optional[str] = None  # Auto-generated from display_name if not provided
     display_name: str
     formula: str
     format_type: Literal["number", "currency", "percent"] = "number"
@@ -445,3 +475,128 @@ class PivotConfigUpdate(BaseModel):
     primary_sort_metric: Optional[str] = Field(None, description="Metric ID to use as default sort for pivot tables")
     avg_per_day_metric: Optional[str] = Field(None, description="Metric ID to use for average per day calculations")
     pagination_threshold: Optional[int] = Field(None, description="Paginate dimensions when unique values exceed this threshold", ge=1)
+
+
+# Dashboard Models
+
+class WidgetPosition(BaseModel):
+    """Widget position in grid layout"""
+    x: int = Field(..., description="X coordinate in grid (0-based)")
+    y: int = Field(..., description="Y coordinate in grid (0-based)")
+    w: int = Field(..., description="Width in grid units", ge=1, le=12)
+    h: int = Field(..., description="Height in grid units", ge=1)
+
+class WidgetConfig(BaseModel):
+    """Configuration for a dashboard widget"""
+    id: str = Field(..., description="Unique widget ID (UUID)")
+    type: Literal["table", "chart"] = Field(..., description="Widget type")
+    table_id: str = Field(..., description="BigQuery table ID this widget queries")
+    title: str = Field(..., description="Widget title")
+
+    # Pivot table configuration
+    dimensions: List[str] = Field(default_factory=list, description="Selected dimension IDs")
+    table_dimensions: List[str] = Field(default_factory=list, description="Selected table dimension IDs (for column-wise dimensions)")
+    metrics: List[str] = Field(default_factory=list, description="Selected metric IDs")
+    filters: Dict[str, List[str]] = Field(default_factory=dict, description="Dimension filters")
+
+    # Date range
+    start_date: Optional[str] = Field(None, description="Start date (YYYY-MM-DD)")
+    end_date: Optional[str] = Field(None, description="End date (YYYY-MM-DD)")
+
+    # Chart-specific config
+    chart_type: Optional[Literal["bar", "line"]] = Field(None, description="Chart type (only for chart widgets)")
+
+    # UI state (preserves editor state in widget)
+    expanded_rows: List[str] = Field(default_factory=list, description="List of expanded row keys")
+    column_order: Optional[List[int]] = Field(None, description="Order of columns (indices)")
+    column_sort: Optional[Dict[str, str]] = Field(None, description="Column sorting config (metric and direction)")
+    display_mode: Optional[Literal["pivot-table", "multi-table", "single-metric-chart"]] = Field(None, description="Explicit display mode")
+
+    # Additional editor state for complete persistence
+    date_range_type: Optional[Literal["absolute", "relative"]] = Field(None, description="Date range type (absolute dates or relative preset)")
+    relative_date_preset: Optional[str] = Field(None, description="Relative date preset (e.g., 'last_7_days', 'last_30_days')")
+    visible_metrics: Optional[List[str]] = Field(None, description="Visible metrics in multi-table display mode")
+    merge_threshold: Optional[int] = Field(None, description="Grouping/merge threshold for rows")
+    dimension_sort_order: Optional[Literal["asc", "desc"]] = Field(None, description="Sort order for dimension column")
+    children_sort_config: Optional[Dict[str, str]] = Field(None, description="Sort config for expanded child rows (column and direction)")
+
+    # Position in grid
+    position: WidgetPosition = Field(..., description="Widget position in grid layout")
+
+    created_at: str = Field(..., description="ISO timestamp when widget was created")
+    updated_at: str = Field(..., description="ISO timestamp when widget was last updated")
+
+class DashboardConfig(BaseModel):
+    """Complete dashboard configuration"""
+    id: str = Field(..., description="Unique dashboard ID (UUID)")
+    name: str = Field(..., description="Dashboard name")
+    description: Optional[str] = Field(None, description="Dashboard description")
+    widgets: List[WidgetConfig] = Field(default_factory=list, description="List of widgets in this dashboard")
+    created_at: str = Field(..., description="ISO timestamp when dashboard was created")
+    updated_at: str = Field(..., description="ISO timestamp when dashboard was last updated")
+
+class DashboardListResponse(BaseModel):
+    """List of all dashboards"""
+    dashboards: List[DashboardConfig]
+
+class DashboardCreateRequest(BaseModel):
+    """Request to create a new dashboard"""
+    name: str = Field(..., min_length=1, max_length=100, description="Dashboard name")
+    description: Optional[str] = Field(None, max_length=500, description="Dashboard description")
+
+class DashboardUpdateRequest(BaseModel):
+    """Request to update a dashboard"""
+    name: Optional[str] = Field(None, min_length=1, max_length=100, description="Dashboard name")
+    description: Optional[str] = Field(None, max_length=500, description="Dashboard description")
+    widgets: Optional[List[WidgetConfig]] = Field(None, description="Complete list of widgets (replaces existing)")
+
+class WidgetCreateRequest(BaseModel):
+    """Request to add a widget to a dashboard"""
+    type: Literal["table", "chart"] = Field(..., description="Widget type")
+    table_id: str = Field(..., description="BigQuery table ID this widget queries")
+    title: str = Field(..., min_length=1, max_length=100, description="Widget title")
+    dimensions: List[str] = Field(default_factory=list, description="Selected dimension IDs")
+    table_dimensions: List[str] = Field(default_factory=list, description="Selected table dimension IDs")
+    metrics: List[str] = Field(default_factory=list, description="Selected metric IDs")
+    filters: Dict[str, List[str]] = Field(default_factory=dict, description="Dimension filters")
+    start_date: Optional[str] = Field(None, description="Start date (YYYY-MM-DD)")
+    end_date: Optional[str] = Field(None, description="End date (YYYY-MM-DD)")
+    chart_type: Optional[Literal["bar", "line"]] = Field(None, description="Chart type (only for chart widgets)")
+    position: WidgetPosition = Field(..., description="Widget position in grid layout")
+
+    # UI state
+    expanded_rows: Optional[List[str]] = Field(None, description="List of expanded row keys")
+    column_order: Optional[List[int]] = Field(None, description="Order of columns (indices)")
+    column_sort: Optional[Dict[str, str]] = Field(None, description="Column sorting config")
+    display_mode: Optional[Literal["pivot-table", "multi-table", "single-metric-chart"]] = Field(None, description="Display mode")
+    date_range_type: Optional[Literal["absolute", "relative"]] = Field(None, description="Date range type")
+    relative_date_preset: Optional[str] = Field(None, description="Relative date preset")
+    visible_metrics: Optional[List[str]] = Field(None, description="Visible metrics in multi-table mode")
+    merge_threshold: Optional[int] = Field(None, description="Grouping/merge threshold")
+    dimension_sort_order: Optional[Literal["asc", "desc"]] = Field(None, description="Dimension sort order")
+    children_sort_config: Optional[Dict[str, str]] = Field(None, description="Child rows sort config")
+
+class WidgetUpdateRequest(BaseModel):
+    """Request to update a widget"""
+    type: Optional[Literal["table", "chart"]] = Field(None, description="Widget type")
+    title: Optional[str] = Field(None, min_length=1, max_length=100, description="Widget title")
+    dimensions: Optional[List[str]] = Field(None, description="Selected dimension IDs")
+    table_dimensions: Optional[List[str]] = Field(None, description="Selected table dimension IDs")
+    metrics: Optional[List[str]] = Field(None, description="Selected metric IDs")
+    filters: Optional[Dict[str, List[str]]] = Field(None, description="Dimension filters")
+    start_date: Optional[str] = Field(None, description="Start date (YYYY-MM-DD)")
+    end_date: Optional[str] = Field(None, description="End date (YYYY-MM-DD)")
+    chart_type: Optional[Literal["bar", "line"]] = Field(None, description="Chart type")
+    position: Optional[WidgetPosition] = Field(None, description="Widget position")
+
+    # UI state
+    expanded_rows: Optional[List[str]] = Field(None, description="List of expanded row keys")
+    column_order: Optional[List[int]] = Field(None, description="Order of columns (indices)")
+    column_sort: Optional[Dict[str, str]] = Field(None, description="Column sorting config")
+    display_mode: Optional[Literal["pivot-table", "multi-table", "single-metric-chart"]] = Field(None, description="Display mode")
+    date_range_type: Optional[Literal["absolute", "relative"]] = Field(None, description="Date range type")
+    relative_date_preset: Optional[str] = Field(None, description="Relative date preset")
+    visible_metrics: Optional[List[str]] = Field(None, description="Visible metrics in multi-table mode")
+    merge_threshold: Optional[int] = Field(None, description="Grouping/merge threshold")
+    dimension_sort_order: Optional[Literal["asc", "desc"]] = Field(None, description="Dimension sort order")
+    children_sort_config: Optional[Dict[str, str]] = Field(None, description="Child rows sort config")

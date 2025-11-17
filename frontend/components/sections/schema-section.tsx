@@ -19,7 +19,11 @@ import type {
   CalculatedMetricUpdate,
 } from '@/lib/types'
 
-export function SchemaSection() {
+interface SchemaSectionProps {
+  tableId?: string
+}
+
+export function SchemaSection({ tableId }: SchemaSectionProps) {
   const [schemaTab, setSchemaTab] = useState<'base' | 'calculated' | 'dimensions'>('base')
   const [isDetecting, setIsDetecting] = useState(false)
   const [detectionResult, setDetectionResult] = useState<string | null>(null)
@@ -81,13 +85,12 @@ export function SchemaSection() {
   })
 
   const handleCopySchema = (sourceTableId: string) => {
-    const activeTableId = tablesData?.active_table_id
-    if (!activeTableId) {
-      setDetectionResult('Error: No active table')
+    if (!tableId) {
+      setDetectionResult('Error: No table selected')
       return
     }
     if (confirm('This will overwrite your current schema for this table. Continue?')) {
-      copySchemaMutation.mutate({ source_table_id: sourceTableId, target_table_id: activeTableId })
+      copySchemaMutation.mutate({ source_table_id: sourceTableId, target_table_id: tableId })
     }
   }
 
@@ -118,9 +121,9 @@ export function SchemaSection() {
     schema,
     updatePivotConfig,
     isUpdatingPivotConfig,
-  } = useSchema()
+  } = useSchema(tableId)
 
-  const { metrics } = usePivotMetrics()
+  const { metrics } = usePivotMetrics(tableId)
 
   // Load current pivot config values when schema is loaded
   useEffect(() => {
@@ -146,10 +149,14 @@ export function SchemaSection() {
   }
 
   const handleDetectSchema = async () => {
+    if (!tableId) {
+      setDetectionResult('Error: No table selected')
+      return
+    }
     setIsDetecting(true)
     setDetectionResult(null)
     try {
-      const result = await detectSchema()
+      const result = await detectSchema(tableId)
       const metricsCount = result?.detected_base_metrics?.length || 0
       const dimensionsCount = result?.detected_dimensions?.length || 0
       setDetectionResult(

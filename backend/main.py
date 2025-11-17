@@ -19,7 +19,7 @@ from services.bigquery_service import (
 )
 from services.custom_dimension_service import get_custom_dimension_service
 from services.query_logger import initialize_query_logger
-from config import CUSTOM_DIMENSIONS_FILE, QUERY_LOGS_DB_PATH, table_registry
+from config import CUSTOM_DIMENSIONS_FILE, QUERY_LOGS_DB_PATH, table_registry, dashboard_registry
 from models.schemas import (
     FilterParams,
     PivotResponse,
@@ -56,7 +56,14 @@ from models.schemas import (
     TableConfigUpdateRequest,
     TableActivateRequest,
     SchemaCopyRequest,
-    SchemaTemplateRequest
+    SchemaTemplateRequest,
+    # Dashboard models
+    DashboardConfig,
+    DashboardListResponse,
+    DashboardCreateRequest,
+    DashboardUpdateRequest,
+    WidgetCreateRequest,
+    WidgetUpdateRequest
 )
 
 app = FastAPI(title="Search Analytics API", version="1.0.0")
@@ -85,7 +92,8 @@ def parse_dimension_filters(request: Request) -> Dict[str, List[str]]:
     # Reserved parameters that are not dimension filters
     reserved_params = {
         'start_date', 'end_date', 'dimensions', 'dimension_values',
-        'limit', 'offset', 'sort_by', 'granularity'
+        'limit', 'offset', 'sort_by', 'granularity', 'table_id', 'skip_count', 'metrics',
+        'date_range_type', 'relative_date_preset'
     }
 
     dimension_filters = {}
@@ -162,13 +170,6 @@ async def startup_event():
                     print(f"  ✓ Table initialized successfully")
                 except Exception as table_error:
                     print(f"  ✗ Failed to initialize table {table_info.name}: {table_error}")
-
-            active_id = table_registry.get_active_table_id()
-            if active_id:
-                active_table = table_registry.get_table(active_id)
-                print(f"\nActive table: {active_table.name} (ID: {active_id})")
-            else:
-                print("\nNo active table selected")
         else:
             print("No tables configured. Please configure via the UI at /info tab.")
     except Exception as e:
@@ -185,10 +186,10 @@ async def health_check():
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
 @app.get("/api/bigquery/info", response_model=BigQueryInfo)
-async def get_bigquery_information():
+async def get_bigquery_information(table_id: Optional[str] = Query(None, description="Optional table ID to get info for")):
     """Get BigQuery connection status and table information"""
     try:
-        return get_bigquery_info()
+        return get_bigquery_info(table_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -257,9 +258,6 @@ async def configure_bigquery(bq_config: BigQueryConfig):
                 max_date=bq_config.allowed_max_date
             )
 
-        # Activate this table
-        table_registry.activate_table(table_id)
-
         return BigQueryConfigResponse(
             success=True,
             message=message,
@@ -273,28 +271,30 @@ async def configure_bigquery(bq_config: BigQueryConfig):
         )
 
 @app.post("/api/bigquery/disconnect", response_model=BigQueryConfigResponse)
-async def disconnect_bigquery():
-    """Legacy endpoint - Disconnect BigQuery and clear the 'default' table configuration"""
+async def disconnect_bigquery(table_id: Optional[str] = Query(None, description="Table ID to disconnect")):
+    """Disconnect and delete a BigQuery table configuration"""
     try:
-        # Find and delete the default table if it exists
-        tables = table_registry.list_tables()
-        default_table = next((t for t in tables if t.name == "default"), None)
+        if not table_id:
+            raise HTTPException(status_code=400, detail="table_id is required")
 
-        if default_table:
-            table_registry.delete_table(default_table.table_id)
-            # Clear the BigQuery service for this table
-            from services.bigquery_service import _bq_services
-            if default_table.table_id in _bq_services:
-                del _bq_services[default_table.table_id]
-            message = "BigQuery disconnected successfully"
-        else:
-            message = "No default table found to disconnect"
+        # Delete the table
+        success = table_registry.delete_table(table_id)
+
+        if not success:
+            raise HTTPException(status_code=404, detail="Table not found")
+
+        # Clear the BigQuery service for this table
+        from services.bigquery_service import _bq_services
+        if table_id in _bq_services:
+            del _bq_services[table_id]
 
         return BigQueryConfigResponse(
             success=True,
-            message=message,
+            message="Table disconnected and deleted successfully",
             connection_status="not configured"
         )
+    except HTTPException:
+        raise
     except Exception as e:
         return BigQueryConfigResponse(
             success=False,
@@ -309,7 +309,6 @@ async def list_tables():
     """List all configured BigQuery table connections"""
     try:
         tables = table_registry.list_tables()
-        active_table_id = table_registry.get_active_table_id()
 
         table_responses = [
             TableInfoResponse(
@@ -319,16 +318,12 @@ async def list_tables():
                 dataset=t.dataset,
                 table=t.table,
                 created_at=t.created_at,
-                last_used_at=t.last_used_at,
-                is_active=(t.table_id == active_table_id)
+                last_used_at=t.last_used_at
             )
             for t in tables
         ]
 
-        return TableListResponse(
-            tables=table_responses,
-            active_table_id=active_table_id
-        )
+        return TableListResponse(tables=table_responses)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -384,7 +379,7 @@ async def create_table(request: TableCreateRequest):
                     auto_detect=True
                 )
             except Exception as e:
-                print(f"Schema auto-detection failed: {e}")
+                pass
 
         return TableInfoResponse(
             table_id=table_info.table_id,
@@ -407,8 +402,6 @@ async def get_table(table_id: str):
         if not table_info:
             raise HTTPException(status_code=404, detail="Table not found")
 
-        active_table_id = table_registry.get_active_table_id()
-
         return TableInfoResponse(
             table_id=table_info.table_id,
             name=table_info.name,
@@ -416,8 +409,7 @@ async def get_table(table_id: str):
             dataset=table_info.dataset,
             table=table_info.table,
             created_at=table_info.created_at,
-            last_used_at=table_info.last_used_at,
-            is_active=(table_info.table_id == active_table_id)
+            last_used_at=table_info.last_used_at
         )
     except HTTPException:
         raise
@@ -433,7 +425,6 @@ async def update_table(table_id: str, request: TableUpdateRequest):
             raise HTTPException(status_code=404, detail="Table not found")
 
         table_info = table_registry.get_table(table_id)
-        active_table_id = table_registry.get_active_table_id()
 
         return TableInfoResponse(
             table_id=table_info.table_id,
@@ -442,8 +433,7 @@ async def update_table(table_id: str, request: TableUpdateRequest):
             dataset=table_info.dataset,
             table=table_info.table,
             created_at=table_info.created_at,
-            last_used_at=table_info.last_used_at,
-            is_active=(table_info.table_id == active_table_id)
+            last_used_at=table_info.last_used_at
         )
     except HTTPException:
         raise
@@ -519,20 +509,6 @@ async def delete_table(table_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/api/tables/{table_id}/activate")
-async def activate_table(table_id: str):
-    """Activate a table for use"""
-    try:
-        success = table_registry.activate_table(table_id)
-        if not success:
-            raise HTTPException(status_code=404, detail="Table not found")
-
-        return {"success": True, "message": "Table activated", "table_id": table_id}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
 @app.post("/api/tables/schema/copy")
 async def copy_schema(request: SchemaCopyRequest):
     """Copy schema from one table to another"""
@@ -589,11 +565,11 @@ async def apply_schema_template(request: SchemaTemplateRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/bigquery/tables")
-async def list_bigquery_tables():
+async def list_bigquery_tables(table_id: Optional[str] = Query(None, description="Table ID to use")):
     """List all tables in the configured BigQuery dataset"""
     try:
         from services.bigquery_service import get_bigquery_service
-        bq_service = get_bigquery_service()
+        bq_service = get_bigquery_service(table_id)
 
         if bq_service is None:
             raise HTTPException(status_code=400, detail="BigQuery not configured")
@@ -604,31 +580,32 @@ async def list_bigquery_tables():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/bigquery/tables/{table_name}/dates")
-async def get_table_dates(table_name: str):
+async def get_table_dates(table_name: str, table_id: Optional[str] = Query(None, description="Table ID to use")):
     """Get date range for a specific table"""
     try:
         from services.bigquery_service import get_bigquery_service
-        bq_service = get_bigquery_service()
+        bq_service = get_bigquery_service(table_id)
 
         if bq_service is None:
             raise HTTPException(status_code=400, detail="BigQuery not configured")
 
-        date_info = bq_service.get_table_date_range(table_name)
+        # Use the table from the bq_service which corresponds to the table_id
+        date_info = bq_service.get_table_date_range()
         return date_info
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 # Schema Management Endpoints
 
-def get_schema_services():
-    """Helper to get schema, metric, and dimension services for the active table"""
+def get_schema_services(table_id: Optional[str] = None):
+    """Helper to get schema, metric, and dimension services for a table"""
     from services.bigquery_service import get_bigquery_service
     from services.metric_service import MetricService
     from services.dimension_service import DimensionService
 
-    bq_service = get_bigquery_service()
+    bq_service = get_bigquery_service(table_id)
     if bq_service is None:
-        raise HTTPException(status_code=400, detail="BigQuery not configured")
+        return None  # No BigQuery configured - return None instead of raising exception
 
     # Use the schema service from bq_service which has the correct table_id
     if not bq_service.schema_service:
@@ -641,19 +618,35 @@ def get_schema_services():
     return schema_service, metric_service, dimension_service
 
 @app.get("/api/schema", response_model=SchemaConfig)
-async def get_schema():
+async def get_schema(table_id: Optional[str] = Query(None, description="Table ID to get schema for")):
     """Get current schema configuration"""
     try:
-        schema_service, _, _ = get_schema_services()
+        services = get_schema_services(table_id)
+        if services is None:
+            # No tables configured - return empty schema
+            from datetime import datetime
+            now = datetime.utcnow().isoformat()
+            return SchemaConfig(
+                base_metrics=[],
+                calculated_metrics=[],
+                dimensions=[],
+                created_at=now,
+                updated_at=now
+            )
+
+        schema_service, _, _ = services
         schema = schema_service.load_schema()
 
         if schema is None:
-            # Auto-create schema if it doesn't exist
-            schema = schema_service.get_or_create_schema(
-                project_id=config.BIGQUERY_PROJECT_ID,
-                dataset=config.BIGQUERY_DATASET,
-                table=config.BIGQUERY_TABLE,
-                auto_detect=True
+            # Return empty schema if it doesn't exist - user must explicitly detect or create schema
+            from datetime import datetime
+            now = datetime.utcnow().isoformat()
+            return SchemaConfig(
+                base_metrics=[],
+                calculated_metrics=[],
+                dimensions=[],
+                created_at=now,
+                updated_at=now
             )
 
         return schema
@@ -663,14 +656,14 @@ async def get_schema():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/schema/detect", response_model=SchemaDetectionResult)
-async def detect_schema():
+async def detect_schema(table_id: Optional[str] = Query(None, description="Table ID to detect schema for")):
     """Auto-detect schema from BigQuery table and save it"""
     try:
         from services.bigquery_service import get_bigquery_service
 
-        bq_service = get_bigquery_service()
+        bq_service = get_bigquery_service(table_id)
         if bq_service is None:
-            raise HTTPException(status_code=400, detail="BigQuery not configured")
+            raise HTTPException(status_code=400, detail="BigQuery not configured or table not found")
 
         schema_service = bq_service.schema_service
         if not schema_service:
@@ -701,25 +694,42 @@ async def detect_schema():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/schema/reset")
-async def reset_schema():
-    """Reset schema to default configuration"""
+async def reset_schema(table_id: Optional[str] = Query(None, description="Table ID to reset schema for")):
+    """Reset schema to empty configuration"""
     try:
-        schema_service, _, _ = get_schema_services()
+        services = get_schema_services(table_id)
+        if services is None:
+            raise HTTPException(status_code=400, detail="No table selected or BigQuery not configured")
 
-        default_schema = schema_service.create_default_schema()
-        schema_service.save_schema(default_schema)
+        schema_service, _, _ = services
 
-        return {"success": True, "message": "Schema reset to default configuration"}
+        # Create empty schema instead of default with hardcoded metrics
+        from datetime import datetime
+        now = datetime.utcnow().isoformat()
+        empty_schema = SchemaConfig(
+            base_metrics=[],
+            calculated_metrics=[],
+            dimensions=[],
+            created_at=now,
+            updated_at=now
+        )
+        schema_service.save_schema(empty_schema)
+
+        return {"success": True, "message": "Schema reset to empty configuration"}
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.patch("/api/schema/pivot-config", response_model=SchemaConfig)
-async def update_pivot_config(update: PivotConfigUpdate):
+async def update_pivot_config(update: PivotConfigUpdate, table_id: Optional[str] = Query(None, description="Table ID to update pivot config for")):
     """Update pivot table configuration settings"""
     try:
-        schema_service, _, _ = get_schema_services()
+        services = get_schema_services(table_id)
+        if services is None:
+            raise HTTPException(status_code=400, detail="No table selected or BigQuery not configured")
+
+        schema_service, _, _ = services
 
         # Load existing schema
         schema = schema_service.load_schema()
@@ -762,10 +772,13 @@ async def update_pivot_config(update: PivotConfigUpdate):
 # Base Metrics Endpoints
 
 @app.get("/api/metrics/base", response_model=List[BaseMetric])
-async def list_base_metrics():
+async def list_base_metrics(table_id: Optional[str] = Query(None, description="Table ID to get metrics for")):
     """List all base metrics"""
     try:
-        _, metric_service, _ = get_schema_services()
+        services = get_schema_services(table_id)
+        if services is None:
+            return []  # No tables configured
+        _, metric_service, _ = services
         return metric_service.list_base_metrics()
     except HTTPException:
         raise
@@ -826,10 +839,10 @@ async def update_base_metric(metric_id: str, update: MetricUpdate):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/api/metrics/base/{metric_id}")
-async def delete_base_metric(metric_id: str):
+async def delete_base_metric(metric_id: str, table_id: Optional[str] = Query(None, description="Table ID")):
     """Delete a base metric"""
     try:
-        _, metric_service, _ = get_schema_services()
+        _, metric_service, _ = get_schema_services(table_id)
         metric_service.delete_base_metric(metric_id)
         return {"success": True, "message": f"Base metric '{metric_id}' deleted"}
     except HTTPException:
@@ -842,10 +855,13 @@ async def delete_base_metric(metric_id: str):
 # Calculated Metrics Endpoints
 
 @app.get("/api/metrics/calculated", response_model=List[CalculatedMetric])
-async def list_calculated_metrics():
+async def list_calculated_metrics(table_id: Optional[str] = Query(None, description="Table ID to get metrics for")):
     """List all calculated metrics"""
     try:
-        _, metric_service, _ = get_schema_services()
+        services = get_schema_services(table_id)
+        if services is None:
+            return []  # No tables configured
+        _, metric_service, _ = services
         return metric_service.list_calculated_metrics()
     except HTTPException:
         raise
@@ -853,10 +869,10 @@ async def list_calculated_metrics():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/metrics/calculated", response_model=CalculatedMetric)
-async def create_calculated_metric(metric: CalculatedMetricCreate):
+async def create_calculated_metric(metric: CalculatedMetricCreate, table_id: Optional[str] = Query(None, description="Table ID")):
     """Create a new calculated metric"""
     try:
-        _, metric_service, _ = get_schema_services()
+        _, metric_service, _ = get_schema_services(table_id)
         return metric_service.create_calculated_metric(metric)
     except HTTPException:
         raise
@@ -882,10 +898,10 @@ async def get_calculated_metric(metric_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.put("/api/metrics/calculated/{metric_id}")
-async def update_calculated_metric(metric_id: str, update: CalculatedMetricUpdate):
+async def update_calculated_metric(metric_id: str, update: CalculatedMetricUpdate, table_id: Optional[str] = Query(None)):
     """Update a calculated metric and cascade update dependents"""
     try:
-        _, metric_service, _ = get_schema_services()
+        _, metric_service, _ = get_schema_services(table_id)
 
         # Update the calculated metric
         updated_metric = metric_service.update_calculated_metric(metric_id, update)
@@ -906,10 +922,10 @@ async def update_calculated_metric(metric_id: str, update: CalculatedMetricUpdat
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/api/metrics/calculated/{metric_id}")
-async def delete_calculated_metric(metric_id: str):
+async def delete_calculated_metric(metric_id: str, table_id: Optional[str] = Query(None, description="Table ID")):
     """Delete a calculated metric"""
     try:
-        _, metric_service, _ = get_schema_services()
+        _, metric_service, _ = get_schema_services(table_id)
         metric_service.delete_calculated_metric(metric_id)
         return {"success": True, "message": f"Calculated metric '{metric_id}' deleted"}
     except HTTPException:
@@ -934,10 +950,13 @@ async def validate_formula(formula: dict):
 # Dimensions Endpoints
 
 @app.get("/api/dimensions", response_model=List[DimensionDef])
-async def list_dimensions():
+async def list_dimensions(table_id: Optional[str] = Query(None, description="Table ID to get dimensions for")):
     """List all dimensions"""
     try:
-        _, _, dimension_service = get_schema_services()
+        services = get_schema_services(table_id)
+        if services is None:
+            return []  # No tables configured
+        _, _, dimension_service = services
         return dimension_service.list_dimensions()
     except HTTPException:
         raise
@@ -945,10 +964,10 @@ async def list_dimensions():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/dimensions", response_model=DimensionDef)
-async def create_dimension(dimension: DimensionCreate):
+async def create_dimension(dimension: DimensionCreate, table_id: Optional[str] = Query(None)):
     """Create a new dimension"""
     try:
-        _, _, dimension_service = get_schema_services()
+        _, _, dimension_service = get_schema_services(table_id)
         return dimension_service.create_dimension(dimension)
     except HTTPException:
         raise
@@ -958,19 +977,25 @@ async def create_dimension(dimension: DimensionCreate):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/dimensions/filterable", response_model=List[DimensionDef])
-async def list_filterable_dimensions():
+async def list_filterable_dimensions(table_id: Optional[str] = Query(None, description="Table ID to get dimensions for")):
     """Get all filterable dimensions"""
     try:
-        _, _, dimension_service = get_schema_services()
+        services = get_schema_services(table_id)
+        if services is None:
+            return []  # No tables configured
+        _, _, dimension_service = services
         return dimension_service.list_filterable_dimensions()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/dimensions/groupable", response_model=List[DimensionDef])
-async def list_groupable_dimensions():
+async def list_groupable_dimensions(table_id: Optional[str] = Query(None, description="Table ID to get dimensions for")):
     """Get all groupable dimensions"""
     try:
-        _, _, dimension_service = get_schema_services()
+        services = get_schema_services(table_id)
+        if services is None:
+            return []  # No tables configured
+        _, _, dimension_service = services
         return dimension_service.list_groupable_dimensions()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -992,10 +1017,10 @@ async def get_dimension(dimension_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.put("/api/dimensions/{dimension_id}", response_model=DimensionDef)
-async def update_dimension(dimension_id: str, update: DimensionUpdate):
+async def update_dimension(dimension_id: str, update: DimensionUpdate, table_id: Optional[str] = Query(None)):
     """Update a dimension"""
     try:
-        _, _, dimension_service = get_schema_services()
+        _, _, dimension_service = get_schema_services(table_id)
         return dimension_service.update_dimension(dimension_id, update)
     except HTTPException:
         raise
@@ -1005,10 +1030,10 @@ async def update_dimension(dimension_id: str, update: DimensionUpdate):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/api/dimensions/{dimension_id}")
-async def delete_dimension(dimension_id: str):
+async def delete_dimension(dimension_id: str, table_id: Optional[str] = Query(None, description="Table ID")):
     """Delete a dimension"""
     try:
-        _, _, dimension_service = get_schema_services()
+        _, _, dimension_service = get_schema_services(table_id)
         dimension_service.delete_dimension(dimension_id)
         return {"success": True, "message": f"Dimension '{dimension_id}' deleted"}
     except HTTPException:
@@ -1089,8 +1114,13 @@ async def get_pivot_table(
     dimension_values: Optional[List[str]] = Query(None, description="Specific dimension values to fetch (for multi-table matching)"),
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
+    date_range_type: Optional[str] = "absolute",
+    relative_date_preset: Optional[str] = None,
     limit: int = 50,
     offset: int = 0,
+    table_id: Optional[str] = Query(None, description="Optional table ID for multi-table widget support"),
+    skip_count: bool = Query(False, description="Skip count query for initial load (saves 1 BigQuery query)"),
+    metrics: Optional[List[str]] = Query(None, description="Optional list of metric IDs to calculate (default: all metrics)"),
 ):
     """
     Get pivot table data grouped by specified dimension(s).
@@ -1098,6 +1128,10 @@ async def get_pivot_table(
     Supports dynamic dimension filtering via query parameters:
     - Multi-select: ?country=USA&country=Canada&channel=Web
     - Single-select: ?channel=App
+    - Table selection: ?table_id=abc123 (for widget multi-table support)
+    - Performance: ?skip_count=true (skip count query on initial load)
+    - Performance: ?metrics=queries&metrics=revenue (only calculate specified metrics)
+    - Relative dates: ?date_range_type=relative&relative_date_preset=last_7_days
     """
     try:
         # Parse dynamic dimension filters from query parameters
@@ -1106,9 +1140,11 @@ async def get_pivot_table(
         filters = FilterParams(
             start_date=start_date,
             end_date=end_date,
+            date_range_type=date_range_type,
+            relative_date_preset=relative_date_preset,
             dimension_filters=dimension_filters
         )
-        return data_service.get_pivot_data(dimensions, filters, limit, offset, dimension_values)
+        return data_service.get_pivot_data(dimensions, filters, limit, offset, dimension_values, table_id, skip_count, metrics)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1117,6 +1153,8 @@ async def get_all_pivot_children(
     request: Request,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
+    date_range_type: Optional[str] = "absolute",
+    relative_date_preset: Optional[str] = None,
     limit: int = 100,
     offset: int = 0,
 ):
@@ -1128,6 +1166,8 @@ async def get_all_pivot_children(
         filters = FilterParams(
             start_date=start_date,
             end_date=end_date,
+            date_range_type=date_range_type,
+            relative_date_preset=relative_date_preset,
             dimension_filters=dimension_filters
         )
         return data_service.get_pivot_children('', '', filters, limit, offset)
@@ -1141,6 +1181,8 @@ async def get_pivot_children(
     value: str,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
+    date_range_type: Optional[str] = "absolute",
+    relative_date_preset: Optional[str] = None,
     limit: int = 100,
     offset: int = 0,
 ):
@@ -1152,6 +1194,8 @@ async def get_pivot_children(
         filters = FilterParams(
             start_date=start_date,
             end_date=end_date,
+            date_range_type=date_range_type,
+            relative_date_preset=relative_date_preset,
             dimension_filters=dimension_filters
         )
         return data_service.get_pivot_children(dimension, value, filters, limit, offset)
@@ -1164,6 +1208,9 @@ async def get_dimension_values(
     dimension: str,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
+    date_range_type: Optional[str] = "absolute",
+    relative_date_preset: Optional[str] = None,
+    table_id: Optional[str] = Query(None),
 ):
     """
     Get distinct values for a given dimension.
@@ -1178,9 +1225,11 @@ async def get_dimension_values(
         filters = FilterParams(
             start_date=start_date,
             end_date=end_date,
+            date_range_type=date_range_type,
+            relative_date_preset=relative_date_preset,
             dimension_filters=dimension_filters
         )
-        return data_svc.get_dimension_values(dimension, filters)
+        return data_svc.get_dimension_values(dimension, filters, table_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1302,6 +1351,130 @@ async def clear_query_logs():
             message=f"Successfully cleared {deleted_count} log entries",
             logs_deleted=deleted_count
         )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# DASHBOARD ENDPOINTS
+# ============================================================================
+
+@app.get("/api/dashboards", response_model=DashboardListResponse)
+async def list_dashboards():
+    """Get list of all dashboards"""
+    try:
+        dashboards = dashboard_registry.list_dashboards()
+        return DashboardListResponse(dashboards=dashboards)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/dashboards", response_model=DashboardConfig)
+async def create_dashboard(request: DashboardCreateRequest):
+    """Create a new dashboard"""
+    try:
+        dashboard = dashboard_registry.create_dashboard(
+            name=request.name,
+            description=request.description
+        )
+        return dashboard
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/dashboards/{dashboard_id}", response_model=DashboardConfig)
+async def get_dashboard(dashboard_id: str):
+    """Get a specific dashboard by ID"""
+    try:
+        dashboard = dashboard_registry.get_dashboard(dashboard_id)
+        if not dashboard:
+            raise HTTPException(status_code=404, detail=f"Dashboard {dashboard_id} not found")
+        return dashboard
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/api/dashboards/{dashboard_id}", response_model=DashboardConfig)
+async def update_dashboard(dashboard_id: str, request: DashboardUpdateRequest):
+    """Update a dashboard (name, description, or complete widget list)"""
+    try:
+        dashboard = dashboard_registry.update_dashboard(
+            dashboard_id=dashboard_id,
+            name=request.name,
+            description=request.description,
+            widgets=[w.dict() for w in request.widgets] if request.widgets else None
+        )
+        if not dashboard:
+            raise HTTPException(status_code=404, detail=f"Dashboard {dashboard_id} not found")
+        return dashboard
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/dashboards/{dashboard_id}")
+async def delete_dashboard(dashboard_id: str):
+    """Delete a dashboard"""
+    try:
+        success = dashboard_registry.delete_dashboard(dashboard_id)
+        if not success:
+            raise HTTPException(status_code=404, detail=f"Dashboard {dashboard_id} not found")
+        return {"success": True, "message": f"Dashboard {dashboard_id} deleted successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/dashboards/{dashboard_id}/widgets", response_model=DashboardConfig)
+async def add_widget(dashboard_id: str, request: WidgetCreateRequest):
+    """Add a widget to a dashboard"""
+    try:
+        widget_config = request.dict()
+        dashboard = dashboard_registry.add_widget(dashboard_id, widget_config)
+        if not dashboard:
+            raise HTTPException(status_code=404, detail=f"Dashboard {dashboard_id} not found")
+        return dashboard
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/api/dashboards/{dashboard_id}/widgets/{widget_id}", response_model=DashboardConfig)
+async def update_widget(dashboard_id: str, widget_id: str, request: WidgetUpdateRequest):
+    """Update a widget in a dashboard"""
+    try:
+        widget_updates = {k: v for k, v in request.dict().items() if v is not None}
+        dashboard = dashboard_registry.update_widget(dashboard_id, widget_id, widget_updates)
+        if not dashboard:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Dashboard {dashboard_id} or widget {widget_id} not found"
+            )
+        return dashboard
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/dashboards/{dashboard_id}/widgets/{widget_id}", response_model=DashboardConfig)
+async def delete_widget(dashboard_id: str, widget_id: str):
+    """Delete a widget from a dashboard"""
+    try:
+        dashboard = dashboard_registry.delete_widget(dashboard_id, widget_id)
+        if not dashboard:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Dashboard {dashboard_id} or widget {widget_id} not found"
+            )
+        return dashboard
     except HTTPException:
         raise
     except Exception as e:

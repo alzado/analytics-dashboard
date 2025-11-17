@@ -10,11 +10,13 @@ from datetime import datetime
 
 # File paths for multi-table configuration
 TABLES_REGISTRY_FILE = "/app/config/tables_registry.json"
-ACTIVE_TABLE_FILE = "/app/config/active_table.json"
 TABLE_CONFIGS_DIR = "/app/config/table_configs"
 SCHEMAS_DIR = "/app/config/schemas"  # Per-table schema directory
 CUSTOM_DIMENSIONS_FILE = "/app/config/custom_dimensions.json"
 QUERY_LOGS_DB_PATH = "/app/config/query_logs.db"
+
+# Dashboard configuration paths
+DASHBOARDS_DIR = "/app/config/dashboards"
 
 # Legacy paths for migration
 LEGACY_CONFIG_FILE = "/app/config/bigquery_config.json"
@@ -84,7 +86,6 @@ class TableRegistry:
     def _migrate_legacy_config(self) -> None:
         """Migrate old single-table config to new multi-table structure."""
         if os.path.exists(LEGACY_CONFIG_FILE) and not os.path.exists(TABLES_REGISTRY_FILE):
-            print("Migrating legacy config to multi-table structure...")
             try:
                 # Load legacy config
                 with open(LEGACY_CONFIG_FILE, 'r') as f:
@@ -103,7 +104,6 @@ class TableRegistry:
                 # Save to new structure
                 self._save_table_config(default_id, legacy_data)
                 self._save_registry({'tables': [table_info.to_dict()]})
-                self._set_active_table(default_id)
 
                 # Migrate schema if exists
                 if os.path.exists(LEGACY_SCHEMA_FILE):
@@ -113,9 +113,8 @@ class TableRegistry:
                     with open(schema_target, 'w') as f:
                         json.dump(schema_data, f, indent=2)
 
-                print("Migration completed successfully")
             except Exception as e:
-                print(f"Migration failed: {e}")
+                pass
 
     def _load_registry(self) -> None:
         """Load tables registry from file."""
@@ -192,10 +191,6 @@ class TableRegistry:
         self.tables[table_id] = table_info
         self._save_registry({'tables': [t.to_dict() for t in self.tables.values()]})
 
-        # If this is the first table, make it active
-        if len(self.tables) == 1:
-            self._set_active_table(table_id)
-
         return table_info
 
     def update_table(self, table_id: str, name: str) -> bool:
@@ -225,10 +220,6 @@ class TableRegistry:
         schema_path = self.get_schema_path(table_id)
         if os.path.exists(schema_path):
             os.remove(schema_path)
-
-        # If this was the active table, switch to first available
-        if self.get_active_table_id() == table_id and self.tables:
-            self._set_active_table(list(self.tables.keys())[0])
 
         return True
 
@@ -277,48 +268,173 @@ class TableRegistry:
 
         return True
 
-    def get_active_table_id(self) -> Optional[str]:
-        """Get the currently active table ID."""
-        if not os.path.exists(ACTIVE_TABLE_FILE):
-            # If no active table set, use first available
-            if self.tables:
-                first_id = list(self.tables.keys())[0]
-                self._set_active_table(first_id)
-                return first_id
+
+class DashboardRegistry:
+    """Registry for managing custom dashboards."""
+
+    def __init__(self):
+        """Initialize dashboard registry."""
+        self._ensure_directories()
+
+    def _ensure_directories(self) -> None:
+        """Create necessary directories if they don't exist."""
+        os.makedirs(DASHBOARDS_DIR, exist_ok=True)
+
+    def _get_dashboard_path(self, dashboard_id: str) -> str:
+        """Get path to dashboard configuration file."""
+        return os.path.join(DASHBOARDS_DIR, f"dashboard_{dashboard_id}.json")
+
+    def list_dashboards(self) -> List[Dict]:
+        """Get list of all dashboards."""
+        dashboards = []
+        if not os.path.exists(DASHBOARDS_DIR):
+            return dashboards
+
+        for filename in os.listdir(DASHBOARDS_DIR):
+            if filename.startswith("dashboard_") and filename.endswith(".json"):
+                dashboard_id = filename.replace("dashboard_", "").replace(".json", "")
+                dashboard = self.get_dashboard(dashboard_id)
+                if dashboard:
+                    dashboards.append(dashboard)
+
+        # Sort by updated_at (most recent first)
+        dashboards.sort(key=lambda x: x.get('updated_at', ''), reverse=True)
+        return dashboards
+
+    def get_dashboard(self, dashboard_id: str) -> Optional[Dict]:
+        """Get dashboard configuration by ID."""
+        dashboard_path = self._get_dashboard_path(dashboard_id)
+        if not os.path.exists(dashboard_path):
             return None
 
         try:
-            with open(ACTIVE_TABLE_FILE, 'r') as f:
-                data = json.load(f)
-                return data.get('active_table_id')
-        except Exception:
+            with open(dashboard_path, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Failed to load dashboard {dashboard_id}: {e}")
             return None
 
-    def _set_active_table(self, table_id: str) -> None:
-        """Set the active table (internal use)."""
-        with open(ACTIVE_TABLE_FILE, 'w') as f:
-            json.dump({'active_table_id': table_id}, f)
+    def create_dashboard(self, name: str, description: Optional[str] = None) -> Dict:
+        """Create a new dashboard."""
+        dashboard_id = str(uuid.uuid4())
+        now = datetime.utcnow().isoformat()
 
-    def activate_table(self, table_id: str) -> bool:
-        """Activate a table for use."""
-        if table_id not in self.tables:
+        dashboard = {
+            'id': dashboard_id,
+            'name': name,
+            'description': description,
+            'widgets': [],
+            'created_at': now,
+            'updated_at': now
+        }
+
+        self._save_dashboard(dashboard_id, dashboard)
+        return dashboard
+
+    def update_dashboard(
+        self,
+        dashboard_id: str,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        widgets: Optional[List[Dict]] = None
+    ) -> Optional[Dict]:
+        """Update dashboard configuration."""
+        dashboard = self.get_dashboard(dashboard_id)
+        if not dashboard:
+            return None
+
+        # Update fields
+        if name is not None:
+            dashboard['name'] = name
+        if description is not None:
+            dashboard['description'] = description
+        if widgets is not None:
+            dashboard['widgets'] = widgets
+
+        dashboard['updated_at'] = datetime.utcnow().isoformat()
+
+        self._save_dashboard(dashboard_id, dashboard)
+        return dashboard
+
+    def delete_dashboard(self, dashboard_id: str) -> bool:
+        """Delete a dashboard."""
+        dashboard_path = self._get_dashboard_path(dashboard_id)
+        if not os.path.exists(dashboard_path):
             return False
 
-        self._set_active_table(table_id)
+        try:
+            os.remove(dashboard_path)
+            return True
+        except Exception as e:
+            print(f"Failed to delete dashboard {dashboard_id}: {e}")
+            return False
 
-        # Update last used timestamp
-        self.tables[table_id].last_used_at = datetime.utcnow().isoformat()
-        self._save_registry({'tables': [t.to_dict() for t in self.tables.values()]})
+    def add_widget(self, dashboard_id: str, widget_config: Dict) -> Optional[Dict]:
+        """Add a widget to a dashboard."""
+        dashboard = self.get_dashboard(dashboard_id)
+        if not dashboard:
+            return None
 
-        return True
+        # Add timestamps to widget
+        now = datetime.utcnow().isoformat()
+        widget_config['id'] = str(uuid.uuid4())
+        widget_config['created_at'] = now
+        widget_config['updated_at'] = now
 
-    def get_active_table(self) -> Optional[TableInfo]:
-        """Get the currently active table info."""
-        active_id = self.get_active_table_id()
-        if active_id:
-            return self.tables.get(active_id)
-        return None
+        # Add widget to dashboard
+        dashboard['widgets'].append(widget_config)
+        dashboard['updated_at'] = now
+
+        self._save_dashboard(dashboard_id, dashboard)
+        return dashboard
+
+    def update_widget(
+        self,
+        dashboard_id: str,
+        widget_id: str,
+        widget_updates: Dict
+    ) -> Optional[Dict]:
+        """Update a widget in a dashboard."""
+        dashboard = self.get_dashboard(dashboard_id)
+        if not dashboard:
+            return None
+
+        # Find and update widget
+        widget_found = False
+        for widget in dashboard['widgets']:
+            if widget['id'] == widget_id:
+                widget.update(widget_updates)
+                widget['updated_at'] = datetime.utcnow().isoformat()
+                widget_found = True
+                break
+
+        if not widget_found:
+            return None
+
+        dashboard['updated_at'] = datetime.utcnow().isoformat()
+        self._save_dashboard(dashboard_id, dashboard)
+        return dashboard
+
+    def delete_widget(self, dashboard_id: str, widget_id: str) -> Optional[Dict]:
+        """Delete a widget from a dashboard."""
+        dashboard = self.get_dashboard(dashboard_id)
+        if not dashboard:
+            return None
+
+        # Remove widget
+        dashboard['widgets'] = [w for w in dashboard['widgets'] if w['id'] != widget_id]
+        dashboard['updated_at'] = datetime.utcnow().isoformat()
+
+        self._save_dashboard(dashboard_id, dashboard)
+        return dashboard
+
+    def _save_dashboard(self, dashboard_id: str, dashboard: Dict) -> None:
+        """Save dashboard configuration to file."""
+        dashboard_path = self._get_dashboard_path(dashboard_id)
+        with open(dashboard_path, 'w') as f:
+            json.dump(dashboard, f, indent=2)
 
 
-# Global table registry instance
+# Global registry instances
 table_registry = TableRegistry()
+dashboard_registry = DashboardRegistry()

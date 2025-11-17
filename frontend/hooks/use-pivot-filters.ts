@@ -1,9 +1,11 @@
 import { useState, useCallback } from 'react'
-import type { FilterParams } from '@/lib/types'
+import type { FilterParams, DateRangeType, RelativeDatePreset } from '@/lib/types'
 
 export interface PivotFiltersState {
   start_date: string | null
   end_date: string | null
+  date_range_type: DateRangeType
+  relative_date_preset: RelativeDatePreset | null
   dimension_filters: Record<string, string[]>
 }
 
@@ -11,6 +13,8 @@ export function usePivotFilters(initialFilters?: Partial<FilterParams>) {
   const [filters, setFilters] = useState<PivotFiltersState>({
     start_date: initialFilters?.start_date || null,
     end_date: initialFilters?.end_date || null,
+    date_range_type: (initialFilters?.date_range_type as DateRangeType) || 'absolute',
+    relative_date_preset: (initialFilters?.relative_date_preset as RelativeDatePreset) || null,
     dimension_filters: initialFilters?.dimension_filters || {},
   })
 
@@ -79,9 +83,16 @@ export function usePivotFilters(initialFilters?: Partial<FilterParams>) {
   }, [])
 
   // Update date range
-  const updateDateRange = useCallback((startDate: string | null, endDate: string | null) => {
+  const updateDateRange = useCallback((
+    type: DateRangeType,
+    preset: RelativeDatePreset | null,
+    startDate: string | null,
+    endDate: string | null
+  ) => {
     setFilters(prev => ({
       ...prev,
+      date_range_type: type,
+      relative_date_preset: preset,
       start_date: startDate,
       end_date: endDate,
     }))
@@ -92,6 +103,8 @@ export function usePivotFilters(initialFilters?: Partial<FilterParams>) {
     setFilters({
       start_date: null,
       end_date: null,
+      date_range_type: 'absolute',
+      relative_date_preset: null,
       dimension_filters: {},
     })
   }, [])
@@ -107,7 +120,7 @@ export function usePivotFilters(initialFilters?: Partial<FilterParams>) {
   // Get active filter count
   const getActiveFilterCount = useCallback(() => {
     let count = 0
-    if (filters.start_date || filters.end_date) count += 1
+    if (filters.start_date || filters.end_date || filters.relative_date_preset) count += 1
     count += Object.keys(filters.dimension_filters).length
     return count
   }, [filters])
@@ -127,6 +140,8 @@ export function usePivotFilters(initialFilters?: Partial<FilterParams>) {
     return {
       start_date: filters.start_date,
       end_date: filters.end_date,
+      date_range_type: filters.date_range_type,
+      relative_date_preset: filters.relative_date_preset,
       dimension_filters: filters.dimension_filters,
     }
   }, [filters])

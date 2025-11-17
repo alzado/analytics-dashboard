@@ -291,6 +291,22 @@ class MetricService:
         if not schema:
             raise ValueError("Schema not found. Please initialize schema first.")
 
+        # Auto-generate ID from display name if not provided
+        if not metric_data.id:
+            import re
+            # Convert display name to snake_case ID
+            metric_id = re.sub(r'[^\w\s-]', '', metric_data.display_name.lower())
+            metric_id = re.sub(r'[-\s]+', '_', metric_id)
+
+            # Ensure uniqueness by appending number if needed
+            base_id = metric_id
+            counter = 1
+            while any(m.id == metric_id for m in schema.calculated_metrics):
+                metric_id = f"{base_id}_{counter}"
+                counter += 1
+
+            metric_data.id = metric_id
+
         # Check for duplicate ID
         if any(m.id == metric_data.id for m in schema.calculated_metrics):
             raise ValueError(f"Calculated metric with ID '{metric_data.id}' already exists")
@@ -607,16 +623,12 @@ class MetricService:
         Returns:
             Dict with: {updated_count: int, updated_metrics: List[str]}
         """
-        print(f"🔄 CASCADE UPDATE triggered for {metric_type} metric '{metric_id}'")
-
         schema = self.schema_service.load_schema()
         if not schema:
-            print("❌ No schema found")
             return {'updated_count': 0, 'updated_metrics': []}
 
         # Find all metrics that need updating
         dependent_ids = self.get_all_dependents(metric_id, metric_type)
-        print(f"📊 Found {len(dependent_ids)} dependent metrics: {dependent_ids}")
 
         if not dependent_ids:
             return {'updated_count': 0, 'updated_metrics': []}
@@ -642,21 +654,17 @@ class MetricService:
 
                 if parse_errors:
                     # Log error but continue with other metrics
-                    print(f"Warning: Error re-parsing metric '{dep_id}': {', '.join(parse_errors)}")
                     continue
 
                 # Update the metric
-                old_sql = metric.sql_expression
                 metric.sql_expression = sql_expression
                 metric.depends_on = depends_on
                 metric.depends_on_base = depends_on_base
                 metric.depends_on_calculated = depends_on_calculated
 
                 updated_metrics.append(dep_id)
-                print(f"  ✓ Updated '{dep_id}': SQL changed from '{old_sql[:80]}...' to '{sql_expression[:80]}...'")
 
             except Exception as e:
-                print(f"Warning: Exception re-parsing metric '{dep_id}': {str(e)}")
                 continue
 
         # Save updated schema

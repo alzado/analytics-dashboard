@@ -3,15 +3,17 @@
 import { useState, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { fetchBigQueryInfo, configureBigQuery, disconnectBigQuery, fetchTables, activateTable, deleteTable } from '@/lib/api'
-import { Database, Calendar, HardDrive, Table, CheckCircle, AlertCircle, Settings, Plus, Trash2, Layers } from 'lucide-react'
+import { fetchBigQueryInfo, configureBigQuery, disconnectBigQuery, fetchTables, createTable } from '@/lib/api'
+import { Database, Calendar, HardDrive, Table, CheckCircle, AlertCircle, Settings } from 'lucide-react'
 import type { BigQueryConfig } from '@/lib/types'
-import { CreateTableModal } from '@/components/modals/create-table-modal'
 
-export function BigQueryInfoSection() {
+interface BigQueryInfoSectionProps {
+  tableId?: string
+}
+
+export function BigQueryInfoSection({ tableId }: BigQueryInfoSectionProps) {
   const router = useRouter()
   const queryClient = useQueryClient()
-  const [showCreateTableModal, setShowCreateTableModal] = useState(false)
   const [formData, setFormData] = useState<BigQueryConfig>({
     project_id: '',
     dataset: '',
@@ -21,12 +23,19 @@ export function BigQueryInfoSection() {
     allowed_min_date: null,
     allowed_max_date: null
   })
+  const [tableName, setTableName] = useState<string>('')
   const [showSuccess, setShowSuccess] = useState(false)
 
+  // Fetch available tables for table management section
+  const { data: tablesData } = useQuery({
+    queryKey: ['tables'],
+    queryFn: fetchTables,
+  })
+
   const { data: info, isLoading, error } = useQuery({
-    queryKey: ['bigquery-info'],
-    queryFn: fetchBigQueryInfo,
-    refetchInterval: 60000, // Refresh every minute
+    queryKey: ['bigquery-info', tableId],
+    queryFn: () => fetchBigQueryInfo(tableId || undefined),
+    enabled: true,
   })
 
   const configureMutation = useMutation({
@@ -35,8 +44,10 @@ export function BigQueryInfoSection() {
       console.log('Configuration response:', response)
       if (response.success) {
         setShowSuccess(true)
+        // Refresh both tables list and bigquery info
         queryClient.invalidateQueries({ queryKey: ['bigquery-info'] })
-        // Clear only credentials and date limits, keep connection details
+        queryClient.invalidateQueries({ queryKey: ['tables'] })
+        // Clear only credentials, keep connection details
         setFormData(prev => ({
           ...prev,
           use_adc: true,
@@ -44,14 +55,39 @@ export function BigQueryInfoSection() {
           allowed_min_date: null,
           allowed_max_date: null
         }))
-        // Navigate to overview page after successful configuration
+        // Hide success message after 3 seconds
         setTimeout(() => {
-          router.push('/')
-        }, 1000)
+          setShowSuccess(false)
+        }, 3000)
       }
     },
     onError: (error) => {
       console.error('Configuration error:', error)
+    }
+  })
+
+  const createTableMutation = useMutation({
+    mutationFn: createTable,
+    onSuccess: () => {
+      setShowSuccess(true)
+      queryClient.invalidateQueries({ queryKey: ['tables'] })
+      // Clear form
+      setFormData({
+        project_id: '',
+        dataset: '',
+        table: '',
+        use_adc: true,
+        credentials_json: '',
+        allowed_min_date: null,
+        allowed_max_date: null
+      })
+      setTableName('')
+      setTimeout(() => {
+        setShowSuccess(false)
+      }, 3000)
+    },
+    onError: (error) => {
+      console.error('Create table error:', error)
     }
   })
 
@@ -61,51 +97,13 @@ export function BigQueryInfoSection() {
       console.log('Disconnect response:', response)
       if (response.success) {
         queryClient.invalidateQueries({ queryKey: ['bigquery-info'] })
+        queryClient.invalidateQueries({ queryKey: ['tables'] })
       }
     },
     onError: (error) => {
       console.error('Disconnect error:', error)
     }
   })
-
-  // Fetch table list
-  const { data: tablesData } = useQuery({
-    queryKey: ['tables'],
-    queryFn: fetchTables,
-    refetchInterval: 30000, // Refresh every 30 seconds
-  })
-
-  // Activate table mutation
-  const activateTableMutation = useMutation({
-    mutationFn: activateTable,
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['tables'] })
-      queryClient.invalidateQueries({ queryKey: ['bigquery-info'] })
-      // Trigger full page reload to refresh all data with new table
-      window.location.reload()
-    },
-  })
-
-  // Delete table mutation
-  const deleteTableMutation = useMutation({
-    mutationFn: deleteTable,
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['tables'] })
-      queryClient.invalidateQueries({ queryKey: ['bigquery-info'] })
-    },
-  })
-
-  const handleTableSwitch = (tableId: string) => {
-    if (confirm('Switching tables will reload the page. Continue?')) {
-      activateTableMutation.mutate(tableId)
-    }
-  }
-
-  const handleDeleteTable = (tableId: string, tableName: string) => {
-    if (confirm(`Are you sure you want to delete the table "${tableName}"? This will remove its configuration and schema.`)) {
-      deleteTableMutation.mutate(tableId)
-    }
-  }
 
   // Pre-fill form with saved connection details when not connected
   useEffect(() => {
@@ -124,7 +122,22 @@ export function BigQueryInfoSection() {
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
-    configureMutation.mutate(formData)
+
+    // If tableId is undefined, we're creating a new table
+    if (!tableId) {
+      createTableMutation.mutate({
+        name: tableName,
+        project_id: formData.project_id,
+        dataset: formData.dataset,
+        table: formData.table,
+        credentials_json: formData.use_adc ? '' : formData.credentials_json,
+        allowed_min_date: null,
+        allowed_max_date: null
+      })
+    } else {
+      // Otherwise, update existing table (using legacy endpoint)
+      configureMutation.mutate(formData)
+    }
   }
 
   const handleInputChange = (field: keyof BigQueryConfig, value: string) => {
@@ -132,8 +145,9 @@ export function BigQueryInfoSection() {
   }
 
   const handleDisconnect = () => {
-    if (confirm('Are you sure you want to disconnect BigQuery? This will clear your configuration.')) {
-      disconnectMutation.mutate()
+    if (!tableId) return
+    if (confirm('Are you sure you want to disconnect and delete this table? This action cannot be undone.')) {
+      disconnectMutation.mutate(tableId)
     }
   }
 
@@ -162,23 +176,26 @@ export function BigQueryInfoSection() {
   }
 
   const isConnected = info.connection_status === 'connected'
+  const tables = tablesData?.tables || []
 
   // Show configuration form if not connected
   if (!isConnected) {
     return (
       <div className="space-y-6">
-        {/* Connection Status */}
-        <div className="rounded-lg border p-6 bg-yellow-50 border-yellow-200">
-          <div className="flex items-center gap-3">
-            <AlertCircle className="text-yellow-600" size={24} />
-            <div>
-              <h2 className="text-lg font-semibold">BigQuery Not Configured</h2>
-              <p className="text-sm text-yellow-700">
-                {info.connection_status || 'Please configure your BigQuery connection below'}
-              </p>
+        {/* Connection Status - only show if no tables exist */}
+        {tables.length === 0 && (
+          <div className="rounded-lg border p-6 bg-yellow-50 border-yellow-200">
+            <div className="flex items-center gap-3">
+              <AlertCircle className="text-yellow-600" size={24} />
+              <div>
+                <h2 className="text-lg font-semibold">BigQuery Not Configured</h2>
+                <p className="text-sm text-yellow-700">
+                  {info.connection_status || 'Please configure your BigQuery connection below'}
+                </p>
+              </div>
             </div>
           </div>
-        </div>
+        )}
 
         {/* Success Message */}
         {showSuccess && (
@@ -196,16 +213,22 @@ export function BigQueryInfoSection() {
         )}
 
         {/* Error Message */}
-        {configureMutation.isError && (
+        {(configureMutation.isError || createTableMutation.isError) && (
           <div className="rounded-lg border p-6 bg-red-50 border-red-200">
             <div className="flex items-center gap-3">
               <AlertCircle className="text-red-600" size={24} />
               <div>
-                <h2 className="text-lg font-semibold">Configuration Failed</h2>
+                <h2 className="text-lg font-semibold">
+                  {!tableId ? 'Table Creation Failed' : 'Configuration Failed'}
+                </h2>
                 <p className="text-sm text-red-700">
-                  {configureMutation.error instanceof Error
-                    ? configureMutation.error.message
-                    : 'An error occurred while configuring BigQuery'}
+                  {!tableId
+                    ? (createTableMutation.error instanceof Error
+                        ? createTableMutation.error.message
+                        : 'An error occurred while creating the table')
+                    : (configureMutation.error instanceof Error
+                        ? configureMutation.error.message
+                        : 'An error occurred while configuring BigQuery')}
                 </p>
               </div>
             </div>
@@ -220,6 +243,27 @@ export function BigQueryInfoSection() {
           </div>
 
           <form onSubmit={handleSubmit} className="space-y-4">
+            {/* Name field - only show when creating new table */}
+            {!tableId && (
+              <div>
+                <label htmlFor="table_name" className="block text-sm font-medium text-gray-700 mb-1">
+                  Table Name
+                </label>
+                <input
+                  type="text"
+                  id="table_name"
+                  required
+                  value={tableName}
+                  onChange={(e) => setTableName(e.target.value)}
+                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                  placeholder="my-analytics-table"
+                />
+                <p className="text-xs text-gray-500 mt-1">
+                  A friendly name to identify this table connection
+                </p>
+              </div>
+            )}
+
             <div>
               <label htmlFor="project_id" className="block text-sm font-medium text-gray-700 mb-1">
                 Project ID
@@ -265,40 +309,6 @@ export function BigQueryInfoSection() {
               />
             </div>
 
-            {/* Date Limits - Optional */}
-            <div className="border-t pt-4 mt-4">
-              <h3 className="text-sm font-medium text-gray-700 mb-3">Date Access Limits (Optional)</h3>
-              <p className="text-xs text-gray-500 mb-3">
-                Restrict query access to specific date ranges. Leave empty for no restrictions.
-              </p>
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label htmlFor="allowed_min_date" className="block text-sm font-medium text-gray-700 mb-1">
-                    Minimum Allowed Date
-                  </label>
-                  <input
-                    type="date"
-                    id="allowed_min_date"
-                    value={formData.allowed_min_date || ''}
-                    onChange={(e) => setFormData(prev => ({ ...prev, allowed_min_date: e.target.value || null }))}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-                  />
-                </div>
-                <div>
-                  <label htmlFor="allowed_max_date" className="block text-sm font-medium text-gray-700 mb-1">
-                    Maximum Allowed Date
-                  </label>
-                  <input
-                    type="date"
-                    id="allowed_max_date"
-                    value={formData.allowed_max_date || ''}
-                    onChange={(e) => setFormData(prev => ({ ...prev, allowed_max_date: e.target.value || null }))}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-                  />
-                </div>
-              </div>
-            </div>
-
             {/* Authentication Method */}
             <div className="border-t pt-4 mt-4">
               <label className="flex items-center gap-2 cursor-pointer">
@@ -340,10 +350,12 @@ export function BigQueryInfoSection() {
 
             <button
               type="submit"
-              disabled={configureMutation.isPending}
+              disabled={configureMutation.isPending || createTableMutation.isPending}
               className="w-full bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed font-medium"
             >
-              {configureMutation.isPending ? 'Configuring...' : 'Configure BigQuery'}
+              {!tableId
+                ? (createTableMutation.isPending ? 'Creating Table...' : 'Create Table')
+                : (configureMutation.isPending ? 'Configuring...' : 'Configure BigQuery')}
             </button>
           </form>
         </div>
@@ -380,72 +392,6 @@ export function BigQueryInfoSection() {
           )}
         </div>
       </div>
-
-      {/* Table Management */}
-      {tablesData && tablesData.tables.length > 0 && (
-        <div className="bg-white rounded-lg border border-gray-200 p-6">
-          <div className="flex items-center justify-between mb-4">
-            <div className="flex items-center gap-2">
-              <Layers className="text-blue-600" size={24} />
-              <h2 className="text-lg font-semibold">Table Management</h2>
-            </div>
-            <button
-              onClick={() => setShowCreateTableModal(true)}
-              className="flex items-center gap-2 px-3 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium text-sm"
-            >
-              <Plus size={16} />
-              Add Table
-            </button>
-          </div>
-
-          <div className="space-y-2">
-            {tablesData.tables.map((table) => (
-              <div
-                key={table.table_id}
-                className={`flex items-center justify-between p-4 rounded-lg border ${
-                  table.is_active ? 'border-blue-500 bg-blue-50' : 'border-gray-200 bg-gray-50'
-                }`}
-              >
-                <div className="flex-1">
-                  <div className="flex items-center gap-2">
-                    <h3 className="font-semibold">{table.name}</h3>
-                    {table.is_active && (
-                      <span className="px-2 py-0.5 bg-blue-600 text-white text-xs rounded-full">
-                        Active
-                      </span>
-                    )}
-                  </div>
-                  <p className="text-sm text-gray-600 font-mono mt-1">
-                    {table.project_id}.{table.dataset}.{table.table}
-                  </p>
-                  <p className="text-xs text-gray-500 mt-1">
-                    Last used: {new Date(table.last_used_at).toLocaleString()}
-                  </p>
-                </div>
-                <div className="flex items-center gap-2">
-                  {!table.is_active && (
-                    <button
-                      onClick={() => handleTableSwitch(table.table_id)}
-                      disabled={activateTableMutation.isPending}
-                      className="px-3 py-1.5 bg-blue-600 text-white rounded hover:bg-blue-700 disabled:bg-gray-400 text-sm"
-                    >
-                      Switch
-                    </button>
-                  )}
-                  <button
-                    onClick={() => handleDeleteTable(table.table_id, table.name)}
-                    disabled={deleteTableMutation.isPending || table.is_active}
-                    className="p-1.5 text-red-600 hover:bg-red-50 rounded disabled:opacity-50 disabled:cursor-not-allowed"
-                    title={table.is_active ? 'Cannot delete active table' : 'Delete table'}
-                  >
-                    <Trash2 size={18} />
-                  </button>
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
 
       {/* Table Information */}
       <div className="bg-white rounded-lg border border-gray-200 p-6">
@@ -537,12 +483,6 @@ export function BigQueryInfoSection() {
           </div>
         </div>
       </div>
-
-      {/* Create Table Modal */}
-      <CreateTableModal
-        isOpen={showCreateTableModal}
-        onClose={() => setShowCreateTableModal(false)}
-      />
     </div>
   )
 }

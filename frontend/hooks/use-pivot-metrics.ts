@@ -79,7 +79,7 @@ function transformDimension(dimension: DimensionDef): DimensionDefinition {
   }
 }
 
-export function usePivotMetrics(): UsePivotMetricsReturn {
+export function usePivotMetrics(tableId?: string): UsePivotMetricsReturn {
   const {
     baseMetrics,
     calculatedMetrics,
@@ -88,7 +88,7 @@ export function usePivotMetrics(): UsePivotMetricsReturn {
     isLoadingBaseMetrics,
     isLoadingCalculatedMetrics,
     isLoadingDimensions,
-  } = useSchema()
+  } = useSchema(tableId)
 
   const isLoading = isLoadingBaseMetrics || isLoadingCalculatedMetrics || isLoadingDimensions
 

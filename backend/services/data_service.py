@@ -29,9 +29,14 @@ def safe_float(value: float) -> float:
     return float(value)
 
 
-def _get_all_metrics_for_pivot():
+def _get_all_metrics_for_pivot(table_id: Optional[str] = None, requested_metrics: Optional[List[str]] = None):
     """
     Load all base and calculated metrics from schema service for pivot table.
+
+    Args:
+        table_id: Optional table ID to load schema for
+        requested_metrics: Optional list of metric IDs to filter (if None, returns all)
+
     Returns dict with:
     - base_metrics: List of base metric definitions
     - calculated_metrics: List of calculated metric definitions
@@ -41,20 +46,55 @@ def _get_all_metrics_for_pivot():
     """
     try:
         from services.schema_service import SchemaService
-        bq_service = get_bigquery_service()
+        bq_service = get_bigquery_service(table_id)
         if bq_service and bq_service.client:
             schema_service = SchemaService(bq_service.client, table_id=bq_service.table_id)
             schema_config = schema_service.load_schema()
 
             # Access Pydantic model attributes directly (not .get() method)
-            base_metrics = schema_config.base_metrics if schema_config else []
-            calculated_metrics = schema_config.calculated_metrics if schema_config else []
+            all_base_metrics = schema_config.base_metrics if schema_config else []
+            all_calculated_metrics = schema_config.calculated_metrics if schema_config else []
+
+            # Filter metrics if requested_metrics is provided
+            if requested_metrics:
+                requested_set = set(requested_metrics)
+
+                # Keep only requested metrics
+                base_metrics = [m for m in all_base_metrics if m.id in requested_set]
+                calculated_metrics = [m for m in all_calculated_metrics if m.id in requested_set]
+
+                # Also include base metrics that calculated metrics depend on
+                for calc_metric in calculated_metrics:
+                    if calc_metric.depends_on:
+                        for dep_id in calc_metric.depends_on:
+                            # Add dependency if not already included
+                            if dep_id not in requested_set:
+                                dep_metric = next((m for m in all_base_metrics if m.id == dep_id), None)
+                                if dep_metric and dep_metric not in base_metrics:
+                                    base_metrics.append(dep_metric)
+            else:
+                base_metrics = all_base_metrics
+                calculated_metrics = all_calculated_metrics
 
             # Get all metric IDs
             all_metric_ids = [m.id for m in base_metrics] + [m.id for m in calculated_metrics]
 
             # Get primary sort metric from schema config, or use first visible base metric
             primary_sort_metric = schema_config.primary_sort_metric if schema_config else None
+
+            # If primary sort metric is set but not in the filtered metrics, we need to either:
+            # 1. Include it in the filtered list, OR
+            # 2. Change to a metric that IS in the filtered list
+            if primary_sort_metric and primary_sort_metric not in all_metric_ids:
+                # Option 1: Add the primary sort metric to the filtered list
+                primary_sort_base_metric = next((m for m in all_base_metrics if m.id == primary_sort_metric), None)
+                if primary_sort_base_metric:
+                    base_metrics.append(primary_sort_base_metric)
+                    all_metric_ids.append(primary_sort_metric)
+                else:
+                    # Option 2: If primary sort metric doesn't exist, use first available metric
+                    primary_sort_metric = None
+
             if not primary_sort_metric and base_metrics:
                 # Fallback: use first visible metric with lowest sort_order
                 visible = [m for m in base_metrics if m.is_visible_by_default]
@@ -65,6 +105,17 @@ def _get_all_metrics_for_pivot():
 
             # Get avg per day metric from schema config, or use primary sort metric as fallback
             avg_per_day_metric = schema_config.avg_per_day_metric if schema_config else None
+
+            # If avg_per_day_metric is set but not in the filtered metrics, add it
+            if avg_per_day_metric and avg_per_day_metric not in all_metric_ids:
+                avg_per_day_base_metric = next((m for m in all_base_metrics if m.id == avg_per_day_metric), None)
+                if avg_per_day_base_metric:
+                    base_metrics.append(avg_per_day_base_metric)
+                    all_metric_ids.append(avg_per_day_metric)
+                else:
+                    # If metric doesn't exist, use primary sort metric as fallback
+                    avg_per_day_metric = None
+
             if not avg_per_day_metric:
                 avg_per_day_metric = primary_sort_metric  # Use same metric as sort metric
 
@@ -275,22 +326,31 @@ def _query_custom_dimension_pivot(
         overall_max_date = None
 
         for value in custom_dim.values:
+            # Resolve dates (relative to absolute if needed)
+            from .date_resolver import resolve_relative_date
+
+            if value.date_range_type == 'relative' and value.relative_date_preset:
+                # Resolve relative date to absolute
+                start_date, end_date = resolve_relative_date(value.relative_date_preset)
+            else:
+                # Use absolute dates (handle empty strings as None)
+                start_date = value.start_date if value.start_date else None
+                end_date = value.end_date if value.end_date else None
+
             # Create modified filters with this date range
             value_filters = FilterParams(**filters.dict())
-            value_filters.start_date = value.start_date
-            value_filters.end_date = value.end_date
+            value_filters.start_date = start_date
+            value_filters.end_date = end_date
 
             # Build filter clause for this date range
-            # Create a modified FilterParams with overridden dates
-            range_filters = FilterParams(
-                start_date=value.start_date,
-                end_date=value.end_date,
-                dimension_filters=filters.dimension_filters
-            )
+            # Note: We've already resolved relative dates to absolute above (lines 334-340)
+            # So we pass date_range_type='absolute' and the resolved dates
             where_clause = bq_service.build_filter_clause(
-                start_date=range_filters.start_date,
-                end_date=range_filters.end_date,
-                dimension_filters=range_filters.dimension_filters
+                start_date=start_date,
+                end_date=end_date,
+                dimension_filters=filters.dimension_filters,
+                date_range_type='absolute',
+                relative_date_preset=None
             )
 
             # Query for this date range with dynamic metrics
@@ -344,9 +404,15 @@ def _query_custom_dimension_pivot(
 
         # Query for "Other" - dates not in any defined date range
         # Build exclusion conditions for all date ranges
+        # Resolve relative dates to absolute dates for exclusions
         date_exclusions = []
         for value in custom_dim.values:
-            date_exclusions.append(f"NOT (date BETWEEN '{value.start_date}' AND '{value.end_date}')")
+            if value.date_range_type == 'relative' and value.relative_date_preset:
+                start_date, end_date = resolve_relative_date(value.relative_date_preset)
+            else:
+                start_date = value.start_date
+                end_date = value.end_date
+            date_exclusions.append(f"NOT (date BETWEEN '{start_date}' AND '{end_date}')")
 
         date_exclusion_clause = " AND ".join(date_exclusions) if date_exclusions else ""
 
@@ -354,7 +420,9 @@ def _query_custom_dimension_pivot(
         base_where_clause = bq_service.build_filter_clause(
             start_date=filters.start_date,
             end_date=filters.end_date,
-            dimension_filters=filters.dimension_filters
+            dimension_filters=filters.dimension_filters,
+            date_range_type=filters.date_range_type,
+            relative_date_preset=filters.relative_date_preset
         )
 
         # Add date exclusions to WHERE clause
@@ -645,7 +713,7 @@ def get_filter_options() -> FilterOptions:
     )
 
 
-def get_pivot_data(dimensions: List[str], filters: FilterParams, limit: int = 50, offset: int = 0, dimension_values: Optional[List[str]] = None) -> PivotResponse:
+def get_pivot_data(dimensions: List[str], filters: FilterParams, limit: int = 50, offset: int = 0, dimension_values: Optional[List[str]] = None, table_id: Optional[str] = None, skip_count: bool = False, metrics: Optional[List[str]] = None) -> PivotResponse:
     """Get hierarchical pivot table data by dimensions from BigQuery
 
     Args:
@@ -654,27 +722,48 @@ def get_pivot_data(dimensions: List[str], filters: FilterParams, limit: int = 50
         limit: Maximum number of rows to return (ignored if dimension_values is provided)
         offset: Number of rows to skip (ignored if dimension_values is provided)
         dimension_values: Optional list of specific dimension values to fetch (for multi-table matching)
+        table_id: Optional table ID for multi-table widget support (defaults to active table)
+        skip_count: Skip the count query (for initial loads or when total count not needed)
+        metrics: Optional list of metric IDs to calculate (defaults to all metrics if None)
     """
-    bq_service = get_bigquery_service()
+    bq_service = get_bigquery_service(table_id)
     if bq_service is None:
         raise ValueError("BigQuery not initialized. Please configure BigQuery connection.")
 
-    # Load all metrics dynamically from schema
-    metrics_data = _get_all_metrics_for_pivot()
+    # If metrics list is explicitly empty (not None), return empty response
+    if metrics is not None and len(metrics) == 0:
+        return PivotResponse(
+            rows=[],
+            total={},
+            total_count=0,
+            has_more=False
+        )
+
+    # Load all metrics dynamically from schema, optionally filtered by requested metrics
+    metrics_data = _get_all_metrics_for_pivot(table_id, requested_metrics=metrics)
     select_clause = _build_pivot_select_clause(metrics_data)
 
     # Check if any dimension is a custom dimension (starts with "custom_")
     if dimensions and len(dimensions) > 0:
-        first_dim = dimensions[0]
-        if first_dim.startswith("custom_"):
-            # Extract custom dimension ID
-            custom_dim_id = first_dim.replace("custom_", "")
-            # Use custom dimension query logic
-            result = _query_custom_dimension_pivot(custom_dim_id, filters, limit)
-            if result:
-                return result
-            else:
-                raise ValueError(f"Custom dimension {custom_dim_id} not found")
+        # Check if mixing custom and regular dimensions (not allowed)
+        has_custom = any(d.startswith("custom_") for d in dimensions)
+        has_regular = any(not d.startswith("custom_") for d in dimensions)
+
+        if has_custom and has_regular:
+            raise ValueError("Cannot mix custom dimensions with regular dimensions in row dimensions. Use custom dimensions as table dimensions (columns) only.")
+
+        if has_custom:
+            # Must be the first (and only) dimension for now
+            first_dim = dimensions[0]
+            if first_dim.startswith("custom_"):
+                # Extract custom dimension ID
+                custom_dim_id = first_dim.replace("custom_", "")
+                # Use custom dimension query logic
+                result = _query_custom_dimension_pivot(custom_dim_id, filters, limit)
+                if result:
+                    return result
+                else:
+                    raise ValueError(f"Custom dimension {custom_dim_id} not found")
 
     # Build dimension map dynamically from schema
     dimension_map = {}
@@ -684,24 +773,15 @@ def get_pivot_data(dimensions: List[str], filters: FilterParams, limit: int = 50
             dimension_map[dim.id] = dim.column_name
 
     # Query actual date range from filtered data for accurate avg_queries_per_day calculation
-    where_clause_for_dates = bq_service.build_filter_clause(
+    # Use cached method to avoid redundant queries for same table/filters/dimensions
+    min_date, max_date, num_days = bq_service.get_date_range_cached(
         start_date=filters.start_date,
         end_date=filters.end_date,
-        dimension_filters=filters.dimension_filters
+        dimension_filters=filters.dimension_filters,
+        dimensions=dimensions,
+        date_range_type=filters.date_range_type,
+        relative_date_preset=filters.relative_date_preset
     )
-    date_range_query = f"""
-        SELECT MIN(date) as min_date, MAX(date) as max_date
-        FROM `{bq_service.table_path}`
-        {where_clause_for_dates}
-    """
-    date_range_df = bq_service._execute_and_log_query(date_range_query, query_type="pivot", endpoint="data_service")
-
-    # Calculate number of days from actual data
-    num_days = 1
-    if not date_range_df.empty and date_range_df['min_date'].iloc[0] is not None and date_range_df['max_date'].iloc[0] is not None:
-        min_date = date_range_df['min_date'].iloc[0]
-        max_date = date_range_df['max_date'].iloc[0]
-        num_days = (max_date - min_date).days + 1
 
     # If no dimensions provided, return aggregated totals as a single row
     if not dimensions:
@@ -709,7 +789,9 @@ def get_pivot_data(dimensions: List[str], filters: FilterParams, limit: int = 50
         where_clause = bq_service.build_filter_clause(
             start_date=filters.start_date,
             end_date=filters.end_date,
-            dimension_filters=filters.dimension_filters
+            dimension_filters=filters.dimension_filters,
+            date_range_type=filters.date_range_type,
+            relative_date_preset=filters.relative_date_preset
         )
 
         # Query for aggregated totals
@@ -719,12 +801,6 @@ def get_pivot_data(dimensions: List[str], filters: FilterParams, limit: int = 50
             FROM `{bq_service.table_path}`
             {where_clause}
         """
-
-        # DEBUG: Print the query to see what SQL is being generated
-        print(f"\n=== PIVOT QUERY DEBUG ===")
-        print(f"SELECT CLAUSE:\n{select_clause}")
-        print(f"\nFULL QUERY:\n{query}")
-        print(f"=== END DEBUG ===\n")
 
         df = bq_service._execute_and_log_query(query, query_type="pivot", endpoint="data_service")
 
@@ -778,7 +854,9 @@ def get_pivot_data(dimensions: List[str], filters: FilterParams, limit: int = 50
     where_clause = bq_service.build_filter_clause(
         start_date=filters.start_date,
         end_date=filters.end_date,
-        dimension_filters=filters.dimension_filters
+        dimension_filters=filters.dimension_filters,
+        date_range_type=filters.date_range_type,
+        relative_date_preset=filters.relative_date_preset
     )
 
     # Map all dimensions to their column names
@@ -819,26 +897,21 @@ def get_pivot_data(dimensions: List[str], filters: FilterParams, limit: int = 50
     # 2. Totals query: Get aggregated totals separately
 
     # Count query - get total count of dimension values for pagination
-    # For multiple dimensions, we need to count distinct combinations using a subquery
-    if len(group_cols) > 1:
-        count_query = f"""
-            SELECT COUNT(*) as total_count
-            FROM (
-                SELECT {group_by_clause}
-                FROM `{bq_service.table_path}`
-                {where_clause}
-                GROUP BY {group_by_clause}
-            )
-        """
+    # Skip if not needed (e.g., initial load or when pagination info not required)
+    if skip_count and offset == 0:
+        # Skip count query on initial load to save BigQuery queries
+        total_count = -1  # Sentinel value indicating count was skipped
     else:
-        count_query = f"""
-            SELECT COUNT(DISTINCT {group_by_clause}) as total_count
-            FROM `{bq_service.table_path}`
-            {where_clause}
-        """
-
-    count_df = bq_service._execute_and_log_query(count_query, query_type="pivot_count", endpoint="data_service")
-    total_count = int(count_df['total_count'].iloc[0]) if not count_df.empty else 0
+        # Use cached count method - will cache results for same filters/dimensions
+        # Use APPROX_COUNT_DISTINCT for very large datasets (faster but slightly less accurate)
+        use_approx = False  # Set to True if you have millions of unique dimension combinations
+        total_count = bq_service.get_count_cached(
+            group_cols=group_cols,
+            start_date=filters.start_date,
+            end_date=filters.end_date,
+            dimension_filters=filters.dimension_filters,
+            use_approx=use_approx
+        )
 
     # Build additional filter for specific dimension values if provided
     dimension_values_filter = ""
@@ -848,7 +921,9 @@ def get_pivot_data(dimensions: List[str], filters: FilterParams, limit: int = 50
         values_list = "', '".join(escaped_values)
         # Add to where clause
         dimension_column = group_cols[0]  # Use the first (and should be only) dimension column
-        dimension_values_filter = f"AND {dimension_column} IN ('{values_list}')"
+        # Use WHERE if there's no existing where clause, otherwise use AND
+        connector = "AND" if where_clause else "WHERE"
+        dimension_values_filter = f"{connector} {dimension_column} IN ('{values_list}')"
 
     # Main query - get top N dimension values with offset (or specific values if provided)
     if dimension_values and len(dimension_values) > 0:
@@ -879,7 +954,7 @@ def get_pivot_data(dimensions: List[str], filters: FilterParams, limit: int = 50
 
     df = bq_service._execute_and_log_query(query, query_type="pivot", endpoint="data_service")
 
-    # Totals query - get overall totals in a separate, efficient query
+    # Totals query - get overall totals in a separate query
     totals_query = f"""
         SELECT
             {select_clause}
@@ -1017,9 +1092,16 @@ def get_pivot_children(
                 raise ValueError(f"Value '{value}' not found in custom dimension {custom_dim.name}")
 
             # Override filters with this date range
+            # Resolve relative dates to absolute dates if needed
+            if date_range_value.date_range_type == 'relative' and date_range_value.relative_date_preset:
+                start_date, end_date = resolve_relative_date(date_range_value.relative_date_preset)
+            else:
+                start_date = date_range_value.start_date
+                end_date = date_range_value.end_date
+
             filters = FilterParams(**filters.dict())
-            filters.start_date = date_range_value.start_date
-            filters.end_date = date_range_value.end_date
+            filters.start_date = start_date
+            filters.end_date = end_date
 
             # Set dimension to empty string so the rest of the function handles it as a non-dimension query
             dimension = ""
@@ -1029,30 +1111,23 @@ def get_pivot_children(
 
 
     # Query actual date range from filtered data for accurate avg_queries_per_day calculation
-    where_clause_for_dates = bq_service.build_filter_clause(
+    # Use cached method to avoid redundant queries for same table/filters/dimensions
+    min_date, max_date, num_days = bq_service.get_date_range_cached(
         start_date=filters.start_date,
         end_date=filters.end_date,
-        dimension_filters=filters.dimension_filters
+        dimension_filters=filters.dimension_filters,
+        dimensions=dimensions,
+        date_range_type=filters.date_range_type,
+        relative_date_preset=filters.relative_date_preset
     )
-    date_range_query = f"""
-        SELECT MIN(date) as min_date, MAX(date) as max_date
-        FROM `{bq_service.table_path}`
-        {where_clause_for_dates}
-    """
-    date_range_df = bq_service._execute_and_log_query(date_range_query, query_type="pivot", endpoint="data_service")
-
-    # Calculate number of days from actual data
-    num_days = 1
-    if not date_range_df.empty and date_range_df['min_date'].iloc[0] is not None and date_range_df['max_date'].iloc[0] is not None:
-        min_date = date_range_df['min_date'].iloc[0]
-        max_date = date_range_df['max_date'].iloc[0]
-        num_days = (max_date - min_date).days + 1
 
     # Build base filter clause using the centralized method
     where_clause = bq_service.build_filter_clause(
         start_date=filters.start_date,
         end_date=filters.end_date,
-        dimension_filters=filters.dimension_filters
+        dimension_filters=filters.dimension_filters,
+        date_range_type=filters.date_range_type,
+        relative_date_preset=filters.relative_date_preset
     )
 
     # Add dimension filter only if dimension is specified
@@ -1081,7 +1156,9 @@ def get_pivot_children(
     base_where_clause = bq_service.build_filter_clause(
         start_date=filters.start_date,
         end_date=filters.end_date,
-        dimension_filters=filters.dimension_filters
+        dimension_filters=filters.dimension_filters,
+        date_range_type=filters.date_range_type,
+        relative_date_preset=filters.relative_date_preset
     )
 
     # Get grand total for percentage calculation (using primary sort metric)
@@ -1140,7 +1217,7 @@ def get_pivot_children(
     return children
 
 
-def get_dimension_values(dimension: str, filters: FilterParams) -> List[str]:
+def get_dimension_values(dimension: str, filters: FilterParams, table_id: Optional[str] = None) -> List[str]:
     """Get distinct values for a dimension from BigQuery or custom dimensions"""
     # Handle custom dimensions
     if dimension.startswith("custom_"):
@@ -1158,7 +1235,7 @@ def get_dimension_values(dimension: str, filters: FilterParams) -> List[str]:
         return [value.label for value in custom_dim.values]
 
     # Handle standard BigQuery dimensions
-    bq_service = get_bigquery_service()
+    bq_service = get_bigquery_service(table_id)
     if bq_service is None:
         raise ValueError("BigQuery not initialized. Please configure BigQuery connection.")
 
