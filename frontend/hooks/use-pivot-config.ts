@@ -167,6 +167,8 @@ export function usePivotConfig(): UsePivotConfigReturn {
         selectedDateRange: config.selectedDateRange,
         startDate: config.startDate,
         endDate: config.endDate,
+        dateRangeType: config.dateRangeType,
+        relativeDatePreset: config.relativeDatePreset,
         isDataSourceDropped: config.isDataSourceDropped,
         isDateRangeDropped: config.isDateRangeDropped,
         selectedDimensions: config.selectedDimensions,

@@ -191,6 +191,23 @@ class SchemaService:
                 # Unknown type - log warning
                 warnings.append(f"Unknown field type {field_type} for column {column_name}")
 
+        # Add virtual days_in_range metric (system-generated, always available)
+        days_in_range_metric = BaseMetric(
+            id='days_in_range',
+            column_name='date',  # Uses date column for calculation
+            display_name='Days in Range',
+            aggregation='COUNT',  # Special: Will be replaced with DATE_DIFF in SQL
+            data_type='INTEGER',
+            format_type='number',
+            decimal_places=0,
+            category='system',
+            is_visible_by_default=False,  # Hidden by default, only used in formulas
+            is_system=True,  # Mark as system metric
+            sort_order=9999,  # Last in lists
+            description='Virtual metric: Number of days in the queried date range (per dimension group)'
+        )
+        detected_metrics.append(days_in_range_metric)
+
         return SchemaDetectionResult(
             detected_base_metrics=detected_metrics,
             detected_dimensions=detected_dimensions,

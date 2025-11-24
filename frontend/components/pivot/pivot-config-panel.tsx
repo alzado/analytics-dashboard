@@ -272,12 +272,38 @@ export function PivotConfigPanel({
   // Pending filter changes (not yet applied)
   const [pendingFilters, setPendingFilters] = useState<Record<string, string[]>>(dimensionFilters || {})
 
+  // Local state for current date range (to avoid stale data during drag)
+  const [currentStartDate, setCurrentStartDate] = useState<string | null>(config.startDate || null)
+  const [currentEndDate, setCurrentEndDate] = useState<string | null>(config.endDate || null)
+
   // Sync pending filters when actual filters change externally
   useEffect(() => {
     setPendingFilters(dimensionFilters || {})
   }, [dimensionFilters])
 
+  // Sync local date state when config changes
+  useEffect(() => {
+    setCurrentStartDate(config.startDate || null)
+    setCurrentEndDate(config.endDate || null)
+  }, [config.startDate, config.endDate])
+
   const queryClient = useQueryClient()
+
+  // Wrapper for onDateRangeChange that updates local state immediately
+  const handleDateRangeChange = (
+    type: DateRangeType,
+    preset: RelativeDatePreset | null,
+    startDate: string | null,
+    endDate: string | null
+  ) => {
+    // Update local state immediately
+    setCurrentStartDate(startDate)
+    setCurrentEndDate(endDate)
+    // Call parent callback
+    if (onDateRangeChange) {
+      onDateRangeChange(type, preset, startDate, endDate)
+    }
+  }
 
   // Fetch custom dimensions
   const { data: customDimensions = [], isLoading: customDimensionsLoading } = useQuery({
@@ -581,9 +607,9 @@ export function PivotConfigPanel({
                         <DateRangeSelector
                           dateRangeType={dateRangeType || 'absolute'}
                           relativeDatePreset={relativeDatePreset || null}
-                          startDate={config.startDate}
-                          endDate={config.endDate}
-                          onDateRangeChange={onDateRangeChange}
+                          startDate={currentStartDate}
+                          endDate={currentEndDate}
+                          onDateRangeChange={handleDateRangeChange}
                         />
                       ) : (
                         <div className="space-y-2">
@@ -624,8 +650,8 @@ export function PivotConfigPanel({
                             e.dataTransfer.setData('relativeDatePreset', relativeDatePreset)
                           } else {
                             e.dataTransfer.setData('dateRangeType', 'absolute')
-                            e.dataTransfer.setData('startDate', config.startDate || '')
-                            e.dataTransfer.setData('endDate', config.endDate || '')
+                            e.dataTransfer.setData('startDate', currentStartDate || '')
+                            e.dataTransfer.setData('endDate', currentEndDate || '')
                           }
                         }}
                         className="p-2 bg-purple-50 border-2 border-purple-300 rounded cursor-move hover:bg-purple-100 transition-colors"

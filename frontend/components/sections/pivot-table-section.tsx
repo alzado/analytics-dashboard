@@ -9,7 +9,6 @@ import { usePivotConfig } from '@/hooks/use-pivot-config'
 import { usePivotMetrics } from '@/hooks/use-pivot-metrics'
 import { useSchema } from '@/hooks/use-schema'
 import { usePivotFilters } from '@/hooks/use-pivot-filters'
-import { useWidgetEditing } from '@/lib/contexts/widget-editing-context'
 import { useDashboard } from '@/lib/contexts/dashboard-context'
 import type { MetricDefinition, DimensionDefinition } from '@/hooks/use-pivot-metrics'
 import { PivotConfigPanel } from '@/components/pivot/pivot-config-panel'
@@ -182,11 +181,10 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
     setChartType,
   } = usePivotConfig()
 
-  // Widget editing context
-  const { editingWidget, editingDashboardId, stopEditingWidget, isEditingWidget } = useWidgetEditing()
-
-  // Dashboard context for navigation
-  const { setCurrentDashboardId } = useDashboard()
+  // Dashboard context for widget editing
+  const { editingWidget, setEditingWidget, currentDashboardId: editingDashboardId, setCurrentDashboardId } = useDashboard()
+  const isEditingWidget = editingWidget !== null
+  const stopEditingWidget = () => setEditingWidget(null)
 
   // Load dynamic metrics and dimensions from schema
   const { metrics, dimensions, getMetricById, getDimensionByValue, isLoading: isLoadingSchema } = usePivotMetrics(config.selectedTable || undefined)
@@ -260,10 +258,16 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
     },
   })
 
-  // Sync date changes from config to filter state
+  // Initial sync of date range from config to filters on mount only
   useEffect(() => {
-    updateFilterDateRange(config.startDate, config.endDate)
-  }, [config.startDate, config.endDate, updateFilterDateRange])
+    updateFilterDateRange(
+      config.dateRangeType || 'absolute',
+      config.relativeDatePreset || null,
+      config.startDate,
+      config.endDate
+    )
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []) // Only run on mount
 
   // Load widget configuration when editing a widget
   useEffect(() => {
@@ -292,6 +296,11 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
         setColumnSortConfig(editingWidget.column_sort)
       }
 
+      // Load row sort config
+      if (editingWidget.row_sort_config) {
+        setSortConfig(editingWidget.row_sort_config as any)
+      }
+
       // Clear existing dimensions and metrics
       // Then add from widget
       setTimeout(() => {
@@ -304,9 +313,9 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
 
         // Load filters
         Object.entries(editingWidget.filters).forEach(([dimensionId, values]) => {
-          values.forEach(value => {
-            updateDimensionFilter(dimensionId, value, true)
-          })
+          // Ensure values is an array
+          const valuesArray = Array.isArray(values) ? values : [values]
+          updateDimensionFilter(dimensionId, valuesArray as string[])
         })
       }, 100)
     }
@@ -339,6 +348,11 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
         setColumnSortConfig(widgetConfig.column_sort as { metric: string; direction: 'asc' | 'desc' })
       }
 
+      // Load row sort config
+      if (widgetConfig.row_sort_config) {
+        setSortConfig(widgetConfig.row_sort_config as any)
+      }
+
       // Load configuration
       setTimeout(() => {
         // Load dimensions
@@ -351,11 +365,9 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
         // Load filters
         if (widgetConfig.filters) {
           Object.entries(widgetConfig.filters).forEach(([dimensionId, values]: [string, any]) => {
-            if (Array.isArray(values)) {
-              values.forEach(value => {
-                updateDimensionFilter(dimensionId, value, true)
-              })
-            }
+            // Ensure values is an array
+            const valuesArray = Array.isArray(values) ? values : [values]
+            updateDimensionFilter(dimensionId, valuesArray as string[])
           })
         }
       }, 100)
@@ -493,9 +505,9 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
     })
   }, [selectedTableDimensions, allDimensionValues])
 
-  // Fetch data for all column combinations
+  // Fetch data for all column combinations using two-step approach
   const { data: allColumnData, isLoading: isLoadingColumnData } = useQuery({
-    queryKey: ['all-columns', tableCombinations, filters, selectedDimensions, customDimensions, selectedMetrics],
+    queryKey: ['all-columns', tableCombinations, filters, selectedDimensions, customDimensions, selectedMetrics, columnOrder],
     queryFn: async () => {
       const results: Record<string, any> = {}
 
@@ -551,20 +563,55 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
         return tableFilters
       }
 
-      // Fetch ALL columns in parallel (no sequential dependency)
-      const allFetches = tableCombinations.map(async (combination, index) => {
-        const tableFilters = buildTableFilters(combination)
-        return {
-          index,
-          data: await fetchPivotData(dims, tableFilters, 50, 0, undefined, selectedTable || undefined, true, selectedMetrics)
-        }
-      })
+      // TWO-STEP FETCH: First get primary (starred) column, then fetch others with same dimension values
 
-      // Wait for all fetches to complete
-      const allResults = await Promise.all(allFetches)
+      // STEP 1: Fetch primary column first
+      const primaryColIndex = columnOrder.length > 0 ? columnOrder[0] : 0
+      const primaryCombination = tableCombinations[primaryColIndex]
+      const primaryFilters = buildTableFilters(primaryCombination)
+
+      const primaryData = await fetchPivotData(
+        dims,
+        primaryFilters,
+        50, // limit
+        0,
+        undefined, // no dimension_values filter for primary column
+        selectedTable || undefined,
+        true,
+        selectedMetrics
+      )
+
+      results[primaryColIndex] = primaryData
+
+      // STEP 2: Extract dimension values from primary column results
+      const dimensionValues = primaryData.rows.map(row => row.dimension_value)
+
+      // STEP 3: Fetch remaining columns using the same dimension values
+      const remainingFetches = tableCombinations
+        .map((combination, index) => ({ combination, index }))
+        .filter(({ index }) => index !== primaryColIndex)
+        .map(async ({ combination, index }) => {
+          const tableFilters = buildTableFilters(combination)
+          return {
+            index,
+            data: await fetchPivotData(
+              dims,
+              tableFilters,
+              50, // limit ignored when dimension_values provided
+              0,
+              dimensionValues, // Filter to primary column's dimension values
+              selectedTable || undefined,
+              true,
+              selectedMetrics
+            )
+          }
+        })
+
+      // Wait for all remaining fetches to complete
+      const remainingResults = await Promise.all(remainingFetches)
 
       // Store results
-      allResults.forEach(({ index, data }) => {
+      remainingResults.forEach(({ index, data }) => {
         results[index] = data
       })
 
@@ -1620,7 +1667,7 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
     if (selection.type === 'chart' && 'metricId' in selection) {
       widgetType = 'chart'
       displayMode = 'single-metric-chart'
-      widgetMetrics = [selection.metricId]
+      widgetMetrics = selectedMetrics // Save ALL selected metrics (not just the clicked one)
       widgetDimensions = selectedDimensions
       widgetTableDimensions = selectedTableDimensions // Keep table dimensions for charts
       const metricLabel = getMetricById(selection.metricId)?.label || selection.metricId
@@ -1643,6 +1690,14 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
       widgetTitle = `${selectedDimensions.map(d => getDimensionLabel(d)).join(' > ')} - ${selectedMetrics.map(m => getMetricById(m)?.label || m).join(', ')}`
     }
 
+    const widgetFilters = Object.fromEntries(
+      Object.entries(pivotFilters.dimension_filters)
+        .filter(([_, values]) => values && values.length > 0)
+    )
+
+    console.log('Saving widget with filters:', widgetFilters)
+    console.log('pivotFilters.dimension_filters:', pivotFilters.dimension_filters)
+
     const updates = {
       type: widgetType,
       display_mode: displayMode,
@@ -1650,10 +1705,7 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
       dimensions: widgetDimensions,
       table_dimensions: widgetTableDimensions,
       metrics: widgetMetrics,
-      filters: Object.fromEntries(
-        Object.entries(pivotFilters.dimension_filters)
-          .filter(([_, values]) => values && values.length > 0)
-      ),
+      filters: widgetFilters,
       start_date: config.startDate || null,
       end_date: config.endDate || null,
       chart_type: widgetType === 'chart' ? (config.chartType || 'bar') : null,
@@ -1664,10 +1716,13 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
       // Additional editor state for complete persistence
       date_range_type: config.dateRangeType || null,
       relative_date_preset: config.relativeDatePreset || null,
-      visible_metrics: config.selectedDisplayMetrics || null,
+      visible_metrics: widgetType === 'chart' && selection.type === 'chart' && 'metricId' in selection
+        ? [selection.metricId]  // For charts, set the clicked metric as the default visible metric
+        : config.selectedDisplayMetrics || null,
       merge_threshold: mergeThreshold || null,
       dimension_sort_order: dimensionSortOrder || null,
       children_sort_config: childrenSortConfig || null,
+      row_sort_config: sortConfig || null,
     }
 
     updateWidgetMutation.mutate({
@@ -1719,9 +1774,9 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
     if (selectedWidgetType?.type === 'chart' && 'metricId' in selectedWidgetType) {
       // Single metric chart
       widgetType = 'chart'
-      widgetMetrics = [selectedWidgetType.metricId]
+      widgetMetrics = selectedMetrics // Save ALL selected metrics (not just the clicked one)
       widgetDimensions = selectedDimensions
-      widgetTableDimensions = selectedTableDimensions
+      widgetTableDimensions = selectedTableDimensions // Keep table dimensions for charts
       const metricLabel = getMetricById(selectedWidgetType.metricId)?.label || selectedWidgetType.metricId
       widgetTitle = `${selectedDimensions.map(d => getDimensionLabel(d)).join(' > ')} - ${metricLabel}`
     } else if (selectedWidgetType?.type === 'multi-table') {
@@ -1759,7 +1814,7 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
       displayMode = 'pivot-table'
     }
 
-    return {
+    const widgetConfig = {
       type: widgetType,
       display_mode: displayMode,
       table_id: selectedTable || '',
@@ -1781,11 +1836,16 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
       // Additional editor state for complete persistence
       date_range_type: config.dateRangeType || null,
       relative_date_preset: config.relativeDatePreset || null,
-      visible_metrics: config.selectedDisplayMetrics || null,
+      visible_metrics: widgetType === 'chart' && selectedWidgetType?.type === 'chart' && 'metricId' in selectedWidgetType
+        ? [selectedWidgetType.metricId]  // For charts, set the clicked metric as the default visible metric
+        : config.selectedDisplayMetrics || null,
       merge_threshold: mergeThreshold || null,
       dimension_sort_order: dimensionSortOrder || null,
       children_sort_config: childrenSortConfig || null,
+      row_sort_config: sortConfig || null,
     }
+
+    return widgetConfig
   })()
 
   // Check if configuration is valid for saving

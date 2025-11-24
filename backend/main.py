@@ -62,6 +62,7 @@ from models.schemas import (
     DashboardListResponse,
     DashboardCreateRequest,
     DashboardUpdateRequest,
+    WidgetConfig,
     WidgetCreateRequest,
     WidgetUpdateRequest
 )
@@ -786,10 +787,13 @@ async def list_base_metrics(table_id: Optional[str] = Query(None, description="T
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/metrics/base", response_model=BaseMetric)
-async def create_base_metric(metric: MetricCreate):
+async def create_base_metric(metric: MetricCreate, table_id: Optional[str] = Query(None, description="Optional table ID")):
     """Create a new base metric"""
     try:
-        _, metric_service, _ = get_schema_services()
+        services = get_schema_services(table_id)
+        if services is None:
+            raise HTTPException(status_code=400, detail="BigQuery not configured")
+        _, metric_service, _ = services
         return metric_service.create_base_metric(metric)
     except HTTPException:
         raise
@@ -799,10 +803,13 @@ async def create_base_metric(metric: MetricCreate):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/metrics/base/{metric_id}", response_model=BaseMetric)
-async def get_base_metric(metric_id: str):
+async def get_base_metric(metric_id: str, table_id: Optional[str] = Query(None, description="Optional table ID")):
     """Get a specific base metric"""
     try:
-        _, metric_service, _ = get_schema_services()
+        services = get_schema_services(table_id)
+        if services is None:
+            raise HTTPException(status_code=400, detail="BigQuery not configured")
+        _, metric_service, _ = services
         metric = metric_service.get_base_metric(metric_id)
 
         if metric is None:
@@ -815,10 +822,13 @@ async def get_base_metric(metric_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.put("/api/metrics/base/{metric_id}")
-async def update_base_metric(metric_id: str, update: MetricUpdate):
+async def update_base_metric(metric_id: str, update: MetricUpdate, table_id: Optional[str] = Query(None, description="Optional table ID")):
     """Update a base metric and cascade update dependents"""
     try:
-        _, metric_service, _ = get_schema_services()
+        services = get_schema_services(table_id)
+        if services is None:
+            raise HTTPException(status_code=400, detail="BigQuery not configured")
+        _, metric_service, _ = services
 
         # Update the base metric
         updated_metric = metric_service.update_base_metric(metric_id, update)
@@ -881,11 +891,33 @@ async def create_calculated_metric(metric: CalculatedMetricCreate, table_id: Opt
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/api/metrics/base/{metric_id}/daily-average", response_model=CalculatedMetric)
+async def create_daily_average_metric(metric_id: str, table_id: Optional[str] = Query(None, description="Table ID")):
+    """
+    Create a daily average metric for a base or calculated metric.
+    Automatically creates a calculated metric with formula: {metric_id} / {days_in_range}
+    Only works for metrics with category='volume'.
+    """
+    try:
+        _, metric_service, _ = get_schema_services(table_id)
+        return metric_service.create_daily_average_metric(metric_id, table_id)
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        import traceback
+        traceback.print_exc()  # Print full traceback to console
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/metrics/calculated/{metric_id}", response_model=CalculatedMetric)
-async def get_calculated_metric(metric_id: str):
+async def get_calculated_metric(metric_id: str, table_id: Optional[str] = Query(None, description="Optional table ID")):
     """Get a specific calculated metric"""
     try:
-        _, metric_service, _ = get_schema_services()
+        services = get_schema_services(table_id)
+        if services is None:
+            raise HTTPException(status_code=400, detail="BigQuery not configured")
+        _, metric_service, _ = services
         metric = metric_service.get_calculated_metric(metric_id)
 
         if metric is None:
@@ -936,10 +968,13 @@ async def delete_calculated_metric(metric_id: str, table_id: Optional[str] = Que
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/metrics/validate-formula")
-async def validate_formula(formula: dict):
+async def validate_formula(formula: dict, table_id: Optional[str] = Query(None, description="Optional table ID")):
     """Validate a metric formula"""
     try:
-        _, metric_service, _ = get_schema_services()
+        services = get_schema_services(table_id)
+        if services is None:
+            raise HTTPException(status_code=400, detail="BigQuery not configured")
+        _, metric_service, _ = services
         result = metric_service.validate_formula(formula.get('formula', ''))
         return result
     except HTTPException:
@@ -1001,10 +1036,13 @@ async def list_groupable_dimensions(table_id: Optional[str] = Query(None, descri
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/dimensions/{dimension_id}", response_model=DimensionDef)
-async def get_dimension(dimension_id: str):
+async def get_dimension(dimension_id: str, table_id: Optional[str] = Query(None, description="Optional table ID")):
     """Get a specific dimension"""
     try:
-        _, _, dimension_service = get_schema_services()
+        services = get_schema_services(table_id)
+        if services is None:
+            raise HTTPException(status_code=400, detail="BigQuery not configured")
+        _, _, dimension_service = services
         dimension = dimension_service.get_dimension(dimension_id)
 
         if dimension is None:
@@ -1146,6 +1184,8 @@ async def get_pivot_table(
         )
         return data_service.get_pivot_data(dimensions, filters, limit, offset, dimension_values, table_id, skip_count, metrics)
     except Exception as e:
+        import traceback
+        traceback.print_exc()  # Print full traceback to console
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/pivot/children", response_model=List[PivotChildRow])

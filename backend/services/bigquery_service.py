@@ -117,7 +117,11 @@ class BigQueryService:
 
         # Add all base metrics with their aggregations
         for metric in self.schema_config.base_metrics:
-            if metric.aggregation == 'COUNT_DISTINCT':
+            # Special handling for virtual metrics
+            if metric.is_system and metric.id == 'days_in_range':
+                # Virtual metric: compute days between min and max date in this group
+                select_parts.append(f"DATE_DIFF(MAX(date), MIN(date), DAY) + 1 as {metric.id}")
+            elif metric.aggregation == 'COUNT_DISTINCT':
                 # Support multi-column COUNT_DISTINCT: column_name can be "col1, col2, col3"
                 # BigQuery syntax: COUNT(DISTINCT col1, col2, col3)
                 columns = metric.column_name.strip()
@@ -341,14 +345,16 @@ class BigQueryService:
             relative_date_preset=relative_date_preset if 'relative_date_preset' in locals() else None
         )
 
-        group_by_clause = ", ".join(group_cols)
+        # Quote column names if they contain special characters
+        quoted_group_cols = [self._quote_column_name(col) for col in group_cols]
+        group_by_clause = ", ".join(quoted_group_cols)
 
         # Build count query - use approximate or exact based on parameter
-        if len(group_cols) > 1:
+        if len(quoted_group_cols) > 1:
             # For multiple dimensions, count distinct combinations
             if use_approx:
                 count_query = f"""
-                    SELECT APPROX_COUNT_DISTINCT(CONCAT({', "-", '.join(group_cols)})) as total_count
+                    SELECT APPROX_COUNT_DISTINCT(CONCAT({', "-", '.join(quoted_group_cols)})) as total_count
                     FROM `{self.table_path}`
                     {where_clause}
                 """
@@ -420,6 +426,28 @@ class BigQueryService:
 
         # Otherwise use absolute dates
         return start_date, end_date
+
+    def _quote_column_name(self, column_name: str) -> str:
+        """
+        Quote column name with backticks if needed for BigQuery.
+
+        BigQuery requires backticks for column names containing special characters like hyphens.
+
+        Args:
+            column_name: The column name to potentially quote
+
+        Returns:
+            Column name wrapped in backticks if it contains special characters
+        """
+        # Check if column name needs quoting (contains special chars except underscore)
+        needs_quoting = any(char in column_name for char in ['-', ' ', '.', ':', '/', '\\', '(', ')', '[', ']'])
+
+        if needs_quoting:
+            # Remove existing backticks if any and re-add them
+            clean_name = column_name.strip('`')
+            return f"`{clean_name}`"
+
+        return column_name
 
     def _clamp_dates(
         self,
@@ -499,9 +527,61 @@ class BigQueryService:
 
         # Dynamic dimension filters
         if dimension_filters:
+            from services.custom_dimension_service import get_custom_dimension_service
+
             for dimension_id, values in dimension_filters.items():
                 if not values:  # Skip empty filter arrays
                     continue
+
+                # Handle custom dimensions - they are virtual dimensions that need to be resolved
+                if dimension_id.startswith("custom_"):
+                    # Extract the UUID part after "custom_"
+                    custom_dim_id = dimension_id.replace("custom_", "")
+                    custom_dim_service = get_custom_dimension_service()
+                    custom_dim = custom_dim_service.get_by_id(custom_dim_id)
+
+                    if not custom_dim:
+                        continue  # Skip if custom dimension not found
+
+                    if custom_dim.type == "date_range":
+                        # For date_range custom dimensions: Resolve to date conditions
+                        date_conditions = []
+                        for value_label in values:
+                            matching_value = next((v for v in custom_dim.values if v.label == value_label), None)
+                            if matching_value:
+                                # Add date range condition with OR logic if multiple values
+                                date_conditions.append(
+                                    f"date BETWEEN '{matching_value.start_date}' AND '{matching_value.end_date}'"
+                                )
+
+                        if date_conditions:
+                            if len(date_conditions) == 1:
+                                conditions.append(date_conditions[0])
+                            else:
+                                # Multiple date ranges with OR
+                                conditions.append(f"({' OR '.join(date_conditions)})")
+
+                    elif custom_dim.type == "metric_condition":
+                        # For metric_condition custom dimensions: Resolve to metric conditions
+                        metric_conditions = []
+                        for value_label in values:
+                            matching_value = next((v for v in custom_dim.metric_values if v.label == value_label), None)
+                            if matching_value:
+                                # Build condition SQL from the metric conditions
+                                condition_sql = self.build_metric_condition_sql(
+                                    custom_dim.metric,
+                                    [c.dict() for c in matching_value.conditions]
+                                )
+                                metric_conditions.append(condition_sql)
+
+                        if metric_conditions:
+                            if len(metric_conditions) == 1:
+                                conditions.append(metric_conditions[0])
+                            else:
+                                # Multiple metric conditions with OR
+                                conditions.append(f"({' OR '.join(metric_conditions)})")
+
+                    continue  # Skip to next filter
 
                 # Find dimension in schema to get column name and data type
                 dimension_def = None
@@ -512,6 +592,9 @@ class BigQueryService:
                 column_name = dimension_def.column_name if dimension_def else dimension_id
                 data_type = dimension_def.data_type if dimension_def else "STRING"
 
+                # Quote column name if it contains special characters
+                quoted_column_name = self._quote_column_name(column_name)
+
                 # Build filter condition based on data type
                 if len(values) == 1:
                     # Single value - use equality
@@ -519,28 +602,28 @@ class BigQueryService:
                     if data_type in ["STRING", "DATE"]:
                         # Escape single quotes in string values
                         escaped_value = value.replace("'", "''")
-                        conditions.append(f"{column_name} = '{escaped_value}'")
+                        conditions.append(f"{quoted_column_name} = '{escaped_value}'")
                     elif data_type == "BOOLEAN":
                         bool_value = "TRUE" if value.lower() in ["true", "1", "yes"] else "FALSE"
-                        conditions.append(f"{column_name} = {bool_value}")
+                        conditions.append(f"{quoted_column_name} = {bool_value}")
                     else:  # INTEGER, FLOAT
-                        conditions.append(f"{column_name} = {value}")
+                        conditions.append(f"{quoted_column_name} = {value}")
                 else:
                     # Multiple values - use IN clause with OR logic
                     if data_type in ["STRING", "DATE"]:
                         # Escape single quotes in string values
                         escaped_values = [v.replace("'", "''") for v in values]
                         values_str = "', '".join(escaped_values)
-                        conditions.append(f"{column_name} IN ('{values_str}')")
+                        conditions.append(f"{quoted_column_name} IN ('{values_str}')")
                     elif data_type == "BOOLEAN":
                         bool_values = ", ".join([
                             "TRUE" if v.lower() in ["true", "1", "yes"] else "FALSE"
                             for v in values
                         ])
-                        conditions.append(f"{column_name} IN ({bool_values})")
+                        conditions.append(f"{quoted_column_name} IN ({bool_values})")
                     else:  # INTEGER, FLOAT
                         values_str = ", ".join(values)
-                        conditions.append(f"{column_name} IN ({values_str})")
+                        conditions.append(f"{quoted_column_name} IN ({values_str})")
 
         where_clause = "WHERE " + " AND ".join(conditions) if conditions else ""
         return where_clause

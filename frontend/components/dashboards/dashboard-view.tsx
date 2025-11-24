@@ -5,7 +5,6 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { ArrowLeft, Plus, Edit2, Trash2, Settings, LayoutGrid, Pen } from 'lucide-react'
 import { fetchDashboard, updateDashboard, deleteWidget, type Dashboard, type WidgetConfig } from '@/lib/api'
 import { useDashboard } from '@/lib/contexts/dashboard-context'
-import { useWidgetEditing } from '@/lib/contexts/widget-editing-context'
 import { AddWidgetDialog } from './add-widget-dialog'
 import { DashboardSettingsDialog } from './dashboard-settings-dialog'
 import { PivotTableWidget } from '../widgets/pivot-table-widget'
@@ -22,8 +21,7 @@ interface DashboardViewProps {
 
 export function DashboardView({ dashboardId, onBack, onTabChange }: DashboardViewProps) {
   const queryClient = useQueryClient()
-  const { isEditMode, setIsEditMode } = useDashboard()
-  const { startEditingWidget } = useWidgetEditing()
+  const { isEditMode, setIsEditMode, setEditingWidget, setCurrentDashboardId } = useDashboard()
   const [showAddWidgetDialog, setShowAddWidgetDialog] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
 
@@ -79,8 +77,9 @@ export function DashboardView({ dashboardId, onBack, onTabChange }: DashboardVie
   }
 
   const handleEditInEditor = (widget: WidgetConfig) => {
-    // Start editing mode with this widget
-    startEditingWidget(widget, dashboardId)
+    // Set the widget in the dashboard context
+    setEditingWidget(widget)
+    setCurrentDashboardId(dashboardId)
     // Switch to Editor tab
     if (onTabChange) {
       onTabChange('pivot')

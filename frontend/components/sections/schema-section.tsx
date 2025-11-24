@@ -1,11 +1,11 @@
 'use client'
 
 import { useState, useEffect } from 'react'
-import { Pencil, Trash2, Copy, FileText } from 'lucide-react'
+import { Pencil, Trash2, Copy, FileText, Calendar } from 'lucide-react'
 import { useSchema } from '@/hooks/use-schema'
 import { usePivotMetrics } from '@/hooks/use-pivot-metrics'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { fetchTables, copySchema, applySchemaTemplate } from '@/lib/api'
+import { fetchTables, copySchema, applySchemaTemplate, createDailyAverageMetric } from '@/lib/api'
 import { FormulaBuilderModal } from '@/components/modals/formula-builder-modal'
 import type {
   BaseMetric,
@@ -223,6 +223,18 @@ export function SchemaSection({ tableId }: SchemaSectionProps) {
     try {
       await deleteBaseMetric(id)
       setDetectionResult('Base metric deleted successfully!')
+    } catch (error) {
+      setDetectionResult(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`)
+    }
+  }
+
+  const handleCreateDailyAverage = async (metricId: string) => {
+    try {
+      await createDailyAverageMetric(metricId, tableId || undefined)
+      // Invalidate queries to refresh the metrics list
+      queryClient.invalidateQueries({ queryKey: ['schema'] })
+      queryClient.invalidateQueries({ queryKey: ['calculatedMetrics'] })
+      setDetectionResult(`Daily average metric "${metricId}_per_day" created successfully!`)
     } catch (error) {
       setDetectionResult(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`)
     }
@@ -561,6 +573,8 @@ export function SchemaSection({ tableId }: SchemaSectionProps) {
               onEdit={handleEditBaseMetric}
               onDelete={handleDeleteBaseMetric}
               onCreate={() => setIsCreateBaseMetricModalOpen(true)}
+              calculatedMetrics={calculatedMetrics}
+              onCreateDailyAverage={handleCreateDailyAverage}
             />
           )}
           {schemaTab === 'calculated' && (
@@ -570,6 +584,7 @@ export function SchemaSection({ tableId }: SchemaSectionProps) {
               onEdit={handleEditCalculatedMetric}
               onDelete={handleDeleteCalculatedMetric}
               onCreate={() => setIsCreateCalculatedMetricModalOpen(true)}
+              onCreateDailyAverage={handleCreateDailyAverage}
             />
           )}
           {schemaTab === 'dimensions' && (
@@ -660,9 +675,11 @@ interface BaseMetricsTabProps {
   onEdit: (metric: BaseMetric) => void
   onDelete: (id: string) => void
   onCreate: () => void
+  calculatedMetrics?: CalculatedMetric[]
+  onCreateDailyAverage: (metricId: string) => void
 }
 
-function BaseMetricsTab({ metrics, isLoading, onEdit, onDelete, onCreate }: BaseMetricsTabProps) {
+function BaseMetricsTab({ metrics, isLoading, onEdit, onDelete, onCreate, calculatedMetrics, onCreateDailyAverage }: BaseMetricsTabProps) {
   if (isLoading) {
     return <div className="text-center py-8 text-gray-500">Loading base metrics...</div>
   }
@@ -732,6 +749,24 @@ function BaseMetricsTab({ metrics, isLoading, onEdit, onDelete, onCreate }: Base
               </td>
               <td className="px-4 py-3 text-sm">
                 <div className="flex gap-2">
+                  {/* Create Daily Average button - only for volume metrics */}
+                  {metric.category === 'volume' && !metric.is_system && (() => {
+                    const dailyAvgId = `${metric.id}_per_day`
+                    const dailyAvgExists = calculatedMetrics?.some(m => m.id === dailyAvgId)
+                    return !dailyAvgExists ? (
+                      <button
+                        onClick={() => onCreateDailyAverage(metric.id)}
+                        className="p-1 text-green-600 hover:bg-green-50 rounded transition-colors"
+                        title="Create daily average (per-day) metric"
+                      >
+                        <Calendar className="h-4 w-4" />
+                      </button>
+                    ) : (
+                      <span className="p-1 text-gray-300" title="Daily average already exists">
+                        <Calendar className="h-4 w-4" />
+                      </span>
+                    )
+                  })()}
                   <button
                     onClick={() => onEdit(metric)}
                     className="p-1 text-blue-600 hover:bg-blue-50 rounded transition-colors"
@@ -763,9 +798,10 @@ interface CalculatedMetricsTabProps {
   onEdit: (metric: CalculatedMetric) => void
   onDelete: (id: string) => void
   onCreate: () => void
+  onCreateDailyAverage: (metricId: string) => void
 }
 
-function CalculatedMetricsTab({ metrics, isLoading, onEdit, onDelete, onCreate }: CalculatedMetricsTabProps) {
+function CalculatedMetricsTab({ metrics, isLoading, onEdit, onDelete, onCreate, onCreateDailyAverage }: CalculatedMetricsTabProps) {
   if (isLoading) {
     return <div className="text-center py-8 text-gray-500">Loading calculated metrics...</div>
   }
@@ -843,6 +879,24 @@ function CalculatedMetricsTab({ metrics, isLoading, onEdit, onDelete, onCreate }
                 </td>
                 <td className="px-4 py-3 text-sm">
                   <div className="flex gap-2">
+                    {/* Create Daily Average button - only for volume metrics */}
+                    {metric.category === 'volume' && (() => {
+                      const dailyAvgId = `${metric.id}_per_day`
+                      const dailyAvgExists = metrics.some(m => m.id === dailyAvgId)
+                      return !dailyAvgExists ? (
+                        <button
+                          onClick={() => onCreateDailyAverage(metric.id)}
+                          className="p-1 text-green-600 hover:bg-green-50 rounded transition-colors"
+                          title="Create daily average (per-day) metric"
+                        >
+                          <Calendar className="h-4 w-4" />
+                        </button>
+                      ) : (
+                        <span className="p-1 text-gray-300" title="Daily average already exists">
+                          <Calendar className="h-4 w-4" />
+                        </span>
+                      )
+                    })()}
                     <button
                       onClick={() => onEdit(metric)}
                       className="p-1 text-blue-600 hover:bg-blue-50 rounded transition-colors"

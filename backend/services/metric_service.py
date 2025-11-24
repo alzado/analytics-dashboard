@@ -55,16 +55,26 @@ class FormulaParser:
         # Validate that all referenced metrics exist (both base and calculated)
         base_metric_ids = {m.id for m in schema.base_metrics}
         calculated_metric_ids = {m.id for m in schema.calculated_metrics}
-        all_metric_ids = base_metric_ids | calculated_metric_ids
+
+        # Add system metrics that are always available
+        system_metrics = {'days_in_range'}
+        all_metric_ids = base_metric_ids | calculated_metric_ids | system_metrics
 
         for metric_ref in metric_refs:
+            print(f"DEBUG parse_formula: Processing metric_ref '{metric_ref}'")
             if metric_ref not in all_metric_ids:
                 errors.append(f"Unknown metric reference: {metric_ref}")
             else:
                 # Track which type of metric is referenced
-                if metric_ref in base_metric_ids and metric_ref not in depends_on_base:
+                if metric_ref in system_metrics and metric_ref not in depends_on_base:
+                    # System metrics are treated as base metrics
+                    print(f"DEBUG parse_formula: Adding system metric '{metric_ref}' to depends_on_base")
+                    depends_on_base.append(metric_ref)
+                elif metric_ref in base_metric_ids and metric_ref not in depends_on_base:
+                    print(f"DEBUG parse_formula: Adding base metric '{metric_ref}' to depends_on_base")
                     depends_on_base.append(metric_ref)
                 elif metric_ref in calculated_metric_ids and metric_ref not in depends_on_calculated:
+                    print(f"DEBUG parse_formula: Adding calculated metric '{metric_ref}' to depends_on_calculated")
                     depends_on_calculated.append(metric_ref)
 
         # Check for circular dependencies
@@ -128,7 +138,7 @@ class FormulaParser:
 
         return None
 
-    def _resolve_formula_to_sql(self, formula: str, schema: SchemaConfig, current_metric_id: Optional[str] = None, visited: Optional[Set[str]] = None) -> str:
+    def _resolve_formula_to_sql(self, formula: str, schema: SchemaConfig, current_metric_id: Optional[str] = None, visited: Optional[Set[str]] = None, resolve_for_subquery: bool = False) -> str:
         """
         Recursively resolve a formula to SQL by replacing metric references with their SQL expressions.
         This allows calculated metrics to reference other calculated metrics, and changes to base metrics
@@ -139,6 +149,8 @@ class FormulaParser:
             schema: Schema configuration
             current_metric_id: ID of current metric being resolved (for cycle detection)
             visited: Set of metric IDs already visited (for cycle detection)
+            resolve_for_subquery: If True, resolve for use in outer SELECT referencing subquery aliases.
+                                   System metrics like days_in_range will be treated as aliases.
 
         Returns:
             SQL expression with all metric references resolved
@@ -153,6 +165,20 @@ class FormulaParser:
         # Find all metric references in the formula
         metric_refs = re.findall(r'\{([a-zA-Z0-9_]+)\}', formula)
 
+        # Check if formula contains days_in_range - if so, we need subquery mode
+        has_days_in_range = 'days_in_range' in metric_refs
+
+        # If this formula has days_in_range and references other calculated metrics,
+        # we need to use alias mode to avoid nested aggregations
+        if has_days_in_range:
+            has_calculated_deps = any(
+                metric_ref != 'days_in_range' and
+                any(m.id == metric_ref for m in schema.calculated_metrics)
+                for metric_ref in metric_refs
+            )
+            if has_calculated_deps:
+                resolve_for_subquery = True
+
         sql_expression = formula
         for metric_ref in metric_refs:
             # Check for circular reference
@@ -160,29 +186,51 @@ class FormulaParser:
                 # Skip circular reference - this will be caught by validation
                 continue
 
+            # Special handling for system metrics
+            if metric_ref == 'days_in_range':
+                if resolve_for_subquery:
+                    # In subquery mode, reference days_in_range as an alias from the inner query
+                    replacement = "days_in_range"
+                else:
+                    # Virtual metric: days_in_range computes DATE_DIFF between min and max dates
+                    replacement = "DATE_DIFF(MAX(date), MIN(date), DAY) + 1"
+                sql_expression = sql_expression.replace(f"{{{metric_ref}}}", replacement)
+                continue
+
             # Check if it's a base metric
             base_metric = next((m for m in schema.base_metrics if m.id == metric_ref), None)
             if base_metric:
-                # Replace with aggregated column
-                agg_func = base_metric.aggregation
-                if agg_func == 'COUNT_DISTINCT':
-                    replacement = f"COUNT(DISTINCT {base_metric.column_name})"
+                if resolve_for_subquery:
+                    # In subquery mode, reference base metric by alias
+                    replacement = metric_ref
                 else:
-                    replacement = f"{agg_func}({base_metric.column_name})"
+                    # Regular base metric: Replace with aggregated column
+                    agg_func = base_metric.aggregation
+                    if agg_func == 'COUNT_DISTINCT':
+                        replacement = f"COUNT(DISTINCT {base_metric.column_name})"
+                    else:
+                        replacement = f"{agg_func}({base_metric.column_name})"
                 sql_expression = sql_expression.replace(f"{{{metric_ref}}}", replacement)
             else:
                 # It's a calculated metric - recursively resolve its formula
                 calc_metric = next((m for m in schema.calculated_metrics if m.id == metric_ref), None)
                 if calc_metric:
-                    # Recursively resolve the calculated metric's formula
-                    resolved_sql = self._resolve_formula_to_sql(
-                        calc_metric.formula,
-                        schema,
-                        metric_ref,
-                        visited.copy()
-                    )
-                    # Wrap in parentheses to preserve order of operations
-                    sql_expression = sql_expression.replace(f"{{{metric_ref}}}", f"({resolved_sql})")
+                    if resolve_for_subquery:
+                        # In subquery mode, reference calculated metric by alias
+                        # This assumes the calculated metric is computed in an inner subquery
+                        replacement = metric_ref
+                        sql_expression = sql_expression.replace(f"{{{metric_ref}}}", replacement)
+                    else:
+                        # Recursively resolve the calculated metric's formula
+                        resolved_sql = self._resolve_formula_to_sql(
+                            calc_metric.formula,
+                            schema,
+                            metric_ref,
+                            visited.copy(),
+                            resolve_for_subquery
+                        )
+                        # Wrap in parentheses to preserve order of operations
+                        sql_expression = sql_expression.replace(f"{{{metric_ref}}}", f"({resolved_sql})")
 
         return sql_expression
 
@@ -340,6 +388,76 @@ class MetricService:
             is_visible_by_default=metric_data.is_visible_by_default,
             sort_order=metric_data.sort_order,
             description=metric_data.description
+        )
+
+        # Add to schema
+        schema.calculated_metrics.append(metric)
+        self.schema_service.save_schema(schema)
+
+        return metric
+
+    def create_daily_average_metric(self, source_metric_id: str, table_id: Optional[str] = None) -> CalculatedMetric:
+        """
+        Create a daily average metric (per-day version) from a source metric.
+
+        Args:
+            source_metric_id: ID of the source metric to create daily average for
+            table_id: Optional table ID (for multi-table support)
+
+        Returns:
+            Created CalculatedMetric with formula: {source_metric} / {days_in_range}
+
+        Raises:
+            ValueError: If source metric not found, not volume category, or daily version already exists
+        """
+        schema = self.schema_service.load_schema()
+
+        # Find source metric (check both base and calculated metrics)
+        source_metric = next((m for m in schema.base_metrics if m.id == source_metric_id), None)
+        is_base_metric = source_metric is not None
+
+        if not source_metric:
+            source_metric = next((m for m in schema.calculated_metrics if m.id == source_metric_id), None)
+
+        if not source_metric:
+            raise ValueError(f"Source metric '{source_metric_id}' not found")
+
+        # Validate source metric is volume category
+        if source_metric.category != 'volume':
+            raise ValueError(f"Only volume metrics can have daily averages. Metric '{source_metric_id}' has category '{source_metric.category}'")
+
+        # Generate daily average metric ID
+        daily_avg_id = f"{source_metric_id}_per_day"
+
+        # Check if daily average metric already exists
+        existing = next((m for m in schema.calculated_metrics if m.id == daily_avg_id), None)
+        if existing:
+            raise ValueError(f"Daily average metric '{daily_avg_id}' already exists")
+
+        # Create formula: {source_metric} / {days_in_range}
+        formula = f"{{{source_metric_id}}} / {{days_in_range}}"
+
+        # Parse and generate SQL expression
+        sql_expression, depends_on_all, depends_on_base, depends_on_calculated, errors = self.formula_parser.parse_formula(formula, schema)
+
+        if errors:
+            raise ValueError(f"Failed to parse formula: {', '.join(errors)}")
+
+        # Create calculated metric with inherited properties
+        metric = CalculatedMetric(
+            id=daily_avg_id,
+            display_name=f"{source_metric.display_name} per Day",
+            formula=formula,
+            sql_expression=sql_expression,
+            depends_on=depends_on_all,
+            depends_on_base=depends_on_base,
+            depends_on_calculated=depends_on_calculated,
+            format_type=source_metric.format_type,  # Inherit format from source
+            decimal_places=2,  # Daily averages typically need more precision
+            category='volume_daily',  # New category for daily averages
+            is_visible_by_default=True,
+            sort_order=source_metric.sort_order + 500,  # Place after source metric
+            description=f"Daily average of {source_metric.display_name} (divided by days in filtered date range)"
         )
 
         # Add to schema

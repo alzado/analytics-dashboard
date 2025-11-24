@@ -1,5 +1,7 @@
+from __future__ import annotations
+
 from pydantic import BaseModel, Field, field_validator, model_validator
-from typing import Optional, List, Union, Literal, Dict
+from typing import Optional, List, Union, Literal, Dict, Any
 from datetime import date
 from enum import Enum
 
@@ -343,6 +345,7 @@ class BaseMetric(BaseModel):
     is_visible_by_default: bool = Field(default=True, description="Whether to show in tables by default")
     sort_order: int = Field(default=999, description="Display order in UI (lower = first)")
     description: Optional[str] = Field(None, description="Metric description")
+    is_system: bool = Field(default=False, description="Whether this is a system-generated virtual metric (e.g., days_in_range)")
 
     @model_validator(mode='after')
     def validate_multi_column(self):
@@ -486,6 +489,13 @@ class WidgetPosition(BaseModel):
     w: int = Field(..., description="Width in grid units", ge=1, le=12)
     h: int = Field(..., description="Height in grid units", ge=1)
 
+class RowSortConfig(BaseModel):
+    """Row sorting configuration for widgets"""
+    column: Union[str, int] = Field(..., description="Column to sort by (metric ID for single-table, column index for multi-table)")
+    subColumn: Optional[Literal["value", "diff", "pctDiff"]] = Field(None, description="Sub-column type (value, diff, or pctDiff)")
+    direction: Literal["asc", "desc"] = Field(..., description="Sort direction")
+    metric: Optional[str] = Field(None, description="Metric ID (for multi-table mode)")
+
 class WidgetConfig(BaseModel):
     """Configuration for a dashboard widget"""
     id: str = Field(..., description="Unique widget ID (UUID)")
@@ -519,6 +529,7 @@ class WidgetConfig(BaseModel):
     merge_threshold: Optional[int] = Field(None, description="Grouping/merge threshold for rows")
     dimension_sort_order: Optional[Literal["asc", "desc"]] = Field(None, description="Sort order for dimension column")
     children_sort_config: Optional[Dict[str, str]] = Field(None, description="Sort config for expanded child rows (column and direction)")
+    row_sort_config: Optional[RowSortConfig] = Field(None, description="Row sorting config (column, subColumn, direction, metric)")
 
     # Position in grid
     position: WidgetPosition = Field(..., description="Widget position in grid layout")
@@ -575,6 +586,7 @@ class WidgetCreateRequest(BaseModel):
     merge_threshold: Optional[int] = Field(None, description="Grouping/merge threshold")
     dimension_sort_order: Optional[Literal["asc", "desc"]] = Field(None, description="Dimension sort order")
     children_sort_config: Optional[Dict[str, str]] = Field(None, description="Child rows sort config")
+    row_sort_config: Optional[RowSortConfig] = Field(None, description="Row sorting config (column, subColumn, direction, metric)")
 
 class WidgetUpdateRequest(BaseModel):
     """Request to update a widget"""
@@ -600,3 +612,4 @@ class WidgetUpdateRequest(BaseModel):
     merge_threshold: Optional[int] = Field(None, description="Grouping/merge threshold")
     dimension_sort_order: Optional[Literal["asc", "desc"]] = Field(None, description="Dimension sort order")
     children_sort_config: Optional[Dict[str, str]] = Field(None, description="Child rows sort config")
+    row_sort_config: Optional[RowSortConfig] = Field(None, description="Row sorting config (column, subColumn, direction, metric)")

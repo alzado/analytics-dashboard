@@ -63,15 +63,34 @@ def _get_all_metrics_for_pivot(table_id: Optional[str] = None, requested_metrics
                 base_metrics = [m for m in all_base_metrics if m.id in requested_set]
                 calculated_metrics = [m for m in all_calculated_metrics if m.id in requested_set]
 
-                # Also include base metrics that calculated metrics depend on
-                for calc_metric in calculated_metrics:
+                # Also include dependencies (both base and calculated) that requested metrics depend on
+                # This is crucial for metrics like "ctr_per_day" that depend on "ctr" (calculated)
+                processed = set()  # Track processed metrics to avoid infinite loops
+                to_process = list(calculated_metrics)
+
+                while to_process:
+                    calc_metric = to_process.pop(0)
+                    if calc_metric.id in processed:
+                        continue
+                    processed.add(calc_metric.id)
+
                     if calc_metric.depends_on:
                         for dep_id in calc_metric.depends_on:
                             # Add dependency if not already included
                             if dep_id not in requested_set:
+                                # Check if it's a base metric
                                 dep_metric = next((m for m in all_base_metrics if m.id == dep_id), None)
                                 if dep_metric and dep_metric not in base_metrics:
                                     base_metrics.append(dep_metric)
+                                    requested_set.add(dep_id)
+                                else:
+                                    # Check if it's a calculated metric
+                                    dep_calc_metric = next((m for m in all_calculated_metrics if m.id == dep_id), None)
+                                    if dep_calc_metric and dep_calc_metric not in calculated_metrics:
+                                        calculated_metrics.append(dep_calc_metric)
+                                        requested_set.add(dep_id)
+                                        # Process this calculated metric's dependencies too
+                                        to_process.append(dep_calc_metric)
             else:
                 base_metrics = all_base_metrics
                 calculated_metrics = all_calculated_metrics
@@ -95,13 +114,15 @@ def _get_all_metrics_for_pivot(table_id: Optional[str] = None, requested_metrics
                     # Option 2: If primary sort metric doesn't exist, use first available metric
                     primary_sort_metric = None
 
-            if not primary_sort_metric and base_metrics:
-                # Fallback: use first visible metric with lowest sort_order
-                visible = [m for m in base_metrics if m.is_visible_by_default]
-                if visible:
-                    primary_sort_metric = sorted(visible, key=lambda m: m.sort_order)[0].id
-                else:
-                    primary_sort_metric = base_metrics[0].id
+            if not primary_sort_metric:
+                # Fallback: use first visible metric with lowest sort_order from base or calculated
+                all_metrics = base_metrics + calculated_metrics
+                if all_metrics:
+                    visible = [m for m in all_metrics if m.is_visible_by_default]
+                    if visible:
+                        primary_sort_metric = sorted(visible, key=lambda m: m.sort_order)[0].id
+                    else:
+                        primary_sort_metric = all_metrics[0].id
 
             # Get avg per day metric from schema config, or use primary sort metric as fallback
             avg_per_day_metric = schema_config.avg_per_day_metric if schema_config else None
@@ -146,35 +167,128 @@ def _load_metrics_data(bq_service):
     Load all base and calculated metrics from schema service.
     This is an alias for _get_all_metrics_for_pivot() for backward compatibility.
     """
-    return _get_all_metrics_for_pivot()
+    table_id = bq_service.table_id if bq_service else None
+    return _get_all_metrics_for_pivot(table_id=table_id)
 
 
 def _build_pivot_select_clause(metrics_data):
     """
     Build dynamic SQL SELECT clause for pivot table queries.
-    Includes all base metrics and SQL expressions for calculated metrics.
+    Uses a two-tier approach to avoid redundant calculations:
+    - Base metrics are calculated with aggregations
+    - Calculated metrics reference base metric aliases (no re-aggregation)
 
     Args:
         metrics_data: Dict from _get_all_metrics_for_pivot()
 
     Returns:
-        String with SELECT clause items (without the SELECT keyword)
+        Tuple of (base_select_items, calculated_select_items) where calculated metrics
+        reference base metrics by their aliases
     """
-    select_items = []
+    print(f"DEBUG _build_pivot_select_clause called with {len(metrics_data.get('calculated_metrics', []))} calculated metrics")
+    base_select_items = []
+    calculated_select_items = []
 
-    # Add base metrics
+    # Separate calculated metrics into categories for proper SQL generation:
+    # - Simple: no dependencies, computed in base query
+    # - Intermediate: dependencies on calculated metrics that are used by days_in_range metrics
+    # - Complex: all other calculated metrics
+    #
+    # Key insight: When a metric like "ctr_per_day = ctr / days_in_range" exists,
+    # the "ctr" metric must be computed in the base query so it can be referenced by alias
+    simple_calculated_metrics = []
+    complex_calculated_metrics = []
+
+    # First pass: identify metrics that depend on days_in_range
+    metrics_with_days_in_range = set()
+    for metric in metrics_data['calculated_metrics']:
+        if metric.depends_on and 'days_in_range' in metric.depends_on:
+            metrics_with_days_in_range.add(metric.id)
+
+    # Second pass: find all calculated metric dependencies of days_in_range metrics
+    # These need to be computed in the base query so they can be referenced
+    must_be_in_base_query = set()
+    for metric in metrics_data['calculated_metrics']:
+        if metric.id in metrics_with_days_in_range and metric.depends_on_calculated:
+            for dep_id in metric.depends_on_calculated:
+                must_be_in_base_query.add(dep_id)
+
+    # Third pass: classify metrics
+    for metric in metrics_data['calculated_metrics']:
+        # Skip days_in_range metrics themselves - they go to complex
+        if metric.id in metrics_with_days_in_range:
+            complex_calculated_metrics.append(metric)
+        # Check if this calculated metric has no dependencies (simple aggregation)
+        elif not metric.depends_on or len(metric.depends_on) == 0:
+            simple_calculated_metrics.append(metric)
+        # Check if this metric must be in base query (dependency of days_in_range metric)
+        elif metric.id in must_be_in_base_query:
+            simple_calculated_metrics.append(metric)
+        else:
+            complex_calculated_metrics.append(metric)
+
+    # Add true base metrics
     for metric in metrics_data['base_metrics']:
         # Use aggregation from schema with actual column name from BigQuery
         agg = metric.aggregation
         col = metric.column_name
-        select_items.append(f"{agg}({col}) as {metric.id}")
+        if metric.is_system and metric.id == 'days_in_range':
+            # Special handling for virtual metric - use DATE_DIFF instead of whatever aggregation is in schema
+            base_select_items.append(f"DATE_DIFF(MAX(date), MIN(date), DAY) + 1 as {metric.id}")
+        else:
+            base_select_items.append(f"{agg}({col}) as {metric.id}")
 
-    # Add calculated metrics using their SQL expressions
-    for metric in metrics_data['calculated_metrics']:
-        # The sql_expression already includes the aggregation
-        select_items.append(f"({metric.sql_expression}) as {metric.id}")
+    # Add simple calculated metrics to base items (they're really just aggregations)
+    for metric in simple_calculated_metrics:
+        base_select_items.append(f"{metric.sql_expression} as {metric.id}")
 
-    return ",\n                ".join(select_items)
+    # Create a combined list of all "base-level" metrics (true base + simple calculated)
+    # This is used later when selecting from subquery
+    all_base_metrics = list(metrics_data['base_metrics']) + simple_calculated_metrics
+
+    # No need to track extra columns anymore since days_in_range is now a base metric in schema
+    extra_base_columns = []
+
+    # Build complex calculated metrics that reference base metrics by alias (not by re-aggregating)
+    # We only process complex calculated metrics here (simple ones are already in base_select_items)
+    for metric in complex_calculated_metrics:
+        # Convert sql_expression to reference aliases instead of aggregations
+        sql_expr = metric.sql_expression
+
+        # Replace true base metrics with their aliases
+        for base_metric in metrics_data['base_metrics']:
+            # Pattern to match: AGG(column_name) where AGG is the aggregation function
+            agg_func = base_metric.aggregation
+            col_name = base_metric.column_name
+
+            if agg_func == 'COUNT_DISTINCT':
+                pattern = f"COUNT(DISTINCT {col_name})"
+            elif agg_func == 'COUNT':
+                # Handle both COUNT(column) and COUNT(*)
+                pattern1 = f"COUNT({col_name})"
+                pattern2 = "COUNT(*)"
+                sql_expr = sql_expr.replace(pattern1, base_metric.id)
+                sql_expr = sql_expr.replace(pattern2, base_metric.id)
+                continue  # Skip the regular replacement below
+            else:
+                pattern = f"{agg_func}({col_name})"
+
+            # Replace with just the metric alias
+            sql_expr = sql_expr.replace(pattern, base_metric.id)
+
+        # Also replace simple calculated metrics (like queries = COUNT(*))
+        for simple_metric in simple_calculated_metrics:
+            # Replace the full SQL expression with the metric ID
+            sql_expr = sql_expr.replace(simple_metric.sql_expression, simple_metric.id)
+
+        # Special handling for days_in_range virtual metric
+        sql_expr = sql_expr.replace("DATE_DIFF(MAX(date), MIN(date), DAY) + 1", "days_in_range")
+
+        calculated_select_items.append(f"({sql_expr}) as {metric.id}")
+
+    # Return base select items, calculated select items, the list of all base-level metrics,
+    # and extra columns that need to be selected from inner query (like days_in_range)
+    return base_select_items, calculated_select_items, all_base_metrics, extra_base_columns
 
 
 def _extract_metrics_from_row(row, metrics_data):
@@ -302,7 +416,7 @@ def _query_custom_dimension_pivot(
 
     # Load all metrics dynamically from schema
     metrics_data = _get_all_metrics_for_pivot()
-    select_clause = _build_pivot_select_clause(metrics_data)
+    base_select_items, calculated_select_items, all_base_metrics, extra_base_columns = _build_pivot_select_clause(metrics_data)
 
     # Determine metric for sorting and avg per day
     if metrics_data['primary_sort_metric']:
@@ -353,15 +467,40 @@ def _query_custom_dimension_pivot(
                 relative_date_preset=None
             )
 
-            # Query for this date range with dynamic metrics
-            query = f"""
-                SELECT
-                    {select_clause},
-                    MIN(date) as min_date,
-                    MAX(date) as max_date
-                FROM `{bq_service.table_path}`
-                {where_clause}
-            """
+            # Query for this date range with dynamic metrics using subquery pattern
+            base_select_str = ',\n                    '.join(base_select_items)
+
+            if calculated_select_items:
+                # List base metric aliases to select from inner query (including extra columns like days_in_range)
+                base_metric_aliases = [metric.id for metric in all_base_metrics] + extra_base_columns
+                base_aliases_str = ', '.join(base_metric_aliases)
+                calculated_select_str = ',\n                '.join(calculated_select_items)
+
+                query = f"""
+                    SELECT
+                        {base_aliases_str},
+                        {calculated_select_str},
+                        min_date,
+                        max_date
+                    FROM (
+                        SELECT
+                            {base_select_str},
+                            MIN(date) as min_date,
+                            MAX(date) as max_date
+                        FROM `{bq_service.table_path}`
+                        {where_clause}
+                    )
+                """
+            else:
+                # If no calculated metrics, use base metrics directly
+                query = f"""
+                    SELECT
+                        {base_select_str},
+                        MIN(date) as min_date,
+                        MAX(date) as max_date
+                    FROM `{bq_service.table_path}`
+                    {where_clause}
+                """
 
             df = bq_service._execute_and_log_query(query, query_type="pivot", endpoint="data_service")
 
@@ -741,7 +880,7 @@ def get_pivot_data(dimensions: List[str], filters: FilterParams, limit: int = 50
 
     # Load all metrics dynamically from schema, optionally filtered by requested metrics
     metrics_data = _get_all_metrics_for_pivot(table_id, requested_metrics=metrics)
-    select_clause = _build_pivot_select_clause(metrics_data)
+    base_select_items, calculated_select_items, all_base_metrics, extra_base_columns = _build_pivot_select_clause(metrics_data)
 
     # Check if any dimension is a custom dimension (starts with "custom_")
     if dimensions and len(dimensions) > 0:
@@ -794,13 +933,38 @@ def get_pivot_data(dimensions: List[str], filters: FilterParams, limit: int = 50
             relative_date_preset=filters.relative_date_preset
         )
 
-        # Query for aggregated totals
-        query = f"""
-            SELECT
-                {select_clause}
-            FROM `{bq_service.table_path}`
-            {where_clause}
-        """
+        # Query for aggregated totals with subquery pattern
+        # Inner query calculates base metrics, outer query calculates calculated metrics
+        base_select_str = ',\n                '.join(base_select_items)
+
+        if calculated_select_items:
+            # List base metric aliases to select from inner query (including extra columns like days_in_range)
+            base_metric_aliases = [metric.id for metric in all_base_metrics] + extra_base_columns
+            print(f"DEBUG: base_metric_aliases = {base_metric_aliases}")
+            print(f"DEBUG: all_base_metrics = {[m.id for m in all_base_metrics]}")
+            base_aliases_str = ', '.join(base_metric_aliases)
+            calculated_select_str = ',\n            '.join(calculated_select_items)
+            print(f"DEBUG: calculated_select_items = {calculated_select_items}")
+
+            query = f"""
+                SELECT
+                    {base_aliases_str},
+                    {calculated_select_str}
+                FROM (
+                    SELECT
+                        {base_select_str}
+                    FROM `{bq_service.table_path}`
+                    {where_clause}
+                )
+            """
+        else:
+            # If no calculated metrics, just use base metrics directly
+            query = f"""
+                SELECT
+                    {base_select_str}
+                FROM `{bq_service.table_path}`
+                {where_clause}
+            """
 
         df = bq_service._execute_and_log_query(query, query_type="pivot", endpoint="data_service")
 
@@ -861,13 +1025,16 @@ def get_pivot_data(dimensions: List[str], filters: FilterParams, limit: int = 50
 
     # Map all dimensions to their column names
     group_cols = [dimension_map.get(dim, dim) for dim in dimensions]
-    group_by_clause = ", ".join(group_cols)
+
+    # Quote column names if they contain special characters (like hyphens in custom dimensions)
+    quoted_group_cols = [bq_service._quote_column_name(col) for col in group_cols]
+    group_by_clause = ", ".join(quoted_group_cols)
 
     # Build SELECT clause for dimension values
     # For multiple dimensions, concat them with " - " separator
-    if len(group_cols) > 1:
+    if len(quoted_group_cols) > 1:
         # Convert each column to string and join with separator
-        cast_cols = [f"CAST({col} AS STRING)" for col in group_cols]
+        cast_cols = [f"CAST({col} AS STRING)" for col in quoted_group_cols]
         separator = ', " - ", '
         concat_args = separator.join(cast_cols)
         dim_value_clause = f"CONCAT({concat_args}) as dimension_value"
@@ -875,9 +1042,9 @@ def get_pivot_data(dimensions: List[str], filters: FilterParams, limit: int = 50
         # Check if dimension is DATE type and cast to STRING
         dim_def = next((d for d in metrics_data['schema_config'].dimensions if d.column_name == group_cols[0]), None)
         if dim_def and dim_def.data_type == 'DATE':
-            dim_value_clause = f"CAST({group_cols[0]} AS STRING) as dimension_value"
+            dim_value_clause = f"CAST({quoted_group_cols[0]} AS STRING) as dimension_value"
         else:
-            dim_value_clause = f"{group_cols[0]} as dimension_value"
+            dim_value_clause = f"{quoted_group_cols[0]} as dimension_value"
 
     # Query for pivot data with dynamic metrics
     # Determine which metric to sort by
@@ -926,41 +1093,100 @@ def get_pivot_data(dimensions: List[str], filters: FilterParams, limit: int = 50
         dimension_values_filter = f"{connector} {dimension_column} IN ('{values_list}')"
 
     # Main query - get top N dimension values with offset (or specific values if provided)
-    if dimension_values and len(dimension_values) > 0:
-        # When fetching specific dimension values, don't use LIMIT/OFFSET and sort alphabetically for consistent ordering
-        query = f"""
-            SELECT
-                {dim_value_clause},
-                {select_clause}
-            FROM `{bq_service.table_path}`
-            {where_clause}
-            {dimension_values_filter}
-            GROUP BY {group_by_clause}
-            ORDER BY {group_by_clause}
-        """
+    # Use subquery pattern to avoid redundant metric calculations
+    base_select_str = ',\n                '.join(base_select_items)
+
+    if calculated_select_items:
+        # List base metric aliases to select from inner query (including extra columns like days_in_range)
+        base_metric_aliases = [metric.id for metric in all_base_metrics] + extra_base_columns
+        base_aliases_str = ', '.join(base_metric_aliases)
+        calculated_select_str = ',\n            '.join(calculated_select_items)
+
+        if dimension_values and len(dimension_values) > 0:
+            # When fetching specific dimension values, don't use LIMIT/OFFSET and sort alphabetically for consistent ordering
+            query = f"""
+                SELECT
+                    dimension_value,
+                    {base_aliases_str},
+                    {calculated_select_str}
+                FROM (
+                    SELECT
+                        {dim_value_clause},
+                        {base_select_str}
+                    FROM `{bq_service.table_path}`
+                    {where_clause}
+                    {dimension_values_filter}
+                    GROUP BY {group_by_clause}
+                )
+                ORDER BY dimension_value
+            """
+        else:
+            # Normal top-N query
+            query = f"""
+                SELECT
+                    dimension_value,
+                    {base_aliases_str},
+                    {calculated_select_str}
+                FROM (
+                    SELECT
+                        {dim_value_clause},
+                        {base_select_str}
+                    FROM `{bq_service.table_path}`
+                    {where_clause}
+                    GROUP BY {group_by_clause}
+                )
+                ORDER BY {primary_sort} DESC
+                LIMIT {limit}
+                OFFSET {offset}
+            """
     else:
-        # Normal top-N query
-        query = f"""
-            SELECT
-                {dim_value_clause},
-                {select_clause}
-            FROM `{bq_service.table_path}`
-            {where_clause}
-            GROUP BY {group_by_clause}
-            ORDER BY {primary_sort} DESC
-            LIMIT {limit}
-            OFFSET {offset}
-        """
+        # If no calculated metrics, use base metrics directly
+        if dimension_values and len(dimension_values) > 0:
+            query = f"""
+                SELECT
+                    {dim_value_clause},
+                    {base_select_str}
+                FROM `{bq_service.table_path}`
+                {where_clause}
+                {dimension_values_filter}
+                GROUP BY {group_by_clause}
+                ORDER BY {group_by_clause}
+            """
+        else:
+            query = f"""
+                SELECT
+                    {dim_value_clause},
+                    {base_select_str}
+                FROM `{bq_service.table_path}`
+                {where_clause}
+                GROUP BY {group_by_clause}
+                ORDER BY {primary_sort} DESC
+                LIMIT {limit}
+                OFFSET {offset}
+            """
 
     df = bq_service._execute_and_log_query(query, query_type="pivot", endpoint="data_service")
 
-    # Totals query - get overall totals in a separate query
-    totals_query = f"""
-        SELECT
-            {select_clause}
-        FROM `{bq_service.table_path}`
-        {where_clause}
-    """
+    # Totals query - get overall totals in a separate query with subquery pattern
+    if calculated_select_items:
+        totals_query = f"""
+            SELECT
+                {base_aliases_str},
+                {calculated_select_str}
+            FROM (
+                SELECT
+                    {base_select_str}
+                FROM `{bq_service.table_path}`
+                {where_clause}
+            )
+        """
+    else:
+        totals_query = f"""
+            SELECT
+                {base_select_str}
+            FROM `{bq_service.table_path}`
+            {where_clause}
+        """
 
     totals_df = bq_service._execute_and_log_query(totals_query, query_type="pivot_totals", endpoint="data_service")
 
@@ -1059,7 +1285,7 @@ def get_pivot_children(
 
     # Load all metrics dynamically from schema
     metrics_data = _get_all_metrics_for_pivot()
-    select_clause = _build_pivot_select_clause(metrics_data)
+    base_select_items, calculated_select_items, all_base_metrics, extra_base_columns = _build_pivot_select_clause(metrics_data)
     if metrics_data['primary_sort_metric']:
         primary_sort = metrics_data['primary_sort_metric']
     elif metrics_data['base_metrics']:
@@ -1172,17 +1398,45 @@ def get_pivot_children(
     grand_total_primary = float(total_df['total_primary_metric'].iloc[0]) if not total_df.empty and total_df['total_primary_metric'].iloc[0] is not None else 0
 
     # Query for search terms within this dimension value using dynamic metrics
-    query = f"""
-        SELECT
-            search_term,
-            {select_clause}
-        FROM `{bq_service.table_path}`
-        {where_clause}
-        GROUP BY search_term
-        ORDER BY {primary_sort} DESC
-        LIMIT {limit}
-        OFFSET {offset}
-    """
+    # Use subquery pattern to avoid redundant metric calculations
+    base_select_str = ',\n                '.join(base_select_items)
+
+    if calculated_select_items:
+        # List base metric aliases to select from inner query (including extra columns like days_in_range)
+        base_metric_aliases = [metric.id for metric in all_base_metrics] + extra_base_columns
+        base_aliases_str = ', '.join(base_metric_aliases)
+        calculated_select_str = ',\n            '.join(calculated_select_items)
+
+        query = f"""
+            SELECT
+                search_term,
+                {base_aliases_str},
+                {calculated_select_str}
+            FROM (
+                SELECT
+                    search_term,
+                    {base_select_str}
+                FROM `{bq_service.table_path}`
+                {where_clause}
+                GROUP BY search_term
+            )
+            ORDER BY {primary_sort} DESC
+            LIMIT {limit}
+            OFFSET {offset}
+        """
+    else:
+        # If no calculated metrics, use base metrics directly
+        query = f"""
+            SELECT
+                search_term,
+                {base_select_str}
+            FROM `{bq_service.table_path}`
+            {where_clause}
+            GROUP BY search_term
+            ORDER BY {primary_sort} DESC
+            LIMIT {limit}
+            OFFSET {offset}
+        """
 
     df = bq_service._execute_and_log_query(query, query_type="pivot", endpoint="data_service")
 
