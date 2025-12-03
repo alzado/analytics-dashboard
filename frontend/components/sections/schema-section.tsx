@@ -2,6 +2,7 @@
 
 import { useState, useEffect } from 'react'
 import { Pencil, Trash2, Copy, FileText, Calendar } from 'lucide-react'
+import { SearchInput } from '@/components/ui/search-input'
 import { useSchema } from '@/hooks/use-schema'
 import { usePivotMetrics } from '@/hooks/use-pivot-metrics'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
@@ -680,6 +681,19 @@ interface BaseMetricsTabProps {
 }
 
 function BaseMetricsTab({ metrics, isLoading, onEdit, onDelete, onCreate, calculatedMetrics, onCreateDailyAverage }: BaseMetricsTabProps) {
+  const [searchTerm, setSearchTerm] = useState('')
+
+  const filteredMetrics = metrics?.filter((metric) => {
+    if (!searchTerm) return true
+    const term = searchTerm.toLowerCase()
+    return (
+      metric.display_name.toLowerCase().includes(term) ||
+      metric.id.toLowerCase().includes(term) ||
+      metric.column_name.toLowerCase().includes(term) ||
+      metric.category.toLowerCase().includes(term)
+    )
+  }) ?? []
+
   if (isLoading) {
     return <div className="text-center py-8 text-gray-500">Loading base metrics...</div>
   }
@@ -701,7 +715,13 @@ function BaseMetricsTab({ metrics, isLoading, onEdit, onDelete, onCreate, calcul
 
   return (
     <div>
-      <div className="flex justify-end mb-4">
+      <div className="flex justify-between items-center mb-4 gap-4">
+        <SearchInput
+          placeholder="Search metrics..."
+          value={searchTerm}
+          onChange={setSearchTerm}
+          className="w-64"
+        />
         <button
           onClick={onCreate}
           className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700"
@@ -724,7 +744,7 @@ function BaseMetricsTab({ metrics, isLoading, onEdit, onDelete, onCreate, calcul
           </tr>
         </thead>
         <tbody className="divide-y divide-gray-200">
-          {metrics.map((metric) => (
+          {filteredMetrics.map((metric) => (
             <tr key={metric.id} className="hover:bg-gray-50">
               <td className="px-4 py-3 text-sm font-mono text-gray-900">{metric.id}</td>
               <td className="px-4 py-3 text-sm text-gray-900">{metric.display_name}</td>
@@ -802,6 +822,19 @@ interface CalculatedMetricsTabProps {
 }
 
 function CalculatedMetricsTab({ metrics, isLoading, onEdit, onDelete, onCreate, onCreateDailyAverage }: CalculatedMetricsTabProps) {
+  const [searchTerm, setSearchTerm] = useState('')
+
+  const filteredMetrics = metrics?.filter((metric) => {
+    if (!searchTerm) return true
+    const term = searchTerm.toLowerCase()
+    return (
+      metric.display_name.toLowerCase().includes(term) ||
+      metric.id.toLowerCase().includes(term) ||
+      metric.formula.toLowerCase().includes(term) ||
+      metric.category.toLowerCase().includes(term)
+    )
+  }) ?? []
+
   if (isLoading) {
     return <div className="text-center py-8 text-gray-500">Loading calculated metrics...</div>
   }
@@ -823,7 +856,13 @@ function CalculatedMetricsTab({ metrics, isLoading, onEdit, onDelete, onCreate, 
 
   return (
     <div>
-      <div className="flex justify-end mb-4">
+      <div className="flex justify-between items-center mb-4 gap-4">
+        <SearchInput
+          placeholder="Search metrics..."
+          value={searchTerm}
+          onChange={setSearchTerm}
+          className="w-64"
+        />
         <button
           onClick={onCreate}
           className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700"
@@ -846,7 +885,7 @@ function CalculatedMetricsTab({ metrics, isLoading, onEdit, onDelete, onCreate, 
             </tr>
           </thead>
           <tbody className="divide-y divide-gray-200">
-            {metrics.map((metric) => (
+            {filteredMetrics.map((metric) => (
               <tr key={metric.id} className="hover:bg-gray-50">
                 <td className="px-4 py-3 text-sm font-mono text-gray-900">{metric.id}</td>
                 <td className="px-4 py-3 text-sm text-gray-900">{metric.display_name}</td>
@@ -931,6 +970,19 @@ interface DimensionsTabProps {
 }
 
 function DimensionsTab({ dimensions, isLoading, onEdit, onDelete, onCreate }: DimensionsTabProps) {
+  const [searchTerm, setSearchTerm] = useState('')
+
+  const filteredDimensions = dimensions?.filter((dimension) => {
+    if (!searchTerm) return true
+    const term = searchTerm.toLowerCase()
+    return (
+      dimension.display_name.toLowerCase().includes(term) ||
+      dimension.id.toLowerCase().includes(term) ||
+      dimension.column_name.toLowerCase().includes(term) ||
+      dimension.data_type.toLowerCase().includes(term)
+    )
+  }) ?? []
+
   if (isLoading) {
     return <div className="text-center py-8 text-gray-500">Loading dimensions...</div>
   }
@@ -952,7 +1004,13 @@ function DimensionsTab({ dimensions, isLoading, onEdit, onDelete, onCreate }: Di
 
   return (
     <div>
-      <div className="flex justify-end mb-4">
+      <div className="flex justify-between items-center mb-4 gap-4">
+        <SearchInput
+          placeholder="Search dimensions..."
+          value={searchTerm}
+          onChange={setSearchTerm}
+          className="w-64"
+        />
         <button
           onClick={onCreate}
           className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700"
@@ -975,7 +1033,7 @@ function DimensionsTab({ dimensions, isLoading, onEdit, onDelete, onCreate }: Di
             </tr>
           </thead>
           <tbody className="divide-y divide-gray-200">
-            {dimensions.map((dimension) => (
+            {filteredDimensions.map((dimension) => (
               <tr key={dimension.id} className="hover:bg-gray-50">
                 <td className="px-4 py-3 text-sm font-mono text-gray-900">{dimension.id}</td>
                 <td className="px-4 py-3 text-sm text-gray-900">{dimension.display_name}</td>
@@ -1480,7 +1538,7 @@ function CreateDimensionModal({ onSave, onClose }: CreateDimensionModalProps) {
     column_name: '',
     display_name: '',
     data_type: 'STRING',
-    filter_type: 'single_select',
+    filter_type: 'single',
     is_filterable: true,
     is_groupable: true,
     sort_order: 0,
@@ -1569,8 +1627,9 @@ function CreateDimensionModal({ onSave, onClose }: CreateDimensionModalProps) {
                 className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
                 required
               >
-                <option value="single_select">Single Select</option>
-                <option value="multi_select">Multi Select</option>
+                <option value="single">Single Select</option>
+                <option value="multi">Multi Select</option>
+                <option value="range">Range</option>
                 <option value="date_range">Date Range</option>
                 <option value="boolean">Boolean</option>
               </select>

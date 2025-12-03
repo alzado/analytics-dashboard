@@ -99,11 +99,39 @@ export function usePivotMetrics(tableId?: string): UsePivotMetricsReturn {
     // Add base metrics
     if (baseMetrics) {
       allMetrics.push(...baseMetrics.map(transformBaseMetric))
+
+      // Add _pct variants for volume metrics
+      baseMetrics.forEach((metric) => {
+        if (metric.category === 'volume') {
+          allMetrics.push({
+            id: `${metric.id}_pct`,
+            label: `${metric.display_name} %`,
+            format: 'percent',
+            description: `Percentage of total ${metric.display_name}`,
+            category: 'volume',
+            decimalPlaces: 0,
+          })
+        }
+      })
     }
 
     // Add calculated metrics
     if (calculatedMetrics) {
       allMetrics.push(...calculatedMetrics.map(transformCalculatedMetric))
+
+      // Add _pct variants for volume calculated metrics
+      calculatedMetrics.forEach((metric) => {
+        if (metric.category === 'volume') {
+          allMetrics.push({
+            id: `${metric.id}_pct`,
+            label: `${metric.display_name} %`,
+            format: 'percent',
+            description: `Percentage of total ${metric.display_name}`,
+            category: 'volume',
+            decimalPlaces: 0,
+          })
+        }
+      })
     }
 
     return allMetrics
@@ -115,8 +143,33 @@ export function usePivotMetrics(tableId?: string): UsePivotMetricsReturn {
   }, [dimensions])
 
   // Helper function to get metric by ID
+  // Also handles dynamically computed _pct suffix metrics that aren't in the schema
   const getMetricById = useMemo(
-    () => (id: string) => metrics.find((m) => m.id === id),
+    () => (id: string): MetricDefinition | undefined => {
+      // First check if it exists in the schema
+      const existingMetric = metrics.find((m) => m.id === id)
+      if (existingMetric) {
+        return existingMetric
+      }
+
+      // Handle dynamically computed _pct metrics (percent over total)
+      if (id.endsWith('_pct')) {
+        const baseMetricId = id.replace(/_pct$/, '')
+        const baseMetric = metrics.find((m) => m.id === baseMetricId)
+        if (baseMetric) {
+          return {
+            id,
+            label: `${baseMetric.label} %`,
+            format: 'percent',
+            description: `Percentage of total ${baseMetric.label}`,
+            category: baseMetric.category,
+            decimalPlaces: 2,
+          }
+        }
+      }
+
+      return undefined
+    },
     [metrics]
   )
 

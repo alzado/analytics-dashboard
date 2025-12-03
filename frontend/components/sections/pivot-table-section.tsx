@@ -4,7 +4,7 @@ import React, { useState, useMemo, useEffect, useCallback } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { fetchPivotData, fetchPivotChildren, fetchDimensionValues, fetchCustomDimensions, fetchTables, updateWidget } from '@/lib/api'
 import type { PivotRow, PivotChildRow, CustomDimension, DateRangeType, RelativeDatePreset } from '@/lib/types'
-import { ChevronRight, ChevronDown, Settings2, ArrowUp, ArrowDown, Database, Save, GripVertical } from 'lucide-react'
+import { ChevronRight, ChevronDown, Settings2, ArrowUp, ArrowDown, Database, Save, GripVertical, Download } from 'lucide-react'
 import { usePivotConfig } from '@/hooks/use-pivot-config'
 import { usePivotMetrics } from '@/hooks/use-pivot-metrics'
 import { useSchema } from '@/hooks/use-schema'
@@ -14,9 +14,121 @@ import type { MetricDefinition, DimensionDefinition } from '@/hooks/use-pivot-me
 import { PivotConfigPanel } from '@/components/pivot/pivot-config-panel'
 import { PivotChartVisualization } from '@/components/pivot/pivot-chart-visualization'
 import { PivotFilterPanel } from '@/components/pivot/pivot-filter-panel'
+import { SignificanceIndicator, SignificanceButton } from '@/components/pivot/significance-indicator'
+import { useSignificance } from '@/hooks/use-significance'
 import DashboardSelectorModal from '@/components/modals/dashboard-selector-modal'
 import { WidgetSelectorModal, type WidgetSelection } from '@/components/modals/widget-selector-modal'
+import ExportModal, { type ExportFormat, type ExportData } from '@/components/modals/export-modal'
 import type { WidgetCreateRequest } from '@/lib/api'
+import html2canvas from 'html2canvas'
+
+// Sort Dropdown Component for cleaner headers
+interface SortDropdownProps {
+  label: string
+  metrics: string[]
+  getMetricById: (id: string) => MetricDefinition | undefined
+  activeMetric?: string | null
+  activeDirection?: 'asc' | 'desc'
+  onSort: (metricId: string) => void
+  align?: 'left' | 'right'
+  color?: 'blue' | 'purple'
+  showFullLabel?: boolean
+}
+
+function SortDropdown({
+  label,
+  metrics,
+  getMetricById,
+  activeMetric,
+  activeDirection,
+  onSort,
+  align = 'right',
+  color = 'blue',
+  showFullLabel = false
+}: SortDropdownProps) {
+  const [isOpen, setIsOpen] = useState(false)
+  const dropdownRef = React.useRef<HTMLDivElement>(null)
+
+  // Close dropdown when clicking outside
+  useEffect(() => {
+    function handleClickOutside(event: MouseEvent) {
+      if (dropdownRef.current && !dropdownRef.current.contains(event.target as Node)) {
+        setIsOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', handleClickOutside)
+    return () => document.removeEventListener('mousedown', handleClickOutside)
+  }, [])
+
+  const activeMetricDef = activeMetric ? getMetricById(activeMetric) : null
+  const hasActiveSort = !!activeMetric
+  const bgColor = color === 'purple' ? 'bg-purple-600' : 'bg-blue-600'
+  const hoverBgColor = color === 'purple' ? 'hover:bg-purple-700' : 'hover:bg-blue-700'
+
+  return (
+    <div className={`relative inline-block ${align === 'left' ? 'text-left' : 'text-right'}`} ref={dropdownRef}>
+      <button
+        onClick={(e) => {
+          e.stopPropagation()
+          setIsOpen(!isOpen)
+        }}
+        className={`inline-flex items-center gap-1 px-2 py-1 rounded text-xs transition-colors ${
+          hasActiveSort
+            ? `${bgColor} text-white ${hoverBgColor}`
+            : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+        }`}
+      >
+        <span>{label}</span>
+        {hasActiveSort && activeMetricDef && (
+          <>
+            <span className="font-medium">
+              {showFullLabel ? activeMetricDef.label : activeMetricDef.label?.substring(0, 3)}
+            </span>
+            <span>{activeDirection === 'desc' ? '↓' : '↑'}</span>
+          </>
+        )}
+        <ChevronDown className={`w-3 h-3 transition-transform ${isOpen ? 'rotate-180' : ''}`} />
+      </button>
+
+      {isOpen && (
+        <div
+          className={`absolute z-50 mt-1 bg-white border border-gray-200 rounded-md shadow-lg min-w-[120px] ${
+            align === 'left' ? 'left-0' : 'right-0'
+          }`}
+        >
+          <div className="py-1">
+            {metrics.map((metricId) => {
+              const metric = getMetricById(metricId)
+              const isActive = activeMetric === metricId
+              return (
+                <button
+                  key={metricId}
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    onSort(metricId)
+                    setIsOpen(false)
+                  }}
+                  className={`w-full text-left px-3 py-1.5 text-xs transition-colors ${
+                    isActive
+                      ? `${bgColor} text-white`
+                      : 'text-gray-700 hover:bg-gray-100'
+                  }`}
+                >
+                  <span className="flex items-center justify-between">
+                    <span>{metric?.label}</span>
+                    {isActive && (
+                      <span className="ml-2">{activeDirection === 'desc' ? '↓' : '↑'}</span>
+                    )}
+                  </span>
+                </button>
+              )
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
 
 // Multi-Pivot Table Card Component
 interface MultiPivotTableCardProps {
@@ -179,7 +291,11 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
     toggleDisplayMetric,
     setSortConfig,
     setChartType,
+    triggerFetch,
+    isStale,
+    fetchRequested,
   } = usePivotConfig()
+
 
   // Dashboard context for widget editing
   const { editingWidget, setEditingWidget, currentDashboardId: editingDashboardId, setCurrentDashboardId } = useDashboard()
@@ -425,6 +541,26 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
   const selectedMetrics = config.selectedMetrics || []
   const selectedTable = config.selectedTable
   const selectedDateRange = config.selectedDateRange
+
+  // Use fetched config snapshot for query keys (prevents auto-refetch on config changes)
+  // These values only change when user clicks "Fetch Data"
+  const fetchedConfig = config.fetchedConfig
+  const fetchedDimensions = fetchedConfig?.selectedDimensions || []
+  const fetchedTableDimensions = fetchedConfig?.selectedTableDimensions || []
+  const fetchedMetrics = fetchedConfig?.selectedMetrics || []
+  const fetchedTable = fetchedConfig?.selectedTable || null
+
+  // Build filters from fetched config (for stable query keys)
+  const fetchedFilters = useMemo(() => {
+    if (!fetchedConfig) return null
+    return {
+      start_date: fetchedConfig.startDate,
+      end_date: fetchedConfig.endDate,
+      date_range_type: fetchedConfig.dateRangeType,
+      relative_date_preset: fetchedConfig.relativeDatePreset,
+      dimension_filters: pivotFilters.dimension_filters, // Use current dimension filters
+    }
+  }, [fetchedConfig, pivotFilters.dimension_filters])
   const [childrenCache, setChildrenCache] = useState<Record<string, PivotChildRow[]>>({})
   const [currentPage, setCurrentPage] = useState<Record<string, number>>({})
   const [loadingRows, setLoadingRows] = useState<Set<string>>(new Set())
@@ -441,6 +577,7 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
   const [columnSortConfig, setColumnSortConfig] = useState<{ metric: string; direction: 'asc' | 'desc' } | null>(null)
   const [childrenSortConfig, setChildrenSortConfig] = useState<{column: string, direction: 'asc' | 'desc'} | null>(null)
   const [isDashboardModalOpen, setIsDashboardModalOpen] = useState(false)
+  const [isExportModalOpen, setIsExportModalOpen] = useState(false)
   const [isWidgetSelectorOpen, setIsWidgetSelectorOpen] = useState(false)
   const [selectedWidgetType, setSelectedWidgetType] = useState<WidgetSelection | null>(null)
   const [isUpdatingWidget, setIsUpdatingWidget] = useState(false) // Track if we're updating vs creating new
@@ -452,16 +589,18 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
   const isConfigured = !!(config.isDataSourceDropped && config.isDateRangeDropped && selectedMetrics.length > 0)
 
   // Fetch all dimension values in a single query
+  // Uses fetchedConfig values for stable query keys (only refetches when user clicks "Fetch Data")
   const { data: allDimensionValues } = useQuery({
-    queryKey: ['all-dimension-values', selectedTableDimensions, filters, selectedTable],
+    queryKey: ['all-dimension-values', fetchedTableDimensions, fetchedFilters, fetchedTable],
     queryFn: async () => {
+      if (!fetchedFilters) return {}
       const results: Record<string, string[]> = {}
-      for (const dimension of selectedTableDimensions) {
-        results[dimension] = await fetchDimensionValues(dimension, filters, selectedTable || undefined)
+      for (const dimension of fetchedTableDimensions) {
+        results[dimension] = await fetchDimensionValues(dimension, fetchedFilters, fetchedTable || undefined)
       }
       return results
     },
-    enabled: isConfigured && selectedTableDimensions.length > 0,
+    enabled: fetchRequested && isConfigured && fetchedTableDimensions.length > 0,
   })
 
   // Calculate table combinations (Cartesian product of all table dimension values)
@@ -506,21 +645,22 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
   }, [selectedTableDimensions, allDimensionValues])
 
   // Fetch data for all column combinations using two-step approach
+  // Uses fetchedConfig values for stable query keys (only refetches when user clicks "Fetch Data")
   const { data: allColumnData, isLoading: isLoadingColumnData } = useQuery({
-    queryKey: ['all-columns', tableCombinations, filters, selectedDimensions, customDimensions, selectedMetrics, columnOrder],
+    queryKey: ['all-columns', tableCombinations, fetchedFilters, fetchedDimensions, customDimensions, fetchedMetrics, columnOrder],
     queryFn: async () => {
       const results: Record<string, any> = {}
 
-      if (tableCombinations.length === 0) {
+      if (tableCombinations.length === 0 || !fetchedFilters) {
         return results
       }
 
-      const dims = selectedDimensions.length > 0 ? [selectedDimensions[0]] : []
+      const dims = fetchedDimensions.length > 0 ? [fetchedDimensions[0]] : []
 
       // Helper function to build table filters for a combination
       const buildTableFilters = (combination: any) => {
-        // Start with base filters
-        const tableFilters: Record<string, any> = { ...filters }
+        // Start with base filters (use fetched filters for stability)
+        const tableFilters: Record<string, any> = { ...fetchedFilters }
 
         // Get the dimension keys that are being used as table dimensions
         const tableDimensionKeys = Object.keys(combination)
@@ -573,12 +713,12 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
       const primaryData = await fetchPivotData(
         dims,
         primaryFilters,
-        50, // limit
+        100, // limit
         0,
         undefined, // no dimension_values filter for primary column
-        selectedTable || undefined,
+        fetchedTable || undefined,
         true,
-        selectedMetrics
+        fetchedMetrics
       )
 
       results[primaryColIndex] = primaryData
@@ -597,12 +737,12 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
             data: await fetchPivotData(
               dims,
               tableFilters,
-              50, // limit ignored when dimension_values provided
+              100, // limit ignored when dimension_values provided
               0,
               dimensionValues, // Filter to primary column's dimension values
-              selectedTable || undefined,
+              fetchedTable || undefined,
               true,
-              selectedMetrics
+              fetchedMetrics
             )
           }
         })
@@ -617,18 +757,21 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
 
       return results
     },
-    enabled: isConfigured && selectedTableDimensions.length > 0 && tableCombinations.length > 0,
+    enabled: fetchRequested && isConfigured && fetchedTableDimensions.length > 0 && tableCombinations.length > 0,
   })
 
   // Only query the first dimension for hierarchical drill-down
-  const firstDimension = selectedDimensions.length > 0 ? [selectedDimensions[0]] : []
+  // Use fetched dimensions for stable query keys
+  const firstFetchedDimension = fetchedDimensions.length > 0 ? [fetchedDimensions[0]] : []
 
+  // Main pivot data query - uses fetchedConfig values for stable query keys
   const { data: pivotData, isLoading, error } = useQuery({
-    queryKey: ['pivot', firstDimension, filters, selectedTable, selectedMetrics],
+    queryKey: ['pivot', firstFetchedDimension, fetchedFilters, fetchedTable, fetchedMetrics],
     queryFn: () => {
+      if (!fetchedFilters) return Promise.resolve({ rows: [], total: {} })
       // If no dimensions, create a single "All Data" row manually
-      if (selectedDimensions.length === 0) {
-        return fetchPivotData([], filters, 1, 0, undefined, selectedTable || undefined, true, selectedMetrics).then(data => {
+      if (fetchedDimensions.length === 0) {
+        return fetchPivotData([], fetchedFilters, 1, 0, undefined, fetchedTable || undefined, true, fetchedMetrics).then(data => {
           // Return single row representing all data
           return {
             ...data,
@@ -640,9 +783,44 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
           }
         })
       }
-      return fetchPivotData(firstDimension, filters, 50, 0, undefined, selectedTable || undefined, true, selectedMetrics)
+      return fetchPivotData(firstFetchedDimension, fetchedFilters, 100, 0, undefined, fetchedTable || undefined, true, fetchedMetrics)
     },
-    enabled: isConfigured, // Only fetch when data source and date range are configured
+    enabled: fetchRequested && isConfigured, // Only fetch when data source and date range are configured AND fetch is requested
+  })
+
+  // Get rows for significance testing (before hook call)
+  // These are the raw rows from the data source, before merge threshold processing
+  const significanceRows = useMemo(() => {
+    if (selectedTableDimensions.length > 0 && allColumnData && columnOrder.length > 0) {
+      // Multi-table mode: use first column data
+      const firstColIndex = columnOrder[0]
+      return allColumnData[firstColIndex]?.rows || []
+    } else {
+      // Single-table mode: use pivotData
+      return pivotData?.rows || []
+    }
+  }, [selectedTableDimensions, allColumnData, columnOrder, pivotData])
+
+  // Significance testing hook
+  const {
+    hasResults: hasSignificanceResults,
+    isLoading: isSignificanceLoading,
+    error: significanceError,
+    runSignificanceTest,
+    clearResults: clearSignificanceResults,
+    getSignificanceForCell,
+    controlColumnIndex,
+  } = useSignificance({
+    allColumnData,
+    tableCombinations,
+    columnOrder,
+    selectedMetrics,
+    selectedTableDimensions,
+    selectedRowDimensions: selectedDimensions,
+    pivotRows: significanceRows,
+    filters,
+    tableId: selectedTable || undefined,
+    enabled: isConfigured && selectedTableDimensions.length > 0 && columnOrder.length >= 2,
   })
 
   // Apply merge threshold logic - must be before conditional returns
@@ -749,6 +927,11 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
       setColumnOrder(sortedIndices)
     }
   }, [allColumnData])
+
+  // Clear significance results when table configuration changes
+  React.useEffect(() => {
+    clearSignificanceResults()
+  }, [selectedMetrics, selectedDimensions, selectedTableDimensions, pivotFilters, columnOrder, clearSignificanceResults])
 
   // Clear cache when dimension changes
   React.useEffect(() => {
@@ -1125,12 +1308,37 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
       case 'currency':
         return `$${value.toLocaleString(undefined, { minimumFractionDigits: decimals, maximumFractionDigits: decimals })}`
       case 'percent':
+        // _pct metrics are already in percentage form (e.g., 86.5 for 86.5%)
+        // Other percent metrics (like conversion rates) are in decimal form (e.g., 0.865)
+        if (metricId.endsWith('_pct')) {
+          return `${value.toFixed(decimals)}%`
+        }
         return `${(value * 100).toFixed(decimals)}%`
       default:
         return decimals > 0
           ? value.toLocaleString(undefined, { minimumFractionDigits: decimals, maximumFractionDigits: decimals })
           : Math.round(value).toLocaleString()
     }
+  }
+
+  // Helper to get format type for significance indicator
+  // Checks metric definition first, then falls back to ID-based detection
+  const getFormatTypeForMetric = (metricId: string): 'number' | 'currency' | 'percent' => {
+    const metric = getMetricById(metricId)
+
+    // If metric is found and has a format, use it
+    if (metric?.format === 'percent') return 'percent'
+    if (metric?.format === 'currency') return 'currency'
+
+    // Fallback: detect from metric ID patterns
+    // _pct suffix indicates percentage
+    if (metricId.endsWith('_pct')) return 'percent'
+    // Common percentage metric patterns
+    if (metricId.includes('rate') || metricId.includes('ratio') || metricId.includes('conversion')) return 'percent'
+    // Common currency patterns
+    if (metricId.includes('revenue') || metricId.includes('price') || metricId.includes('cost') || metricId.includes('aov')) return 'currency'
+
+    return 'number'
   }
 
   // Reset sort when dimensions change
@@ -1577,6 +1785,92 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
     )
   }
 
+  // Show "ready to fetch" state when configured but not yet fetched
+  if (!fetchRequested) {
+    return (
+      <div className="space-y-4">
+        <div className="flex justify-between items-center">
+          <div>
+            <h2 className="text-lg font-semibold text-gray-900">Pivot Table</h2>
+            <p className="text-sm text-gray-600 mt-1">Configure your options and click "Fetch Data" when ready</p>
+          </div>
+          <div className="flex items-center gap-3">
+            {/* Fetch BigQuery Data button */}
+            <button
+              onClick={triggerFetch}
+              className="flex items-center gap-2 px-4 py-2 rounded-lg bg-blue-600 text-white hover:bg-blue-700 transition-colors"
+              title="Fetch data from BigQuery"
+            >
+              <Database className="h-4 w-4" />
+              Fetch Data
+            </button>
+            <button
+              onClick={() => setConfigOpen(!isConfigOpen)}
+              className={`flex items-center gap-2 px-4 py-2 rounded-lg transition-colors ${
+                isConfigOpen
+                  ? 'bg-gray-200 text-gray-700'
+                  : 'bg-blue-600 text-white hover:bg-blue-700'
+              }`}
+            >
+              <Settings2 className="h-4 w-4" />
+              {isConfigOpen ? 'Hide' : 'Configure'}
+            </button>
+          </div>
+        </div>
+
+        <div className="flex gap-4">
+          <PivotConfigPanel
+            isOpen={isConfigOpen}
+            onClose={() => setConfigOpen(false)}
+            config={config}
+            updateTable={updateTable}
+            updateDateRange={updateDateRange}
+            updateStartDate={updateStartDate}
+            updateEndDate={updateEndDate}
+            setDataSourceDropped={setDataSourceDropped}
+            setDateRangeDropped={setDateRangeDropped}
+            addDimension={addDimension}
+            removeDimension={removeDimension}
+            addMetric={addMetric}
+            removeMetric={removeMetric}
+            addFilter={addFilter}
+            removeFilter={removeFilter}
+            resetToDefaults={resetToDefaults}
+            dimensionFilters={pivotFilters.dimension_filters}
+            onDimensionFilterChange={updateDimensionFilter}
+            onClearDimensionFilters={clearDimensionFilters}
+            currentFilters={filters}
+            dateRangeType={pivotFilters.date_range_type}
+            relativeDatePreset={pivotFilters.relative_date_preset}
+            onDateRangeChange={handleDateRangeChange}
+          />
+
+          <div className="flex-1 min-w-0 bg-white shadow overflow-hidden rounded-lg">
+            <div className="flex flex-col items-center justify-center h-96 text-center p-8">
+              <div className="mb-4 text-gray-400">
+                <Database className="h-16 w-16 mx-auto" />
+              </div>
+              <h3 className="text-lg font-medium text-gray-900 mb-2">
+                Ready to Fetch Data
+              </h3>
+              <p className="text-sm text-gray-600 max-w-md mb-4">
+                Your pivot table is configured. Click "Fetch Data" to query BigQuery.
+                You can modify dimensions, metrics, and filters before fetching.
+              </p>
+              <button
+                onClick={triggerFetch}
+                className="flex items-center gap-2 px-6 py-3 rounded-lg bg-blue-600 text-white hover:bg-blue-700 transition-colors text-lg"
+              >
+                <Database className="h-5 w-5" />
+                Fetch BigQuery Data
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
   if (isLoading) {
     return <div className="flex items-center justify-center h-64">Loading...</div>
   }
@@ -1761,6 +2055,748 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
     setSelectedWidgetType(null)
   }
 
+  // Build export data for modal
+  const getExportData = (): ExportData | null => {
+    // Build metadata
+    const dateRange = pivotFilters.date_range_type === 'relative' && pivotFilters.relative_date_preset
+      ? `${pivotFilters.relative_date_preset} (${config.startDate} to ${config.endDate})`
+      : `${config.startDate} to ${config.endDate}`
+
+    const dimensionLabels = selectedDimensions.length > 0
+      ? selectedDimensions.map(d => getDimensionLabel(d)).join(' > ')
+      : ''
+
+    const tableDimensionLabels = selectedTableDimensions.length > 0
+      ? selectedTableDimensions.map(d => getDimensionLabel(d)).join(' x ')
+      : undefined
+
+    const metricLabels = selectedMetrics.map(m => getMetricById(m)?.label || m).join(', ')
+
+    const activeFilters = Object.entries(pivotFilters.dimension_filters || {})
+      .filter(([_, values]) => values && values.length > 0)
+      .map(([dimId, values]) => ({
+        label: getDimensionLabel(dimId),
+        values: (values as string[]).join(', ')
+      }))
+
+    // Check if we're in multi-table mode
+    const isMultiTableMode = selectedTableDimensions.length > 0 && allColumnData && columnOrder.length > 0
+
+    if (isMultiTableMode) {
+      // Multi-table mode export
+      const firstColIndex = columnOrder[0]
+      const firstColData = allColumnData?.[firstColIndex]
+
+      if (!firstColData?.rows) return null
+
+      // Get column labels from tableCombinations
+      const getColumnLabel = (colIndex: number) => {
+        const combination = tableCombinations[colIndex]
+        if (!combination) return `Column ${colIndex}`
+        return Object.entries(combination)
+          .map(([dimId, value]) => `${getDimensionLabel(dimId)}: ${value}`)
+          .join(', ')
+      }
+
+      // Build headers: Dimension | Metric | Col1 Value | Col2 Value | Col2 Diff | Col2 % Diff | ...
+      const dimensionLabel = selectedDimensions.length > 0
+        ? getDimensionLabel(selectedDimensions[0])
+        : 'Total'
+
+      const headers: string[] = [dimensionLabel, 'Metric']
+      columnOrder.forEach((colIndex, orderIndex) => {
+        const colLabel = getColumnLabel(colIndex)
+        if (orderIndex === 0) {
+          headers.push(colLabel)
+        } else {
+          headers.push(`${colLabel}`)
+          headers.push('Diff')
+          headers.push('% Diff')
+        }
+      })
+
+      // Build rows - one row per dimension value per metric
+      const rows: (string | number)[][] = []
+
+      // Get dimension values from first column
+      const dimensionValues = selectedDimensions.length === 0
+        ? ['Total']
+        : firstColData.rows.map((r: any) => r.dimension_value)
+
+      dimensionValues.forEach((dimValue: string) => {
+        selectedMetrics.forEach((metricId) => {
+          const metricLabel = getMetricById(metricId)?.label || metricId
+          const row: (string | number)[] = [dimValue, metricLabel]
+
+          // Get first column value for diff calculations
+          let firstValue: number | null = null
+          if (selectedDimensions.length === 0) {
+            firstValue = allColumnData?.[columnOrder[0]]?.total?.metrics?.[metricId] ?? null
+          } else {
+            const firstRowData = allColumnData?.[columnOrder[0]]?.rows?.find((r: any) => r.dimension_value === dimValue)
+            firstValue = firstRowData?.metrics?.[metricId] ?? null
+          }
+
+          columnOrder.forEach((colIndex, orderIndex) => {
+            let value: number | null = null
+            if (selectedDimensions.length === 0) {
+              value = allColumnData?.[colIndex]?.total?.metrics?.[metricId] ?? null
+            } else {
+              const rowData = allColumnData?.[colIndex]?.rows?.find((r: any) => r.dimension_value === dimValue)
+              value = rowData?.metrics?.[metricId] ?? null
+            }
+
+            if (orderIndex === 0) {
+              row.push(value != null ? formatMetricValue(value, metricId) : '-')
+            } else {
+              row.push(value != null ? formatMetricValue(value, metricId) : '-')
+              // Diff
+              const diff = (value ?? 0) - (firstValue ?? 0)
+              row.push(formatMetricValue(diff, metricId))
+              // % Diff
+              const pctDiff = (firstValue ?? 0) !== 0
+                ? (((value ?? 0) / (firstValue ?? 0)) - 1) * 100
+                : null
+              row.push(pctDiff != null ? `${pctDiff.toFixed(2)}%` : '-')
+            }
+          })
+
+          rows.push(row)
+        })
+      })
+
+      return {
+        metadata: {
+          exportDate: new Date().toISOString(),
+          dataSource: selectedTable || undefined,
+          dateRange,
+          dimensions: dimensionLabels,
+          tableDimensions: tableDimensionLabels,
+          metrics: metricLabels,
+          filters: activeFilters,
+        },
+        headers,
+        rows,
+      }
+    } else {
+      // Single table mode (original behavior)
+      if (!pivotData?.rows) return null
+
+      const dimensionLabel = selectedDimensions.length > 0
+        ? getDimensionLabel(selectedDimensions[0])
+        : 'Dimension'
+      const metricHeaders = selectedMetrics.map(m => getMetricById(m)?.label || m)
+      const headers = [dimensionLabel, ...metricHeaders]
+
+      const rows = pivotData.rows.map(row => {
+        const metricValues = selectedMetrics.map(metricId => {
+          const value = row.metrics[metricId]
+          return formatMetricValue(value, metricId)
+        })
+        return [row.dimension_value, ...metricValues]
+      })
+
+      return {
+        metadata: {
+          exportDate: new Date().toISOString(),
+          dataSource: selectedTable || undefined,
+          dateRange,
+          dimensions: dimensionLabels,
+          tableDimensions: tableDimensionLabels,
+          metrics: metricLabels,
+          filters: activeFilters,
+        },
+        headers,
+        rows,
+      }
+    }
+  }
+
+  // Handle export based on format
+  const handleExport = async (format: ExportFormat) => {
+    const data = getExportData()
+    if (!data) return
+
+    if (format === 'csv') {
+      exportAsCSV(data)
+    } else if (format === 'html') {
+      exportAsHTML(data)
+    } else if (format === 'png') {
+      await exportAsPNG(data)
+    }
+  }
+
+  // Export as CSV
+  const exportAsCSV = (data: ExportData) => {
+    // Helper to escape CSV cells
+    const escapeCell = (cell: string | number | null | undefined): string => {
+      const str = String(cell ?? '')
+      if (str.includes(',') || str.includes('"') || str.includes('\n')) {
+        return `"${str.replace(/"/g, '""')}"`
+      }
+      return str
+    }
+
+    // Build metadata rows
+    const metadataRows: string[][] = [
+      ['Export Date', data.metadata.exportDate],
+    ]
+    if (data.metadata.dataSource) {
+      metadataRows.push(['Data Source', data.metadata.dataSource])
+    }
+    metadataRows.push(['Date Range', data.metadata.dateRange])
+    if (data.metadata.dimensions) {
+      metadataRows.push(['Dimensions', data.metadata.dimensions])
+    }
+    if (data.metadata.tableDimensions) {
+      metadataRows.push(['Table Dimensions', data.metadata.tableDimensions])
+    }
+    metadataRows.push(['Metrics', data.metadata.metrics])
+    data.metadata.filters.forEach(f => {
+      metadataRows.push(['Filter: ' + f.label, f.values])
+    })
+
+    // Combine all rows
+    const allRows: string[][] = [
+      ...metadataRows,
+      [],
+      data.headers,
+      ...data.rows
+    ]
+
+    const csvContent = allRows
+      .map(row => row.map(escapeCell).join(','))
+      .join('\n')
+
+    downloadFile(csvContent, 'text/csv;charset=utf-8;', `pivot-table-${new Date().toISOString().split('T')[0]}.csv`)
+  }
+
+  // Export as HTML with table and chart
+  const exportAsHTML = (data: ExportData) => {
+    // Get raw numeric values for chart (before formatting)
+    const chartData = pivotData?.rows.map(row => ({
+      label: row.dimension_value,
+      values: selectedMetrics.map(metricId => row.metrics[metricId] ?? 0)
+    })) || []
+
+    const metricLabels = selectedMetrics.map(m => getMetricById(m)?.label || m)
+
+    // Generate colors for each metric
+    const colors = [
+      'rgba(59, 130, 246, 0.8)',   // blue
+      'rgba(16, 185, 129, 0.8)',   // green
+      'rgba(245, 158, 11, 0.8)',   // amber
+      'rgba(239, 68, 68, 0.8)',    // red
+      'rgba(139, 92, 246, 0.8)',   // purple
+      'rgba(236, 72, 153, 0.8)',   // pink
+      'rgba(20, 184, 166, 0.8)',   // teal
+      'rgba(249, 115, 22, 0.8)',   // orange
+    ]
+
+    const htmlContent = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pivot Table Export - ${new Date().toISOString().split('T')[0]}</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f3f4f6; padding: 24px; color: #1f2937; }
+    .container { max-width: 1200px; margin: 0 auto; }
+    h1 { font-size: 24px; font-weight: 600; margin-bottom: 8px; }
+    .subtitle { color: #6b7280; margin-bottom: 24px; }
+    .card { background: white; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); margin-bottom: 24px; overflow: hidden; }
+    .card-header { padding: 16px 20px; border-bottom: 1px solid #e5e7eb; font-weight: 600; }
+    .card-body { padding: 20px; }
+    .metadata { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 12px; }
+    .metadata-item { display: flex; flex-direction: column; }
+    .metadata-label { font-size: 12px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.05em; }
+    .metadata-value { font-size: 14px; font-weight: 500; margin-top: 2px; }
+    .chart-container { height: 400px; position: relative; }
+    .chart-controls { margin-bottom: 16px; display: flex; gap: 8px; flex-wrap: wrap; }
+    .chart-controls button { padding: 8px 16px; border: 1px solid #d1d5db; border-radius: 6px; background: white; cursor: pointer; font-size: 14px; transition: all 0.2s; }
+    .chart-controls button:hover { border-color: #3b82f6; color: #3b82f6; }
+    .chart-controls button.active { background: #3b82f6; color: white; border-color: #3b82f6; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th { background: #f9fafb; text-align: left; padding: 12px 16px; font-weight: 600; border-bottom: 2px solid #e5e7eb; }
+    th:not(:first-child) { text-align: right; }
+    td { padding: 12px 16px; border-bottom: 1px solid #e5e7eb; }
+    td:not(:first-child) { text-align: right; font-variant-numeric: tabular-nums; }
+    tr:hover { background: #f9fafb; }
+    .filters { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+    .filter-tag { background: #fef3c7; color: #92400e; padding: 4px 12px; border-radius: 9999px; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Pivot Table Export</h1>
+    <p class="subtitle">Generated on ${new Date().toLocaleString()}</p>
+
+    <!-- Metadata Card -->
+    <div class="card">
+      <div class="card-header">Export Configuration</div>
+      <div class="card-body">
+        <div class="metadata">
+          ${data.metadata.dataSource ? `<div class="metadata-item"><span class="metadata-label">Data Source</span><span class="metadata-value">${data.metadata.dataSource}</span></div>` : ''}
+          <div class="metadata-item"><span class="metadata-label">Date Range</span><span class="metadata-value">${data.metadata.dateRange}</span></div>
+          ${data.metadata.dimensions ? `<div class="metadata-item"><span class="metadata-label">Dimensions</span><span class="metadata-value">${data.metadata.dimensions}</span></div>` : ''}
+          ${data.metadata.tableDimensions ? `<div class="metadata-item"><span class="metadata-label">Table Dimensions</span><span class="metadata-value">${data.metadata.tableDimensions}</span></div>` : ''}
+          <div class="metadata-item"><span class="metadata-label">Metrics</span><span class="metadata-value">${data.metadata.metrics}</span></div>
+        </div>
+        ${data.metadata.filters.length > 0 ? `
+        <div class="filters">
+          ${data.metadata.filters.map(f => `<span class="filter-tag">${f.label}: ${f.values}</span>`).join('')}
+        </div>` : ''}
+      </div>
+    </div>
+
+    <!-- Chart Card -->
+    <div class="card">
+      <div class="card-header">Chart Visualization</div>
+      <div class="card-body">
+        <div class="chart-controls">
+          <button class="active" onclick="setChartType('bar')">Bar Chart</button>
+          <button onclick="setChartType('line')">Line Chart</button>
+          <button onclick="setChartType('pie')">Pie Chart</button>
+        </div>
+        <div class="chart-controls">
+          ${metricLabels.map((label, i) => `<button class="${i === 0 ? 'active' : ''}" onclick="setMetric(${i})">${label}</button>`).join('')}
+        </div>
+        <div class="chart-container">
+          <canvas id="chart"></canvas>
+        </div>
+      </div>
+    </div>
+
+    <!-- Table Card -->
+    <div class="card">
+      <div class="card-header">Data Table (${data.rows.length} rows)</div>
+      <div class="card-body" style="padding: 0; overflow-x: auto;">
+        <table>
+          <thead>
+            <tr>
+              ${data.headers.map(h => `<th>${h}</th>`).join('')}
+            </tr>
+          </thead>
+          <tbody>
+            ${data.rows.map(row => `<tr>${row.map(cell => `<td>${cell}</td>`).join('')}</tr>`).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const chartData = ${JSON.stringify(chartData)};
+    const metricLabels = ${JSON.stringify(metricLabels)};
+    const colors = ${JSON.stringify(colors)};
+    let currentMetricIndex = 0;
+    let currentChartType = 'bar';
+    let chart;
+
+    function createChart() {
+      const ctx = document.getElementById('chart').getContext('2d');
+      const labels = chartData.map(d => d.label);
+      const values = chartData.map(d => d.values[currentMetricIndex]);
+
+      if (chart) chart.destroy();
+
+      const config = {
+        type: currentChartType === 'pie' ? 'pie' : currentChartType,
+        data: {
+          labels: labels,
+          datasets: [{
+            label: metricLabels[currentMetricIndex],
+            data: values,
+            backgroundColor: currentChartType === 'pie' ? colors.slice(0, labels.length) : colors[currentMetricIndex % colors.length],
+            borderColor: currentChartType === 'line' ? colors[currentMetricIndex % colors.length] : undefined,
+            borderWidth: currentChartType === 'line' ? 2 : 0,
+            fill: currentChartType === 'line' ? false : undefined,
+            tension: 0.3,
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            legend: { display: currentChartType === 'pie' }
+          },
+          scales: currentChartType === 'pie' ? {} : {
+            y: { beginAtZero: true }
+          }
+        }
+      };
+
+      chart = new Chart(ctx, config);
+    }
+
+    function setChartType(type) {
+      currentChartType = type;
+      document.querySelectorAll('.chart-controls:first-of-type button').forEach(b => b.classList.remove('active'));
+      event.target.classList.add('active');
+      createChart();
+    }
+
+    function setMetric(index) {
+      currentMetricIndex = index;
+      document.querySelectorAll('.chart-controls:nth-of-type(2) button').forEach(b => b.classList.remove('active'));
+      event.target.classList.add('active');
+      createChart();
+    }
+
+    createChart();
+  </script>
+</body>
+</html>`
+
+    downloadFile(htmlContent, 'text/html;charset=utf-8;', `pivot-table-${new Date().toISOString().split('T')[0]}.html`)
+  }
+
+  // Helper to download file
+  const downloadFile = (content: string, mimeType: string, filename: string) => {
+    const blob = new Blob([content], { type: mimeType })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = filename
+    link.click()
+    URL.revokeObjectURL(url)
+  }
+
+  // Build table HTML for PNG export
+  const buildExportTableHTML = (data: ExportData): string => {
+    // Check if we're in multi-table mode
+    const isMultiTableMode = selectedTableDimensions.length > 0 && allColumnData && columnOrder.length > 0
+
+    // Helper to format significance indicator for export
+    const formatSignificanceForExport = (sigResult: any) => {
+      if (!sigResult) return { indicator: '', displayProb: '' }
+      const probBeat = sigResult.prob_beat_control * 100
+      // For "worse" direction, show probability of being worse (1 - prob_beat_control)
+      // For "better" direction, show probability of being better (prob_beat_control)
+      const displayProb = sigResult.direction === 'worse'
+        ? (100 - probBeat).toFixed(1)
+        : probBeat.toFixed(1)
+
+      if (sigResult.direction === 'better') {
+        return {
+          indicator: `<span style="color: #16a34a; font-weight: 500;">↑</span>`,
+          displayProb: `<span style="color: #16a34a;">${displayProb}%</span>`
+        }
+      } else if (sigResult.direction === 'worse') {
+        return {
+          indicator: `<span style="color: #dc2626; font-weight: 500;">↓</span>`,
+          displayProb: `<span style="color: #dc2626;">${displayProb}%</span>`
+        }
+      }
+      return {
+        indicator: `<span style="color: #6b7280;">~</span>`,
+        displayProb: `<span style="color: #6b7280;">${displayProb}%</span>`
+      }
+    }
+
+    // Build metadata section
+    const metadataHTML = `
+      <div style="margin-bottom: 24px; padding-bottom: 16px; border-bottom: 2px solid #e5e7eb;">
+        <h1 style="font-size: 20px; font-weight: 600; margin-bottom: 8px; color: #111827; margin-top: 0;">Pivot Table Export</h1>
+        <div style="display: flex; flex-wrap: wrap; gap: 16px; font-size: 14px; color: #6b7280;">
+          ${data.metadata.dataSource ? `<span><strong>Data Source:</strong> ${data.metadata.dataSource}</span>` : ''}
+          <span><strong>Date Range:</strong> ${data.metadata.dateRange}</span>
+          ${data.metadata.dimensions ? `<span><strong>Dimensions:</strong> ${data.metadata.dimensions}</span>` : ''}
+          <span><strong>Metrics:</strong> ${data.metadata.metrics}</span>
+        </div>
+        ${data.metadata.filters.length > 0 ? `
+          <div style="margin-top: 8px; display: flex; flex-wrap: wrap; gap: 8px;">
+            ${data.metadata.filters.map(f => `
+              <span style="background: #fef3c7; color: #92400e; padding: 2px 10px; border-radius: 9999px; font-size: 12px;">
+                ${f.label}: ${f.values}
+              </span>
+            `).join('')}
+          </div>
+        ` : ''}
+        <div style="margin-top: 8px; font-size: 12px; color: #9ca3af;">
+          Generated: ${new Date().toLocaleString()}
+        </div>
+      </div>
+    `
+
+    if (isMultiTableMode) {
+      // Multi-table mode - render with proper structure matching the UI
+      const getColumnLabel = (colIndex: number) => {
+        const combination = tableCombinations[colIndex]
+        if (!combination) return `Column ${colIndex}`
+        return selectedTableDimensions.map((dim) => {
+          const dimLabel = getDimensionLabel(dim)
+          return `${dimLabel}: ${combination[dim]}`
+        }).join(' | ')
+      }
+
+      // Get dimension values from processedRows (which respects sort order)
+      const dimensionValues = selectedDimensions.length === 0
+        ? ['Total']
+        : processedRows.map((r: any) => r.dimension_value)
+
+      // Build header rows
+      const headerRow1 = `
+        <tr style="background: #f9fafb;">
+          <th style="padding: 12px 16px; text-align: left; font-weight: 600; border-bottom: 1px solid #e5e7eb; border-right: 1px solid #e5e7eb; white-space: nowrap; color: #111827;">
+            ${selectedDimensions.length > 0 ? getDimensionLabel(selectedDimensions[0]) : 'Summary'}
+          </th>
+          <th style="padding: 12px 16px; text-align: left; font-weight: 600; border-bottom: 1px solid #e5e7eb; border-right: 2px solid #d1d5db; white-space: nowrap; color: #111827;">
+            Metric
+          </th>
+          ${columnOrder.map((colIndex, orderIndex) => {
+            // First column = 1, others = 4 (value, diff, %diff, sig) if significance results exist, else 3
+            const colSpan = orderIndex === 0 ? 1 : (hasSignificanceResults ? 4 : 3)
+            const bgColor = orderIndex === 0 ? 'background: #ecfdf5;' : ''
+            return `
+              <th colspan="${colSpan}" style="padding: 12px 16px; text-align: center; font-weight: 600; border-bottom: 1px solid #e5e7eb; ${orderIndex === 0 ? 'border-right: 2px solid #d1d5db;' : 'border-right: 1px solid #e5e7eb;'} white-space: nowrap; color: #111827; ${bgColor}">
+                ${orderIndex === 0 ? '★ ' : ''}${getColumnLabel(colIndex)}
+              </th>
+            `
+          }).join('')}
+        </tr>
+      `
+
+      // Sub-header row with Value, Diff, % Diff, Sig
+      const headerRow2 = `
+        <tr style="background: #f9fafb;">
+          <th style="padding: 8px 16px; border-bottom: 2px solid #e5e7eb; border-right: 1px solid #e5e7eb;"></th>
+          <th style="padding: 8px 16px; border-bottom: 2px solid #e5e7eb; border-right: 2px solid #d1d5db;"></th>
+          ${columnOrder.map((_, orderIndex) => {
+            if (orderIndex === 0) {
+              return `<th style="padding: 8px 16px; text-align: right; font-weight: 500; font-size: 12px; border-bottom: 2px solid #e5e7eb; border-right: 2px solid #d1d5db; color: #6b7280; background: #ecfdf5;">Value</th>`
+            } else {
+              const sigHeader = hasSignificanceResults
+                ? `<th style="padding: 8px 16px; text-align: right; font-weight: 500; font-size: 12px; border-bottom: 2px solid #e5e7eb; border-right: 1px solid #e5e7eb; color: #6b7280;">Sig</th>`
+                : ''
+              return `
+                <th style="padding: 8px 16px; text-align: right; font-weight: 500; font-size: 12px; border-bottom: 2px solid #e5e7eb; color: #6b7280;">Value</th>
+                <th style="padding: 8px 16px; text-align: right; font-weight: 500; font-size: 12px; border-bottom: 2px solid #e5e7eb; color: #6b7280;">Diff</th>
+                <th style="padding: 8px 16px; text-align: right; font-weight: 500; font-size: 12px; border-bottom: 2px solid #e5e7eb; ${hasSignificanceResults ? '' : 'border-right: 1px solid #e5e7eb;'} color: #6b7280;">% Diff</th>
+                ${sigHeader}
+              `
+            }
+          }).join('')}
+        </tr>
+      `
+
+      // Build data rows - render dimension value on each row but only show on first metric
+      let rowsHTML = ''
+      dimensionValues.forEach((dimValue: string, dimIndex: number) => {
+        const numMetrics = selectedMetrics.length
+
+        selectedMetrics.forEach((metricId, metricIndex) => {
+          const metricLabel = getMetricById(metricId)?.label || metricId
+          const isFirstMetric = metricIndex === 0
+          const isLastMetric = metricIndex === numMetrics - 1
+          const rowBg = dimIndex % 2 === 0 ? '#ffffff' : '#f9fafb'
+
+          // Get first column value for diff calculations
+          let firstValue: number | null = null
+          if (selectedDimensions.length === 0) {
+            firstValue = allColumnData?.[columnOrder[0]]?.total?.metrics?.[metricId] ?? null
+          } else {
+            const firstRowData = allColumnData?.[columnOrder[0]]?.rows?.find((r: any) => r.dimension_value === dimValue)
+            firstValue = firstRowData?.metrics?.[metricId] ?? null
+          }
+
+          rowsHTML += `<tr style="background: ${rowBg};">`
+
+          // Dimension value cell - show value only on first metric row, empty on others
+          // Use border-bottom only on last metric row of each group
+          const dimCellBorderBottom = isLastMetric ? 'border-bottom: 2px solid #d1d5db;' : 'border-bottom: 1px solid #e5e7eb;'
+          rowsHTML += `
+            <td style="padding: ${isFirstMetric ? '12px' : '4px'} 16px; text-align: left; font-weight: 500; border-right: 1px solid #e5e7eb; ${dimCellBorderBottom} white-space: nowrap; color: #111827; vertical-align: top;">
+              ${isFirstMetric ? dimValue : ''}
+            </td>
+          `
+
+          // Metric name cell
+          rowsHTML += `
+            <td style="padding: 8px 16px; text-align: left; font-size: 13px; border-right: 2px solid #d1d5db; ${isLastMetric ? 'border-bottom: 2px solid #d1d5db;' : 'border-bottom: 1px solid #e5e7eb;'} white-space: nowrap; color: #6b7280;">
+              ${metricLabel}
+            </td>
+          `
+
+          // Data columns
+          columnOrder.forEach((colIndex, orderIndex) => {
+            let value: number | null = null
+            if (selectedDimensions.length === 0) {
+              value = allColumnData?.[colIndex]?.total?.metrics?.[metricId] ?? null
+            } else {
+              const rowData = allColumnData?.[colIndex]?.rows?.find((r: any) => r.dimension_value === dimValue)
+              value = rowData?.metrics?.[metricId] ?? null
+            }
+
+            const formattedValue = value != null ? formatMetricValue(value, metricId) : '-'
+            const borderBottom = isLastMetric ? 'border-bottom: 2px solid #d1d5db;' : 'border-bottom: 1px solid #e5e7eb;'
+
+            if (orderIndex === 0) {
+              rowsHTML += `
+                <td style="padding: 8px 16px; text-align: right; font-weight: 500; border-right: 2px solid #d1d5db; ${borderBottom} white-space: nowrap; color: #111827; background: #ecfdf5;">
+                  ${formattedValue}
+                </td>
+              `
+            } else {
+              const diff = (value ?? 0) - (firstValue ?? 0)
+              const pctDiff = (firstValue ?? 0) !== 0
+                ? (((value ?? 0) / (firstValue ?? 0)) - 1) * 100
+                : null
+
+              // Get significance result for this cell
+              const rowId = selectedDimensions.length === 0 ? undefined : dimValue
+              const sigResult = hasSignificanceResults ? getSignificanceForCell(colIndex, metricId, rowId) : null
+              const sigData = formatSignificanceForExport(sigResult)
+
+              // Significance column (only if results exist)
+              const sigCell = hasSignificanceResults
+                ? `<td style="padding: 8px 16px; text-align: right; border-right: 1px solid #e5e7eb; ${borderBottom} white-space: nowrap;">
+                    ${sigData.indicator} ${sigData.displayProb}
+                  </td>`
+                : ''
+
+              rowsHTML += `
+                <td style="padding: 8px 16px; text-align: right; font-weight: 500; ${borderBottom} white-space: nowrap; color: #111827;">
+                  ${formattedValue}
+                </td>
+                <td style="padding: 8px 16px; text-align: right; ${borderBottom} white-space: nowrap; color: #374151;">
+                  ${formatMetricValue(diff, metricId)}
+                </td>
+                <td style="padding: 8px 16px; text-align: right; ${hasSignificanceResults ? '' : 'border-right: 1px solid #e5e7eb;'} ${borderBottom} white-space: nowrap; color: #374151;">
+                  ${pctDiff != null ? `${pctDiff.toFixed(2)}%` : '-'}
+                </td>
+                ${sigCell}
+              `
+            }
+          })
+
+          rowsHTML += '</tr>'
+        })
+      })
+
+      const tableHTML = `
+        <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
+          <thead>
+            ${headerRow1}
+            ${headerRow2}
+          </thead>
+          <tbody>
+            ${rowsHTML}
+          </tbody>
+        </table>
+      `
+
+      return metadataHTML + tableHTML
+    } else {
+      // Single table mode - simple table
+      const tableHTML = `
+        <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
+          <thead>
+            <tr style="background: #f9fafb;">
+              ${data.headers.map((h, i) => `
+                <th style="padding: 12px 16px; text-align: ${i === 0 ? 'left' : 'right'}; font-weight: 600; border-bottom: 2px solid #e5e7eb; white-space: nowrap; color: #111827;">
+                  ${h}
+                </th>
+              `).join('')}
+            </tr>
+          </thead>
+          <tbody>
+            ${data.rows.map((row, rowIdx) => `
+              <tr style="background: ${rowIdx % 2 === 0 ? '#ffffff' : '#f9fafb'};">
+                ${row.map((cell, i) => `
+                  <td style="padding: 12px 16px; text-align: ${i === 0 ? 'left' : 'right'}; border-bottom: 1px solid #e5e7eb; white-space: nowrap; color: #374151;">
+                    ${cell}
+                  </td>
+                `).join('')}
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      `
+
+      return metadataHTML + tableHTML
+    }
+  }
+
+  // Export as PNG image
+  const exportAsPNG = async (data: ExportData) => {
+    // Warn for very large tables
+    if (data.rows.length > 500) {
+      const confirmed = window.confirm(
+        `This table has ${data.rows.length} rows. Large tables may take longer to export. Continue?`
+      )
+      if (!confirmed) return
+    }
+
+    // Show loading overlay
+    const loadingOverlay = document.createElement('div')
+    loadingOverlay.className = 'fixed inset-0 bg-black/50 flex items-center justify-center z-[100]'
+    loadingOverlay.innerHTML = `
+      <div style="background: white; border-radius: 8px; padding: 24px; display: flex; flex-direction: column; align-items: center; gap: 12px;">
+        <div style="width: 32px; height: 32px; border: 3px solid #e5e7eb; border-top-color: #3b82f6; border-radius: 50%; animation: spin 1s linear infinite;"></div>
+        <p style="color: #374151; margin: 0;">Generating image...</p>
+      </div>
+      <style>
+        @keyframes spin {
+          to { transform: rotate(360deg); }
+        }
+      </style>
+    `
+    document.body.appendChild(loadingOverlay)
+
+    try {
+      // Create off-screen container for the complete table
+      const container = document.createElement('div')
+      container.style.cssText = `
+        position: absolute;
+        left: -9999px;
+        top: 0;
+        background: white;
+        padding: 24px;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      `
+      document.body.appendChild(container)
+
+      // Build the complete table HTML
+      container.innerHTML = buildExportTableHTML(data)
+
+      // Wait for styles to apply
+      await new Promise(resolve => setTimeout(resolve, 100))
+
+      // Capture with html2canvas
+      const canvas = await html2canvas(container, {
+        scale: 2, // 2x for high DPI/retina quality
+        useCORS: true,
+        logging: false,
+        backgroundColor: '#ffffff',
+        windowWidth: container.scrollWidth,
+        windowHeight: container.scrollHeight,
+      })
+
+      // Clean up the container
+      document.body.removeChild(container)
+
+      // Convert to PNG and download
+      canvas.toBlob((blob) => {
+        if (blob) {
+          const url = URL.createObjectURL(blob)
+          const link = document.createElement('a')
+          link.href = url
+          link.download = `pivot-table-${new Date().toISOString().split('T')[0]}.png`
+          link.click()
+          URL.revokeObjectURL(url)
+        }
+      }, 'image/png')
+    } catch (error) {
+      console.error('PNG export failed:', error)
+      alert('Failed to generate image. The table may be too large. Try exporting fewer rows or using CSV/HTML format.')
+    } finally {
+      // Remove loading overlay
+      document.body.removeChild(loadingOverlay)
+    }
+  }
 
   // Build widget config from current pivot state and selected widget type
   const currentWidgetConfig: Omit<WidgetCreateRequest, 'position'> = (() => {
@@ -1814,11 +2850,16 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
       displayMode = 'pivot-table'
     }
 
+    // Truncate title to 100 characters (backend validation limit)
+    const truncatedTitle = widgetTitle.length > 100
+      ? widgetTitle.substring(0, 97) + '...'
+      : widgetTitle
+
     const widgetConfig = {
       type: widgetType,
       display_mode: displayMode,
       table_id: selectedTable || '',
-      title: widgetTitle,
+      title: truncatedTitle,
       dimensions: widgetDimensions,
       table_dimensions: widgetTableDimensions,
       metrics: widgetMetrics,
@@ -1870,6 +2911,26 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
         </div>
         {!widgetMode && (
           <div className="flex items-center gap-3">
+            {/* Fetch BigQuery Data button */}
+            <button
+              onClick={triggerFetch}
+              disabled={(isLoading || isLoadingColumnData) || !isConfigured}
+              className={`flex items-center gap-2 px-4 py-2 rounded-lg transition-colors ${
+                isConfigured
+                  ? 'bg-blue-600 text-white hover:bg-blue-700 disabled:bg-blue-400'
+                  : 'bg-gray-300 text-gray-500 cursor-not-allowed'
+              }`}
+              title={!isConfigured ? 'Configure data source, date range, and select at least one metric' : 'Fetch data from BigQuery'}
+            >
+              <Database className="h-4 w-4" />
+              {isLoading || isLoadingColumnData ? 'Fetching...' : 'Fetch Data'}
+            </button>
+            {/* Stale indicator - show when config changed after last fetch */}
+            {isStale && !(isLoading || isLoadingColumnData) && (
+              <span className="px-3 py-1 text-xs font-medium bg-yellow-100 text-yellow-800 border border-yellow-300 rounded-full">
+                Config changed - click Fetch to update
+              </span>
+            )}
             <div className="flex items-center gap-2">
               <label className="text-sm text-gray-600">Show top:</label>
               <input
@@ -1922,6 +2983,29 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
               <Save className="h-4 w-4" />
               {isEditingWidget ? 'Copy to Dashboard' : 'Add to Dashboard'}
             </button>
+            <button
+              onClick={() => setIsExportModalOpen(true)}
+              disabled={!pivotData?.rows?.length}
+              className={`flex items-center gap-2 px-4 py-2 rounded-lg transition-colors ${
+                pivotData?.rows?.length
+                  ? 'bg-blue-600 text-white hover:bg-blue-700'
+                  : 'bg-gray-300 text-gray-500 cursor-not-allowed'
+              }`}
+              title="Export data as CSV or HTML"
+            >
+              <Download className="h-4 w-4" />
+              Export
+            </button>
+            {/* Significance Test Button - only show when using table dimensions (multi-column mode) */}
+            {selectedTableDimensions.length > 0 && (
+              <SignificanceButton
+                onClick={runSignificanceTest}
+                isLoading={isSignificanceLoading}
+                hasResults={hasSignificanceResults}
+                disabled={!isConfigured}
+                columnCount={columnOrder.length}
+              />
+            )}
             <button
               onClick={() => setConfigOpen(!isConfigOpen)}
               className={`flex items-center gap-2 px-4 py-2 rounded-lg transition-colors ${
@@ -2053,15 +3137,36 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
                   </div>
                 ))}
 
-                {/* Metric Chips */}
-                {selectedMetrics.map((metricId) => {
+                {/* Metric Chips - Drag to reorder */}
+                {selectedMetrics.map((metricId, index) => {
                   const metric = getMetricById(metricId)
                   return (
-                    <div key={metricId} className="flex items-center gap-1 px-3 py-1 bg-orange-100 text-orange-800 rounded-full text-sm">
+                    <div
+                      key={metricId}
+                      draggable
+                      onDragStart={(e) => {
+                        e.dataTransfer.effectAllowed = 'move'
+                        e.dataTransfer.setData('metricChipIndex', String(index))
+                        e.dataTransfer.setData('metricChipId', metricId)
+                      }}
+                      onDragOver={(e) => {
+                        e.preventDefault()
+                        e.dataTransfer.dropEffect = 'move'
+                      }}
+                      onDrop={(e) => {
+                        e.preventDefault()
+                        const fromIndex = parseInt(e.dataTransfer.getData('metricChipIndex'))
+                        if (!isNaN(fromIndex) && fromIndex !== index) {
+                          reorderMetrics(fromIndex, index)
+                        }
+                      }}
+                      className="flex items-center gap-1 px-3 py-1 bg-orange-100 text-orange-800 rounded-full text-sm cursor-move hover:bg-orange-200 transition-colors"
+                    >
+                      <GripVertical className="w-3 h-3 text-orange-400" />
                       <span>{metric?.label || metricId}</span>
                       <button
                         onClick={() => removeMetric(metricId)}
-                        className="ml-1 hover:bg-orange-200 rounded-full p-0.5"
+                        className="ml-1 hover:bg-orange-300 rounded-full p-0.5"
                       >
                         <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
@@ -2120,7 +3225,7 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
                       className={`transition-all ${isDragOverHeader ? 'bg-yellow-100 ring-2 ring-yellow-400' : ''}`}
                     >
                       <th
-                        className={`px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider transition-all border-r-2 border-gray-300 cursor-pointer hover:bg-gray-100 ${
+                        className={`px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider transition-all border-r border-gray-200 cursor-pointer hover:bg-gray-100 ${
                           isDragOverFirstColumn ? 'bg-green-100 ring-2 ring-green-400' : ''
                         }`}
                         onClick={() => {
@@ -2149,6 +3254,9 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
                             </span>
                           )}
                         </div>
+                      </th>
+                      <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider border-r-2 border-gray-300">
+                        Metric
                       </th>
                       {columnOrder.map((originalColIndex, orderIndex) => {
                         const combination = tableCombinations[originalColIndex]
@@ -2207,163 +3315,88 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
                     {/* Second header row - metric sub-columns */}
                     <tr className="bg-gray-100">
                       {/* Row dimension column - Sort columns by metric */}
-                      <th className="px-6 py-2 text-left text-xs font-medium text-gray-600 uppercase tracking-wider border-r-2 border-gray-300">
-                        <div className="flex flex-col items-start gap-1">
-                          <span className="text-gray-500">Sort columns:</span>
-                          <div className="flex flex-wrap gap-1">
-                            {selectedMetrics.map((metricId) => {
-                              const metric = getMetricById(metricId)
-                              const isActiveColumnSort = columnSortConfig && columnSortConfig.metric === metricId
-                              return (
-                                <button
-                                  key={metricId}
-                                  onClick={(e) => {
-                                    e.stopPropagation()
-                                    handleColumnSort(metricId)
-                                  }}
-                                  className={`px-2 py-0.5 rounded text-xs transition-colors ${
-                                    isActiveColumnSort
-                                      ? 'bg-purple-600 text-white'
-                                      : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
-                                  }`}
-                                  title={`Reorder columns by ${metric?.label}`}
-                                >
-                                  {metric?.label}
-                                  {isActiveColumnSort && (
-                                    <span className="ml-1">{columnSortConfig.direction === 'desc' ? '↓' : '↑'}</span>
-                                  )}
-                                </button>
-                              )
-                            })}
-                          </div>
-                        </div>
+                      <th className="px-6 py-2 text-left text-xs font-medium text-gray-600 uppercase tracking-wider border-r border-gray-200">
+                        <SortDropdown
+                          label="Sort cols"
+                          metrics={selectedMetrics}
+                          getMetricById={getMetricById}
+                          activeMetric={columnSortConfig?.metric}
+                          activeDirection={columnSortConfig?.direction}
+                          onSort={handleColumnSort}
+                          align="left"
+                          color="purple"
+                          showFullLabel={true}
+                        />
+                      </th>
+                      <th className="px-4 py-2 text-left text-xs font-medium text-gray-600 uppercase tracking-wider border-r-2 border-gray-300">
                       </th>
                       {columnOrder.map((originalColIndex, orderIndex) => {
                         if (orderIndex === 0) {
-                          // First column - show metric badges for sorting selection
+                          // First column - show sort dropdown
+                          const activeMetricForCol = sortConfig?.column === originalColIndex && sortConfig?.subColumn === 'value' ? sortConfig.metric : null
                           return (
                             <th
                               key={`metric-${originalColIndex}`}
                               className="px-6 py-2 text-right text-xs font-medium text-gray-600 uppercase tracking-wider border-r-2 border-gray-300"
                             >
-                              <div className="flex flex-col items-end gap-1">
-                                <span className="text-gray-500">Sort by:</span>
-                                <div className="flex flex-wrap gap-1 justify-end">
-                                  {selectedMetrics.map((metricId) => {
-                                    const metric = getMetricById(metricId)
-                                    const isActiveSortMetric = sortConfig && sortConfig.column === originalColIndex && sortConfig.subColumn === 'value' && sortConfig.metric === metricId
-                                    return (
-                                      <button
-                                        key={metricId}
-                                        onClick={() => handleSort(originalColIndex, 'value', metricId)}
-                                        className={`px-2 py-0.5 rounded text-xs transition-colors ${
-                                          isActiveSortMetric
-                                            ? 'bg-blue-600 text-white'
-                                            : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
-                                        }`}
-                                        title={`Sort by ${metric?.label}`}
-                                      >
-                                        {metric?.label}
-                                        {isActiveSortMetric && (
-                                          <span className="ml-1">{sortConfig.direction === 'desc' ? '↓' : '↑'}</span>
-                                        )}
-                                      </button>
-                                    )
-                                  })}
-                                </div>
-                              </div>
+                              <SortDropdown
+                                label="Sort"
+                                metrics={selectedMetrics}
+                                getMetricById={getMetricById}
+                                activeMetric={activeMetricForCol}
+                                activeDirection={sortConfig?.direction}
+                                onSort={(metricId) => handleSort(originalColIndex, 'value', metricId)}
+                                align="right"
+                                color="blue"
+                                showFullLabel={true}
+                              />
                             </th>
                           )
                         } else {
-                          // Columns 2+ - Value, Diff, % Diff with metric badges
+                          // Columns 2+ - Value, Diff, % Diff with sort dropdowns
+                          const activeValueMetric = sortConfig?.column === originalColIndex && sortConfig?.subColumn === 'value' ? sortConfig.metric : null
+                          const activeDiffMetric = sortConfig?.column === originalColIndex && sortConfig?.subColumn === 'diff' ? sortConfig.metric : null
+                          const activePctDiffMetric = sortConfig?.column === originalColIndex && sortConfig?.subColumn === 'pctDiff' ? sortConfig.metric : null
                           return (
                             <React.Fragment key={`metrics-${originalColIndex}`}>
-                              {/* Value column with metric badges */}
+                              {/* Value column */}
                               <th className="px-4 py-2 text-right text-xs font-medium text-gray-600 uppercase tracking-wider border-l border-gray-200">
-                                <div className="flex flex-col items-end gap-1">
-                                  <span className="text-gray-500">Value</span>
-                                  <div className="flex flex-wrap gap-1 justify-end">
-                                    {selectedMetrics.map((metricId) => {
-                                      const metric = getMetricById(metricId)
-                                      const isActiveSortMetric = sortConfig && sortConfig.column === originalColIndex && sortConfig.subColumn === 'value' && sortConfig.metric === metricId
-                                      return (
-                                        <button
-                                          key={metricId}
-                                          onClick={() => handleSort(originalColIndex, 'value', metricId)}
-                                          className={`px-1.5 py-0.5 rounded text-xs transition-colors ${
-                                            isActiveSortMetric
-                                              ? 'bg-blue-600 text-white'
-                                              : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
-                                          }`}
-                                          title={`Sort by ${metric?.label}`}
-                                        >
-                                          {metric?.label?.substring(0, 3)}
-                                          {isActiveSortMetric && (
-                                            <span className="ml-0.5">{sortConfig.direction === 'desc' ? '↓' : '↑'}</span>
-                                          )}
-                                        </button>
-                                      )
-                                    })}
-                                  </div>
-                                </div>
+                                <SortDropdown
+                                  label="Value"
+                                  metrics={selectedMetrics}
+                                  getMetricById={getMetricById}
+                                  activeMetric={activeValueMetric}
+                                  activeDirection={sortConfig?.direction}
+                                  onSort={(metricId) => handleSort(originalColIndex, 'value', metricId)}
+                                  align="right"
+                                  color="blue"
+                                />
                               </th>
-                              {/* Diff column with metric badges */}
+                              {/* Diff column */}
                               <th className="px-4 py-2 text-right text-xs font-medium text-gray-600 uppercase tracking-wider">
-                                <div className="flex flex-col items-end gap-1">
-                                  <span className="text-gray-500">Diff</span>
-                                  <div className="flex flex-wrap gap-1 justify-end">
-                                    {selectedMetrics.map((metricId) => {
-                                      const metric = getMetricById(metricId)
-                                      const isActiveSortMetric = sortConfig && sortConfig.column === originalColIndex && sortConfig.subColumn === 'diff' && sortConfig.metric === metricId
-                                      return (
-                                        <button
-                                          key={metricId}
-                                          onClick={() => handleSort(originalColIndex, 'diff', metricId)}
-                                          className={`px-1.5 py-0.5 rounded text-xs transition-colors ${
-                                            isActiveSortMetric
-                                              ? 'bg-blue-600 text-white'
-                                              : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
-                                          }`}
-                                          title={`Sort by ${metric?.label}`}
-                                        >
-                                          {metric?.label?.substring(0, 3)}
-                                          {isActiveSortMetric && (
-                                            <span className="ml-0.5">{sortConfig.direction === 'desc' ? '↓' : '↑'}</span>
-                                          )}
-                                        </button>
-                                      )
-                                    })}
-                                  </div>
-                                </div>
+                                <SortDropdown
+                                  label="Diff"
+                                  metrics={selectedMetrics}
+                                  getMetricById={getMetricById}
+                                  activeMetric={activeDiffMetric}
+                                  activeDirection={sortConfig?.direction}
+                                  onSort={(metricId) => handleSort(originalColIndex, 'diff', metricId)}
+                                  align="right"
+                                  color="blue"
+                                />
                               </th>
-                              {/* % Diff column with metric badges */}
+                              {/* % Diff column */}
                               <th className="px-4 py-2 text-right text-xs font-medium text-gray-600 uppercase tracking-wider border-r border-gray-200">
-                                <div className="flex flex-col items-end gap-1">
-                                  <span className="text-gray-500">% Diff</span>
-                                  <div className="flex flex-wrap gap-1 justify-end">
-                                    {selectedMetrics.map((metricId) => {
-                                      const metric = getMetricById(metricId)
-                                      const isActiveSortMetric = sortConfig && sortConfig.column === originalColIndex && sortConfig.subColumn === 'pctDiff' && sortConfig.metric === metricId
-                                      return (
-                                        <button
-                                          key={metricId}
-                                          onClick={() => handleSort(originalColIndex, 'pctDiff', metricId)}
-                                          className={`px-1.5 py-0.5 rounded text-xs transition-colors ${
-                                            isActiveSortMetric
-                                              ? 'bg-blue-600 text-white'
-                                              : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
-                                          }`}
-                                          title={`Sort by ${metric?.label}`}
-                                        >
-                                          {metric?.label?.substring(0, 3)}
-                                          {isActiveSortMetric && (
-                                            <span className="ml-0.5">{sortConfig.direction === 'desc' ? '↓' : '↑'}</span>
-                                          )}
-                                        </button>
-                                      )
-                                    })}
-                                  </div>
-                                </div>
+                                <SortDropdown
+                                  label="% Diff"
+                                  metrics={selectedMetrics}
+                                  getMetricById={getMetricById}
+                                  activeMetric={activePctDiffMetric}
+                                  activeDirection={sortConfig?.direction}
+                                  onSort={(metricId) => handleSort(originalColIndex, 'pctDiff', metricId)}
+                                  align="right"
+                                  color="blue"
+                                />
                               </th>
                             </React.Fragment>
                           )
@@ -2375,270 +3408,86 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
                     {/* Render rows based on row dimensions or show single summary row */}
                     {selectedDimensions.length === 0 ? (
                       <>
-                        {/* Make Total row expandable */}
+                        {/* No dimensions - show Total with sub-rows per metric */}
                         {(() => {
-                          const rowKey = `depth0:Total`
-                          const isExpanded = expandedRows.has(rowKey)
-                          const isLoading = loadingRows.has(rowKey)
-                          const currentPageNum = currentPage[rowKey] || 0
-                          const firstColIndex = columnOrder[0] ?? 0
-                          const colPageKey = `${rowKey}:col_${firstColIndex}:${currentPageNum}`
-                          const firstColChildren = childrenCache[colPageKey] || []
+                          const firstColIndex = columnOrder[0]
+                          const firstColData = allColumnData?.[firstColIndex]
 
                           return (
                             <>
-                              <tr className="hover:bg-gray-50">
-                                <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
-                                  <span>Total</span>
-                                </td>
-                                {columnOrder.map((originalColIndex, orderIndex) => {
-                                  const columnData = allColumnData?.[originalColIndex]
+                              {selectedMetrics.map((metricId, metricIndex) => {
+                                const metric = getMetricById(metricId)
+                                const isFirstMetric = metricIndex === 0
+                                const isLastMetric = metricIndex === selectedMetrics.length - 1
+                                const firstValue = firstColData?.total?.metrics?.[metricId] ?? null
 
-                                  if (orderIndex === 0) {
-                                    // First column - show all selected metrics stacked
-                                    return (
+                                return (
+                                  <tr key={`total-${metricId}`} className="hover:bg-gray-50">
+                                    {/* Total label - only render on first metric row with rowSpan */}
+                                    {isFirstMetric && (
                                       <td
-                                        key={`col-${originalColIndex}`}
-                                        className="px-6 py-4 text-sm text-gray-900 text-right border-r-2 border-gray-300"
+                                        rowSpan={selectedMetrics.length}
+                                        className="px-6 py-2 whitespace-nowrap text-sm font-medium text-gray-900 border-r border-gray-200 align-middle"
                                       >
-                                        <div className="space-y-1">
-                                          {selectedMetrics.map((metricId) => {
-                                            const value = columnData?.total?.metrics?.[metricId] ?? null
-                                            const metric = getMetricById(metricId)
-                                            return (
-                                              <div key={metricId} className="whitespace-nowrap">
-                                                <span className="text-xs text-gray-500">{metric?.label}: </span>
-                                                <span className="font-medium">{value != null ? formatMetricValue(value, metricId) : '-'}</span>
+                                        Total
+                                      </td>
+                                    )}
+                                    {/* Metric name */}
+                                    <td className={`px-4 ${isFirstMetric ? 'pt-3' : 'pt-1'} ${isLastMetric ? 'pb-3' : 'pb-1'} whitespace-nowrap text-xs text-gray-500 border-r-2 border-gray-300`}>
+                                      {metric?.label}
+                                    </td>
+                                    {/* Data columns */}
+                                    {columnOrder.map((originalColIndex, orderIndex) => {
+                                      const columnData = allColumnData?.[originalColIndex]
+                                      const value = columnData?.total?.metrics?.[metricId] ?? null
+
+                                      if (orderIndex === 0) {
+                                        return (
+                                          <td
+                                            key={`col-${originalColIndex}`}
+                                            className={`px-6 ${isFirstMetric ? 'pt-3' : 'pt-1'} ${isLastMetric ? 'pb-3' : 'pb-1'} text-sm text-gray-900 text-right border-r-2 border-gray-300`}
+                                          >
+                                            <span className="font-medium">{value != null ? formatMetricValue(value, metricId) : '-'}</span>
+                                          </td>
+                                        )
+                                      } else {
+                                        const diff = (value ?? 0) - (firstValue ?? 0)
+                                        const pctDiff = (firstValue ?? 0) !== 0
+                                          ? (((value ?? 0) / (firstValue ?? 0)) - 1) * 100
+                                          : null
+
+                                        // Get significance result for indicator (but don't color diff values)
+                                        const sigResult = getSignificanceForCell(originalColIndex, metricId)
+                                        // Don't color diff/pctDiff - only the significance indicator shows color
+                                        const diffColorClass = 'text-gray-700'
+
+                                        return (
+                                          <React.Fragment key={`col-${originalColIndex}`}>
+                                            <td className={`px-4 ${isFirstMetric ? 'pt-3' : 'pt-1'} ${isLastMetric ? 'pb-3' : 'pb-1'} text-sm text-gray-900 text-right border-l border-gray-200`}>
+                                              <span className="font-medium">{value != null ? formatMetricValue(value, metricId) : '-'}</span>
+                                            </td>
+                                            <td className={`px-4 ${isFirstMetric ? 'pt-3' : 'pt-1'} ${isLastMetric ? 'pb-3' : 'pb-1'} text-sm ${diffColorClass} text-right`}>
+                                              {diff != null ? formatMetricValue(diff, metricId) : '-'}
+                                            </td>
+                                            <td className={`px-4 ${isFirstMetric ? 'pt-3' : 'pt-1'} ${isLastMetric ? 'pb-3' : 'pb-1'} text-sm ${diffColorClass} text-right border-r border-gray-200`}>
+                                              <div className="flex items-center justify-end gap-1">
+                                                <span>{pctDiff != null ? `${pctDiff.toFixed(2)}%` : '-'}</span>
+                                                <span className="inline-block min-w-[60px] text-right">
+                                                  <SignificanceIndicator
+                                                    result={sigResult}
+                                                    compact={true}
+                                                    formatType={getFormatTypeForMetric(metricId)}
+                                                  />
+                                                </span>
                                               </div>
-                                            )
-                                          })}
-                                        </div>
-                                      </td>
-                                    )
-                                  } else {
-                                    // Columns 2+ - show all selected metrics with diff and % diff
-                                    const firstColIndex = columnOrder[0]
-                                    const firstColData = allColumnData?.[firstColIndex]
-
-                                    return (
-                                      <React.Fragment key={`col-${originalColIndex}`}>
-                                        <td className="px-4 py-4 text-sm text-gray-900 text-right border-l border-gray-200">
-                                          <div className="space-y-1">
-                                            {selectedMetrics.map((metricId) => {
-                                              const value = columnData?.total?.metrics?.[metricId] ?? null
-                                              const metric = getMetricById(metricId)
-                                              return (
-                                                <div key={metricId} className="whitespace-nowrap">
-                                                  <span className="text-xs text-gray-500">{metric?.label}: </span>
-                                                  <span className="font-medium">{value != null ? formatMetricValue(value, metricId) : '-'}</span>
-                                                </div>
-                                              )
-                                            })}
-                                          </div>
-                                        </td>
-                                        <td className="px-4 py-4 text-sm text-gray-700 text-right">
-                                          <div className="space-y-1">
-                                            {selectedMetrics.map((metricId) => {
-                                              const value = columnData?.total?.metrics?.[metricId] ?? null
-                                              const firstValue = firstColData?.total?.metrics?.[metricId] ?? null
-                                              const diff = (value ?? 0) - (firstValue ?? 0)
-                                              return (
-                                                <div key={metricId} className="whitespace-nowrap">
-                                                  {diff != null ? formatMetricValue(diff, metricId) : '-'}
-                                                </div>
-                                              )
-                                            })}
-                                          </div>
-                                        </td>
-                                        <td className="px-4 py-4 text-sm text-gray-700 text-right border-r border-gray-200">
-                                          <div className="space-y-1">
-                                            {selectedMetrics.map((metricId) => {
-                                              const value = columnData?.total?.metrics?.[metricId] ?? null
-                                              const firstValue = firstColData?.total?.metrics?.[metricId] ?? null
-                                              const pctDiff = (firstValue ?? 0) !== 0
-                                                ? (((value ?? 0) / (firstValue ?? 0)) - 1) * 100
-                                                : null
-                                              return (
-                                                <div key={metricId} className="whitespace-nowrap">
-                                                  {pctDiff != null ? `${pctDiff.toFixed(2)}%` : '-'}
-                                                </div>
-                                              )
-                                            })}
-                                          </div>
-                                        </td>
-                                      </React.Fragment>
-                                    )
-                                  }
-                                })}
-                              </tr>
-                              {/* No drill-down in column-pivot mode - dimensions already shown as columns */}
-                              {false && isExpanded && (
-                                <>
-                                  {isLoading && firstColChildren.length === 0 ? (
-                                    <tr className="bg-blue-50">
-                                      <td colSpan={columnOrder.length + 1} className="px-6 py-4 text-center text-sm text-gray-600">
-                                        Loading...
-                                      </td>
-                                    </tr>
-                                  ) : (
-                                    (() => {
-                                      // Build a map of search term -> column data for all columns
-                                      const childrenByColumn: Record<number, Record<string, PivotChildRow>> = {}
-                                      columnOrder.forEach((originalColIndex) => {
-                                        const colPageKey = `${rowKey}:col_${originalColIndex}:${currentPageNum}`
-                                        const colChildren = childrenCache[colPageKey] || []
-                                        childrenByColumn[originalColIndex] = {}
-                                        colChildren.forEach(child => {
-                                          childrenByColumn[originalColIndex][child.search_term] = child
-                                        })
-                                      })
-
-                                      return (
-                                        <>
-                                          {/* Drill-down header row */}
-                                          <tr className="bg-blue-100 border-t-2 border-blue-300">
-                                            <th
-                                              className="px-6 py-2 text-left text-xs font-medium text-gray-700 uppercase tracking-wider cursor-pointer hover:bg-blue-200"
-                                              onClick={() => handleChildrenSort('dimension')}
-                                            >
-                                              <div className="flex items-center gap-1 pl-8">
-                                                <span>Search Term</span>
-                                                {childrenSortConfig?.column === 'dimension' && (
-                                                  <span className="text-gray-500">
-                                                    {childrenSortConfig.direction === 'asc' ? '↑' : '↓'}
-                                                  </span>
-                                                )}
-                                              </div>
-                                            </th>
-                                            {columnOrder.map((originalColIndex, orderIndex) => {
-                                              const metric = getMetricById(selectedMetrics[0] || primarySortMetric)
-                                              if (orderIndex === 0) {
-                                                const isSorted = childrenSortConfig?.column === (selectedMetrics[0] || primarySortMetric)
-                                                return (
-                                                  <th
-                                                    key={`child-header-${originalColIndex}`}
-                                                    className="px-6 py-2 text-right text-xs font-medium text-gray-700 uppercase tracking-wider border-r-2 border-blue-300 cursor-pointer hover:bg-blue-200"
-                                                    onClick={() => handleChildrenSort(selectedMetrics[0] || primarySortMetric)}
-                                                  >
-                                                    <div className="flex items-center justify-end gap-1">
-                                                      {metric?.label}
-                                                      {isSorted && (
-                                                        <span className="text-gray-500">
-                                                          {childrenSortConfig.direction === 'asc' ? '↑' : '↓'}
-                                                        </span>
-                                                      )}
-                                                    </div>
-                                                  </th>
-                                                )
-                                              } else {
-                                                return (
-                                                  <th
-                                                    key={`child-header-${originalColIndex}`}
-                                                    colSpan={3}
-                                                    className="px-4 py-2 text-center text-xs font-medium text-gray-700 uppercase tracking-wider border-r border-blue-200"
-                                                  >
-                                                    {metric?.label}
-                                                  </th>
-                                                )
-                                              }
-                                            })}
-                                          </tr>
-                                          {sortChildren(firstColChildren).map((child, idx) => (
-                                            <tr key={`Total-child-${idx}`} className="bg-blue-50 hover:bg-blue-100">
-                                              <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-700">
-                                                <div className="pl-8">{child.search_term}</div>
-                                              </td>
-                                              {columnOrder.map((originalColIndex, orderIndex) => {
-                                                // Look up the child data for this search term in this column
-                                                const childData = childrenByColumn[originalColIndex][child.search_term]
-                                                const value = childData ? (childData as any)[selectedMetrics[0] || primarySortMetric] : null
-
-                                                if (orderIndex === 0) {
-                                                  // First column - just show the value
-                                                  return (
-                                                    <td
-                                                      key={`col-${originalColIndex}`}
-                                                      className="px-6 py-4 whitespace-nowrap text-sm text-gray-700 text-right border-r-2 border-gray-300"
-                                                    >
-                                                      {value != null ? formatMetricValue(value, selectedMetrics[0] || primarySortMetric) : '-'}
-                                                    </td>
-                                                  )
-                                                } else {
-                                                  // Columns 2+ - show value, diff, % diff
-                                                  const firstColIndex = columnOrder[0]
-                                                  const firstChildData = childrenByColumn[firstColIndex][child.search_term]
-                                                  const firstValue = firstChildData ? (firstChildData as any)[selectedMetrics[0] || primarySortMetric] : null
-
-                                                  const diff = (value ?? 0) - (firstValue ?? 0)
-                                                  const pctDiff = (firstValue ?? 0) !== 0
-                                                    ? (((value ?? 0) / (firstValue ?? 0)) - 1) * 100
-                                                    : null
-
-                                                  return (
-                                                    <React.Fragment key={`col-${originalColIndex}`}>
-                                                      <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-700 text-right border-l border-gray-200">
-                                                        {value != null ? formatMetricValue(value, selectedMetrics[0] || primarySortMetric) : '-'}
-                                                      </td>
-                                                      <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-600 text-right">
-                                                        {diff != null ? formatMetricValue(diff, selectedMetrics[0] || primarySortMetric) : '-'}
-                                                      </td>
-                                                      <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-600 text-right border-r border-gray-200">
-                                                        {pctDiff != null ? `${pctDiff.toFixed(2)}%` : '-'}
-                                                      </td>
-                                                    </React.Fragment>
-                                                  )
-                                                }
-                                              })}
-                                            </tr>
-                                          ))}
-                                        </>
-                                      )
-                                    })()
-                                  )}
-                                  {firstColChildren.length >= CHILDREN_PAGE_SIZE && (
-                                    <tr className="bg-blue-50">
-                                      <td colSpan={columnOrder.length + 1} className="px-6 py-4">
-                                        {isLoading ? (
-                                          <div className="flex items-center justify-center gap-2 text-sm text-gray-600">
-                                            <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-gray-700"></div>
-                                            Loading...
-                                          </div>
-                                        ) : (
-                                          <div className="flex items-center justify-center gap-4">
-                                            <button
-                                              onClick={(e) => {
-                                                e.stopPropagation()
-                                                const currentPageNum = currentPage[rowKey] || 0
-                                                if (currentPageNum > 0) {
-                                                  goToPage('Total', 0, currentPageNum - 1)
-                                                }
-                                              }}
-                                              disabled={!currentPage[rowKey] || currentPage[rowKey] === 0}
-                                              className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-md hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
-                                            >
-                                              Previous
-                                            </button>
-                                            <span className="text-sm text-gray-600">
-                                              Page {(currentPage[rowKey] || 0) + 1}
-                                            </span>
-                                            <button
-                                              onClick={(e) => {
-                                                e.stopPropagation()
-                                                const currentPageNum = currentPage[rowKey] || 0
-                                                goToPage('Total', 0, currentPageNum + 1)
-                                              }}
-                                              disabled={firstColChildren.length < CHILDREN_PAGE_SIZE}
-                                              className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-md hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
-                                            >
-                                              Next
-                                            </button>
-                                          </div>
-                                        )}
-                                      </td>
-                                    </tr>
-                                  )}
-                                </>
-                              )}
+                                            </td>
+                                          </React.Fragment>
+                                        )
+                                      }
+                                    })}
+                                  </tr>
+                                )
+                              })}
                             </>
                           )
                         })()}
@@ -2655,94 +3504,94 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
                           const children = childrenCache[pageKey] || []
                           const grandTotal = pivotData?.total.metrics?.[primarySortMetric] || 0
 
+                          // Get data for all columns for this row
+                          const firstColIndex = columnOrder[0]
+                          const firstColData = allColumnData?.[firstColIndex]
+                          const firstRowData = firstColData?.rows.find((r: any) => r.dimension_value === row.dimension_value)
+
                           return (
                             <React.Fragment key={row.dimension_value}>
-                              <tr className="hover:bg-gray-50">
-                                <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
-                                  <span>{row.dimension_value}</span>
-                                </td>
-                                {columnOrder.map((originalColIndex, orderIndex) => {
-                                  const columnData = allColumnData?.[originalColIndex]
-                                  const rowData = columnData?.rows.find((r: any) => r.dimension_value === row.dimension_value)
+                              {/* Render one sub-row per metric */}
+                              {selectedMetrics.map((metricId, metricIndex) => {
+                                const metric = getMetricById(metricId)
+                                const isFirstMetric = metricIndex === 0
+                                const isLastMetric = metricIndex === selectedMetrics.length - 1
 
-                                  if (orderIndex === 0) {
-                                    // First column - show all selected metrics stacked
-                                    return (
+                                return (
+                                  <tr
+                                    key={`${row.dimension_value}-${metricId}`}
+                                    className={`hover:bg-gray-50 ${isLastMetric ? 'border-b-2 border-gray-300' : ''}`}
+                                  >
+                                    {/* Dimension value cell - only render on first metric row with rowSpan */}
+                                    {isFirstMetric && (
                                       <td
-                                        key={`col-${originalColIndex}`}
-                                        className="px-6 py-4 text-sm text-gray-900 text-right border-r-2 border-gray-300"
+                                        rowSpan={selectedMetrics.length}
+                                        className="px-6 py-2 whitespace-nowrap text-sm font-medium text-gray-900 border-r border-gray-200 align-middle"
                                       >
-                                        <div className="space-y-1">
-                                          {selectedMetrics.map((metricId) => {
-                                            const value = rowData?.metrics?.[metricId] ?? null
-                                            const metric = getMetricById(metricId)
-                                            return (
-                                              <div key={metricId} className="whitespace-nowrap">
-                                                <span className="text-xs text-gray-500">{metric?.label}: </span>
-                                                <span className="font-medium">{value != null ? formatMetricValue(value, metricId) : '-'}</span>
-                                              </div>
-                                            )
-                                          })}
-                                        </div>
+                                        {row.dimension_value}
                                       </td>
-                                    )
-                                  } else {
-                                    // Columns 2+ - show all selected metrics with diff and % diff
-                                    const firstColIndex = columnOrder[0]
-                                    const firstColData = allColumnData?.[firstColIndex]
-                                    const firstRowData = firstColData?.rows.find((r: any) => r.dimension_value === row.dimension_value)
+                                    )}
+                                    {/* Metric name column */}
+                                    <td className={`px-4 ${isFirstMetric ? 'pt-3' : 'pt-1'} ${isLastMetric ? 'pb-3' : 'pb-1'} whitespace-nowrap text-xs text-gray-500 border-r-2 border-gray-300`}>
+                                      {metric?.label}
+                                    </td>
 
-                                    return (
-                                      <React.Fragment key={`col-${originalColIndex}`}>
-                                        <td className="px-4 py-4 text-sm text-gray-900 text-right border-l border-gray-200">
-                                          <div className="space-y-1">
-                                            {selectedMetrics.map((metricId) => {
-                                              const value = rowData?.metrics?.[metricId] ?? null
-                                              const metric = getMetricById(metricId)
-                                              return (
-                                                <div key={metricId} className="whitespace-nowrap">
-                                                  <span className="text-xs text-gray-500">{metric?.label}: </span>
-                                                  <span className="font-medium">{value != null ? formatMetricValue(value, metricId) : '-'}</span>
-                                                </div>
-                                              )
-                                            })}
-                                          </div>
-                                        </td>
-                                        <td className="px-4 py-4 text-sm text-gray-700 text-right">
-                                          <div className="space-y-1">
-                                            {selectedMetrics.map((metricId) => {
-                                              const value = rowData?.metrics?.[metricId] ?? null
-                                              const firstValue = firstRowData?.metrics?.[metricId] ?? null
-                                              const diff = (value ?? 0) - (firstValue ?? 0)
-                                              return (
-                                                <div key={metricId} className="whitespace-nowrap">
-                                                  {diff != null ? formatMetricValue(diff, metricId) : '-'}
-                                                </div>
-                                              )
-                                            })}
-                                          </div>
-                                        </td>
-                                        <td className="px-4 py-4 text-sm text-gray-700 text-right border-r border-gray-200">
-                                          <div className="space-y-1">
-                                            {selectedMetrics.map((metricId) => {
-                                              const value = rowData?.metrics?.[metricId] ?? null
-                                              const firstValue = firstRowData?.metrics?.[metricId] ?? null
-                                              const pctDiff = (firstValue ?? 0) !== 0
-                                                ? (((value ?? 0) / (firstValue ?? 0)) - 1) * 100
-                                                : null
-                                              return (
-                                                <div key={metricId} className="whitespace-nowrap">
-                                                  {pctDiff != null ? `${pctDiff.toFixed(2)}%` : '-'}
-                                                </div>
-                                              )
-                                            })}
-                                          </div>
-                                        </td>
-                                      </React.Fragment>
-                                    )
-                                  }
-                                })}
-                              </tr>
+                                    {/* Data columns */}
+                                    {columnOrder.map((originalColIndex, orderIndex) => {
+                                      const columnData = allColumnData?.[originalColIndex]
+                                      const rowData = columnData?.rows.find((r: any) => r.dimension_value === row.dimension_value)
+                                      const value = rowData?.metrics?.[metricId] ?? null
+
+                                      if (orderIndex === 0) {
+                                        // First/control column - just show value
+                                        return (
+                                          <td
+                                            key={`col-${originalColIndex}`}
+                                            className={`px-6 ${isFirstMetric ? 'pt-3' : 'pt-1'} ${isLastMetric ? 'pb-3' : 'pb-1'} text-sm text-gray-900 text-right border-r-2 border-gray-300`}
+                                          >
+                                            <span className="font-medium">{value != null ? formatMetricValue(value, metricId) : '-'}</span>
+                                          </td>
+                                        )
+                                      } else {
+                                        // Comparison columns - show value, diff, % diff
+                                        const firstValue = firstRowData?.metrics?.[metricId] ?? null
+                                        const diff = (value ?? 0) - (firstValue ?? 0)
+                                        const pctDiff = (firstValue ?? 0) !== 0
+                                          ? (((value ?? 0) / (firstValue ?? 0)) - 1) * 100
+                                          : null
+
+                                        // Get significance result for indicator (but don't color diff values)
+                                        const sigResult = getSignificanceForCell(originalColIndex, metricId, row.dimension_value)
+                                        // Don't color diff/pctDiff - only the significance indicator shows color
+                                        const diffColorClass = 'text-gray-700'
+
+                                        return (
+                                          <React.Fragment key={`col-${originalColIndex}`}>
+                                            <td className={`px-4 ${isFirstMetric ? 'pt-3' : 'pt-1'} ${isLastMetric ? 'pb-3' : 'pb-1'} text-sm text-gray-900 text-right border-l border-gray-200`}>
+                                              <span className="font-medium">{value != null ? formatMetricValue(value, metricId) : '-'}</span>
+                                            </td>
+                                            <td className={`px-4 ${isFirstMetric ? 'pt-3' : 'pt-1'} ${isLastMetric ? 'pb-3' : 'pb-1'} text-sm ${diffColorClass} text-right`}>
+                                              {diff != null ? formatMetricValue(diff, metricId) : '-'}
+                                            </td>
+                                            <td className={`px-4 ${isFirstMetric ? 'pt-3' : 'pt-1'} ${isLastMetric ? 'pb-3' : 'pb-1'} text-sm ${diffColorClass} text-right border-r border-gray-200`}>
+                                              <div className="flex items-center justify-end gap-1">
+                                                <span>{pctDiff != null ? `${pctDiff.toFixed(2)}%` : '-'}</span>
+                                                <span className="inline-block min-w-[60px] text-right">
+                                                  <SignificanceIndicator
+                                                    result={sigResult}
+                                                    compact={true}
+                                                    formatType={getFormatTypeForMetric(metricId)}
+                                                  />
+                                                </span>
+                                              </div>
+                                            </td>
+                                          </React.Fragment>
+                                        )
+                                      }
+                                    })}
+                                  </tr>
+                                )
+                              })}
                               {/* Expanded children rows */}
                               {isExpanded && (
                                 <>
@@ -2924,51 +3773,80 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
                   </tbody>
                   <tfoot className="bg-gray-100 font-semibold sticky bottom-0 z-10">
                     {selectedDimensions.length > 0 && (
-                      <tr>
-                        <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                          Total
-                        </td>
-                        {columnOrder.map((originalColIndex, orderIndex) => {
-                          const columnData = allColumnData?.[originalColIndex]
-                          const value = columnData?.total?.metrics?.[selectedMetrics[0] || primarySortMetric] ?? null
+                      <>
+                        {selectedMetrics.map((metricId, metricIndex) => {
+                          const metric = getMetricById(metricId)
+                          const isFirstMetric = metricIndex === 0
+                          const isLastMetric = metricIndex === selectedMetrics.length - 1
+                          const firstColIndex = columnOrder[0]
+                          const firstColData = allColumnData?.[firstColIndex]
+                          const firstValue = firstColData?.total?.metrics?.[metricId] ?? null
 
-                          if (orderIndex === 0) {
-                            // First column - just show the value
-                            return (
-                              <td
-                                key={`col-${originalColIndex}`}
-                                className="px-6 py-4 whitespace-nowrap text-sm text-gray-900 text-right border-r-2 border-gray-300"
-                              >
-                                {value != null ? formatMetricValue(value, selectedMetrics[0] || primarySortMetric) : '-'}
+                          return (
+                            <tr key={`total-${metricId}`} className={isFirstMetric ? 'border-t-2 border-gray-500' : ''}>
+                              {/* Total label - only render on first metric row with rowSpan */}
+                              {isFirstMetric && (
+                                <td
+                                  rowSpan={selectedMetrics.length}
+                                  className="px-6 py-2 whitespace-nowrap text-sm font-semibold text-gray-900 border-r border-gray-200 align-middle"
+                                >
+                                  Total
+                                </td>
+                              )}
+                              {/* Metric name */}
+                              <td className={`px-4 ${isFirstMetric ? 'pt-3' : 'pt-1'} ${isLastMetric ? 'pb-3' : 'pb-1'} whitespace-nowrap text-xs text-gray-500 font-normal border-r-2 border-gray-300`}>
+                                {metric?.label}
                               </td>
-                            )
-                          } else {
-                            // Columns 2+ - show value, diff, % diff
-                            const firstColIndex = columnOrder[0]
-                            const firstColData = allColumnData?.[firstColIndex]
-                            const firstValue = firstColData?.total?.metrics?.[selectedMetrics[0] || primarySortMetric] ?? null
+                              {columnOrder.map((originalColIndex, orderIndex) => {
+                                const columnData = allColumnData?.[originalColIndex]
+                                const value = columnData?.total?.metrics?.[metricId] ?? null
 
-                            const diff = (value ?? 0) - (firstValue ?? 0)
-                            const pctDiff = (firstValue ?? 0) !== 0
-                              ? (((value ?? 0) / (firstValue ?? 0)) - 1) * 100
-                              : null
+                                if (orderIndex === 0) {
+                                  return (
+                                    <td
+                                      key={`col-${originalColIndex}`}
+                                      className={`px-6 ${isFirstMetric ? 'pt-3' : 'pt-1'} ${isLastMetric ? 'pb-3' : 'pb-1'} whitespace-nowrap text-sm text-gray-900 text-right border-r-2 border-gray-300`}
+                                    >
+                                      {value != null ? formatMetricValue(value, metricId) : '-'}
+                                    </td>
+                                  )
+                                } else {
+                                  const diff = (value ?? 0) - (firstValue ?? 0)
+                                  const pctDiff = (firstValue ?? 0) !== 0
+                                    ? (((value ?? 0) / (firstValue ?? 0)) - 1) * 100
+                                    : null
 
-                            return (
-                              <React.Fragment key={`col-${originalColIndex}`}>
-                                <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-900 text-right border-l border-gray-200">
-                                  {value != null ? formatMetricValue(value, selectedMetrics[0] || primarySortMetric) : '-'}
-                                </td>
-                                <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-700 text-right">
-                                  {diff != null ? formatMetricValue(diff, selectedMetrics[0] || primarySortMetric) : '-'}
-                                </td>
-                                <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-700 text-right border-r border-gray-200">
-                                  {pctDiff != null ? `${pctDiff.toFixed(2)}%` : '-'}
-                                </td>
-                              </React.Fragment>
-                            )
-                          }
+                                  // Get significance result for indicator (but don't color diff values)
+                                  const sigResult = getSignificanceForCell(originalColIndex, metricId)
+                                  // Don't color diff/pctDiff - only the significance indicator shows color
+                                  const diffColorClass = 'text-gray-700'
+
+                                  return (
+                                    <React.Fragment key={`col-${originalColIndex}`}>
+                                      <td className={`px-4 ${isFirstMetric ? 'pt-3' : 'pt-1'} ${isLastMetric ? 'pb-3' : 'pb-1'} whitespace-nowrap text-sm text-gray-900 text-right border-l border-gray-200`}>
+                                        {value != null ? formatMetricValue(value, metricId) : '-'}
+                                      </td>
+                                      <td className={`px-4 ${isFirstMetric ? 'pt-3' : 'pt-1'} ${isLastMetric ? 'pb-3' : 'pb-1'} whitespace-nowrap text-sm ${diffColorClass} text-right`}>
+                                        {diff != null ? formatMetricValue(diff, metricId) : '-'}
+                                      </td>
+                                      <td className={`px-4 ${isFirstMetric ? 'pt-3' : 'pt-1'} ${isLastMetric ? 'pb-3' : 'pb-1'} whitespace-nowrap text-sm ${diffColorClass} text-right border-r border-gray-200`}>
+                                        <div className="flex items-center justify-end gap-1">
+                                          <span>{pctDiff != null ? `${pctDiff.toFixed(2)}%` : '-'}</span>
+                                          <SignificanceIndicator
+                                            result={sigResult}
+                                            compact={true}
+                                            formatType={getFormatTypeForMetric(metricId)}
+                                          />
+                                        </div>
+                                      </td>
+                                    </React.Fragment>
+                                  )
+                                }
+                              })}
+                            </tr>
+                          )
                         })}
-                      </tr>
+                      </>
                     )}
                   </tfoot>
                 </table>
@@ -3352,6 +4230,16 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
           onClose={handleDashboardModalClose}
           widgetConfig={currentWidgetConfig}
           onSuccess={handleDashboardSuccess}
+        />
+      )}
+
+      {/* Export Modal */}
+      {!widgetMode && (
+        <ExportModal
+          isOpen={isExportModalOpen}
+          onClose={() => setIsExportModalOpen(false)}
+          onExport={handleExport}
+          data={getExportData()}
         />
       )}
     </div>

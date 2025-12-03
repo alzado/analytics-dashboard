@@ -64,8 +64,14 @@ from models.schemas import (
     DashboardUpdateRequest,
     WidgetConfig,
     WidgetCreateRequest,
-    WidgetUpdateRequest
+    WidgetUpdateRequest,
+    # Significance testing models
+    SignificanceRequest,
+    SignificanceResponse,
+    SignificanceResultItem,
+    ColumnDefinition
 )
+from services.statistical_service import StatisticalService
 
 app = FastAPI(title="Search Analytics API", version="1.0.0")
 
@@ -302,6 +308,7 @@ async def disconnect_bigquery(table_id: Optional[str] = Query(None, description=
             message=f"Failed to disconnect BigQuery: {str(e)}",
             connection_status="error"
         )
+
 
 # Multi-Table Management Endpoints
 
@@ -1519,3 +1526,256 @@ async def delete_widget(dashboard_id: str, widget_id: str):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# Significance Testing Endpoint
+
+@app.post("/api/significance", response_model=SignificanceResponse)
+async def calculate_significance(
+    request: SignificanceRequest,
+    table_id: Optional[str] = Query(None, description="Table ID (for multi-table support)")
+):
+    """
+    Calculate statistical significance for rate metrics using two-proportion z-test.
+
+    Only percent-format calculated metrics with simple {A}/{B} formulas are eligible.
+    Uses event counts (e.g., queries, clicks) as the sample size, not days.
+
+    Request body:
+    - control_column: Reference column definition with dimension filters
+    - treatment_columns: List of treatment columns to compare against control
+    - metric_ids: List of metric IDs to analyze (only eligible percent metrics will be tested)
+    - filters: Base filters (date range, etc.)
+    - rows: Optional list of rows to test (for per-row significance)
+    """
+    try:
+        # Initialize services
+        stat_service = StatisticalService()
+        bq_service = data_service.get_bigquery_service(table_id)
+        if bq_service is None:
+            raise ValueError("BigQuery not initialized. Please configure BigQuery connection.")
+
+        # Get metric service to extract formula components
+        from services.metric_service import MetricService
+        from services.schema_service import SchemaService
+        schema_service = SchemaService(bq_service.client, table_id=bq_service.table_id)
+        metric_service = MetricService(schema_service)
+
+        # Filter metrics to only eligible ones:
+        # 1. Percent format calculated metrics with simple A/B formula
+        # 2. _pct metrics (percentage of total for volume metrics)
+        eligible_metrics = {}
+        pct_metrics = {}  # Separate handling for _pct metrics
+
+        for metric_id in request.metric_ids:
+            # Check if it's a _pct metric (e.g., queries_pct)
+            if metric_id.endswith('_pct'):
+                base_metric_id = metric_id[:-4]  # Remove '_pct' suffix
+                # Verify the base metric exists
+                schema = schema_service.load_schema()
+                base_exists = any(m.id == base_metric_id for m in schema.base_metrics)
+                calc_exists = any(m.id == base_metric_id for m in schema.calculated_metrics)
+                if base_exists or calc_exists:
+                    pct_metrics[metric_id] = {
+                        'base_metric_id': base_metric_id,
+                        'is_pct_metric': True
+                    }
+            else:
+                # Check if it's a calculated metric with simple A/B formula
+                components = metric_service.extract_formula_components(metric_id)
+                if components and components.get('is_simple_ratio'):
+                    eligible_metrics[metric_id] = components
+
+        if not eligible_metrics and not pct_metrics:
+            # No eligible metrics - return empty results
+            return SignificanceResponse(
+                control_column_index=request.control_column.column_index,
+                results={}
+            )
+
+        # Collect all base metrics needed (numerators and denominators)
+        base_metrics_needed = set()
+        for metric_id, components in eligible_metrics.items():
+            base_metrics_needed.add(components['numerator_metric_id'])
+            base_metrics_needed.add(components['denominator_metric_id'])
+        for metric_id, pct_info in pct_metrics.items():
+            base_metrics_needed.add(pct_info['base_metric_id'])
+
+        # Merge dimension filters safely (handle None cases)
+        base_dim_filters = request.filters.dimension_filters or {}
+        control_dim_filters = request.control_column.dimension_filters or {}
+
+        # Helper function to fetch aggregated totals with combined filters
+        def fetch_aggregated_totals(extra_filters: Dict[str, List[str]] = None) -> Dict[str, float]:
+            combined_filters = {**base_dim_filters}
+            if extra_filters:
+                combined_filters.update(extra_filters)
+            filters = FilterParams(
+                start_date=request.filters.start_date,
+                end_date=request.filters.end_date,
+                date_range_type=request.filters.date_range_type,
+                relative_date_preset=request.filters.relative_date_preset,
+                dimension_filters=combined_filters
+            )
+            # Use query_kpi_metrics for aggregated totals
+            return bq_service.query_kpi_metrics(filters=filters)
+
+        # Helper function to run proportion test for a specific row
+        def run_test_for_row(row_filters: Dict[str, List[str]] = None, row_id: str = None) -> Dict[str, List]:
+            # Fetch control aggregated totals
+            control_combined = {**control_dim_filters}
+            if row_filters:
+                control_combined.update(row_filters)
+            control_totals = fetch_aggregated_totals(control_combined)
+
+            # Build results for each treatment column
+            all_metric_results = {}
+
+            for treatment_col in request.treatment_columns:
+                # Fetch treatment aggregated totals
+                treatment_combined = {**(treatment_col.dimension_filters or {})}
+                if row_filters:
+                    treatment_combined.update(row_filters)
+                treatment_totals = fetch_aggregated_totals(treatment_combined)
+
+                # Run proportion test for each eligible metric
+                for metric_id, components in eligible_metrics.items():
+                    numerator_id = components['numerator_metric_id']
+                    denominator_id = components['denominator_metric_id']
+
+                    # Get counts
+                    control_successes = int(control_totals.get(numerator_id, 0))
+                    control_trials = int(control_totals.get(denominator_id, 0))
+                    treatment_successes = int(treatment_totals.get(numerator_id, 0))
+                    treatment_trials = int(treatment_totals.get(denominator_id, 0))
+
+                    # Skip if no trials (avoid division by zero)
+                    if control_trials == 0 and treatment_trials == 0:
+                        continue
+
+                    # Get direction preference
+                    higher_is_better = stat_service.get_higher_is_better(metric_id)
+
+                    # Run proportion significance test
+                    result = stat_service.analyze_proportion_metric(
+                        metric_id=metric_id,
+                        control_successes=control_successes,
+                        control_trials=control_trials,
+                        treatment_successes=treatment_successes,
+                        treatment_trials=treatment_trials,
+                        column_index=treatment_col.column_index,
+                        higher_is_better=higher_is_better
+                    )
+
+                    # Convert to SignificanceResultItem
+                    result_item = SignificanceResultItem(
+                        metric_id=result.metric_id,
+                        column_index=result.column_index,
+                        row_id=row_id,
+                        prob_beat_control=result.prob_beat_control,
+                        credible_interval_lower=result.credible_interval_lower,
+                        credible_interval_upper=result.credible_interval_upper,
+                        mean_difference=result.mean_difference,
+                        relative_difference=result.relative_difference,
+                        is_significant=result.is_significant,
+                        direction=result.direction,
+                        control_mean=result.control_mean,
+                        treatment_mean=result.treatment_mean,
+                        n_control_events=result.n_control_events,
+                        n_treatment_events=result.n_treatment_events,
+                        control_successes=result.control_successes,
+                        treatment_successes=result.treatment_successes,
+                        warning=result.warning
+                    )
+
+                    if metric_id not in all_metric_results:
+                        all_metric_results[metric_id] = []
+                    all_metric_results[metric_id].append(result_item)
+
+                # Run proportion test for _pct metrics
+                # For _pct metrics: numerator = row value, denominator = column total (without row filters)
+                for metric_id, pct_info in pct_metrics.items():
+                    base_metric_id = pct_info['base_metric_id']
+
+                    # For _pct, we need column totals (without row filters) as denominator
+                    # Numerator is the row-specific value (control_totals/treatment_totals already have row filters)
+                    control_column_totals = fetch_aggregated_totals(control_dim_filters)  # No row filters
+                    treatment_column_totals = fetch_aggregated_totals(treatment_col.dimension_filters or {})  # No row filters
+
+                    # Get counts
+                    # Successes = row value (with row filters applied)
+                    # Trials = column total (without row filters)
+                    control_successes = int(control_totals.get(base_metric_id, 0))
+                    control_trials = int(control_column_totals.get(base_metric_id, 0))
+                    treatment_successes = int(treatment_totals.get(base_metric_id, 0))
+                    treatment_trials = int(treatment_column_totals.get(base_metric_id, 0))
+
+                    # Skip if no trials (avoid division by zero)
+                    if control_trials == 0 and treatment_trials == 0:
+                        continue
+
+                    # For _pct metrics, higher percentage is typically better (more market share)
+                    higher_is_better = True
+
+                    # Run proportion significance test
+                    result = stat_service.analyze_proportion_metric(
+                        metric_id=metric_id,
+                        control_successes=control_successes,
+                        control_trials=control_trials,
+                        treatment_successes=treatment_successes,
+                        treatment_trials=treatment_trials,
+                        column_index=treatment_col.column_index,
+                        higher_is_better=higher_is_better
+                    )
+
+                    # Convert to SignificanceResultItem
+                    result_item = SignificanceResultItem(
+                        metric_id=result.metric_id,
+                        column_index=result.column_index,
+                        row_id=row_id,
+                        prob_beat_control=result.prob_beat_control,
+                        credible_interval_lower=result.credible_interval_lower,
+                        credible_interval_upper=result.credible_interval_upper,
+                        mean_difference=result.mean_difference,
+                        relative_difference=result.relative_difference,
+                        is_significant=result.is_significant,
+                        direction=result.direction,
+                        control_mean=result.control_mean,
+                        treatment_mean=result.treatment_mean,
+                        n_control_events=result.n_control_events,
+                        n_treatment_events=result.n_treatment_events,
+                        control_successes=result.control_successes,
+                        treatment_successes=result.treatment_successes,
+                        warning=result.warning
+                    )
+
+                    if metric_id not in all_metric_results:
+                        all_metric_results[metric_id] = []
+                    all_metric_results[metric_id].append(result_item)
+
+            return all_metric_results
+
+        # Check if per-row testing is requested
+        if request.rows:
+            # Run per-row significance tests
+            all_results = {}
+            for row in request.rows:
+                row_results = run_test_for_row(row.dimension_filters, row.row_id)
+                # Merge results
+                for metric_id, metric_results in row_results.items():
+                    if metric_id not in all_results:
+                        all_results[metric_id] = []
+                    all_results[metric_id].extend(metric_results)
+        else:
+            # Run totals-only significance test
+            all_results = run_test_for_row(None, None)
+
+        return SignificanceResponse(
+            control_column_index=request.control_column.column_index,
+            results=all_results
+        )
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error calculating significance: {str(e)}")

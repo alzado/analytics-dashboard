@@ -793,3 +793,116 @@ class MetricService:
             'updated_count': len(updated_metrics),
             'updated_metrics': updated_metrics
         }
+
+    def extract_formula_components(self, metric_id: str) -> Optional[dict]:
+        """
+        Extract numerator and denominator metric IDs from a calculated metric formula.
+        Only works for simple ratio formulas like {A} / {B}.
+
+        Args:
+            metric_id: ID of the calculated metric
+
+        Returns:
+            Dict with:
+                - numerator_metric_id: str (e.g., 'queries_pdp')
+                - denominator_metric_id: str (e.g., 'queries')
+                - is_simple_ratio: bool (True if formula is simple A/B)
+            Returns None if metric not found or not a calculated metric.
+        """
+        schema = self.schema_service.load_schema()
+        if not schema:
+            return None
+
+        # Find the calculated metric
+        metric = next((m for m in schema.calculated_metrics if m.id == metric_id), None)
+        if not metric:
+            return None
+
+        # Check if it's a percent format metric
+        if metric.format_type != 'percent':
+            return {
+                'numerator_metric_id': None,
+                'denominator_metric_id': None,
+                'is_simple_ratio': False,
+                'reason': 'Not a percent format metric'
+            }
+
+        formula = metric.formula.strip()
+
+        # Pattern for simple ratio: {metric_a} / {metric_b}
+        # Allows optional whitespace around the division operator
+        simple_ratio_pattern = r'^\{([a-zA-Z0-9_]+)\}\s*/\s*\{([a-zA-Z0-9_]+)\}$'
+        match = re.match(simple_ratio_pattern, formula)
+
+        if match:
+            numerator_id = match.group(1)
+            denominator_id = match.group(2)
+
+            # Collect all valid metric IDs (both base and calculated)
+            base_metric_ids = {m.id for m in schema.base_metrics}
+            calculated_metric_ids = {m.id for m in schema.calculated_metrics}
+            all_metric_ids = base_metric_ids | calculated_metric_ids
+
+            # Verify numerator exists as a metric
+            if numerator_id not in all_metric_ids:
+                return {
+                    'numerator_metric_id': numerator_id,
+                    'denominator_metric_id': denominator_id,
+                    'is_simple_ratio': False,
+                    'reason': f'Numerator {numerator_id} is not a valid metric'
+                }
+
+            # Verify denominator exists as a metric
+            if denominator_id not in all_metric_ids:
+                return {
+                    'numerator_metric_id': numerator_id,
+                    'denominator_metric_id': denominator_id,
+                    'is_simple_ratio': False,
+                    'reason': f'Denominator {denominator_id} is not a valid metric'
+                }
+
+            return {
+                'numerator_metric_id': numerator_id,
+                'denominator_metric_id': denominator_id,
+                'is_simple_ratio': True,
+                'reason': None
+            }
+        else:
+            return {
+                'numerator_metric_id': None,
+                'denominator_metric_id': None,
+                'is_simple_ratio': False,
+                'reason': 'Formula is not a simple {A}/{B} ratio'
+            }
+
+    def get_eligible_significance_metrics(self) -> List[dict]:
+        """
+        Get all calculated metrics that are eligible for significance testing.
+        Only percent-format metrics with simple {A}/{B} formulas are eligible.
+
+        Returns:
+            List of dicts with:
+                - metric_id: str
+                - display_name: str
+                - numerator_metric_id: str
+                - denominator_metric_id: str
+        """
+        schema = self.schema_service.load_schema()
+        if not schema:
+            return []
+
+        eligible = []
+        for metric in schema.calculated_metrics:
+            if metric.format_type != 'percent':
+                continue
+
+            components = self.extract_formula_components(metric.id)
+            if components and components.get('is_simple_ratio'):
+                eligible.append({
+                    'metric_id': metric.id,
+                    'display_name': metric.display_name,
+                    'numerator_metric_id': components['numerator_metric_id'],
+                    'denominator_metric_id': components['denominator_metric_id']
+                })
+
+        return eligible

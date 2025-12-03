@@ -613,3 +613,50 @@ class WidgetUpdateRequest(BaseModel):
     dimension_sort_order: Optional[Literal["asc", "desc"]] = Field(None, description="Dimension sort order")
     children_sort_config: Optional[Dict[str, str]] = Field(None, description="Child rows sort config")
     row_sort_config: Optional[RowSortConfig] = Field(None, description="Row sorting config (column, subColumn, direction, metric)")
+
+
+# Significance Testing Models
+
+class ColumnDefinition(BaseModel):
+    """Definition of a column for significance testing."""
+    column_index: int = Field(..., description="Index of the column in the pivot table")
+    dimension_filters: Dict[str, List[str]] = Field(..., description="Dimension filters that define this column (e.g., {'country': ['USA']})")
+
+class RowDefinition(BaseModel):
+    """Definition of a row for per-row significance testing."""
+    row_id: str = Field(..., description="Unique identifier for this row (e.g., dimension value)")
+    dimension_filters: Dict[str, List[str]] = Field(default_factory=dict, description="Dimension filters that define this row (e.g., {'ops_score': ['5']})")
+
+class SignificanceRequest(BaseModel):
+    """Request for Bayesian significance analysis."""
+    control_column: ColumnDefinition = Field(..., description="The reference/control column to compare against")
+    treatment_columns: List[ColumnDefinition] = Field(..., description="Treatment columns to compare with control")
+    metric_ids: List[str] = Field(..., description="Metric IDs to analyze")
+    filters: FilterParams = Field(..., description="Base filters (date range, etc.)")
+    rows: Optional[List[RowDefinition]] = Field(None, description="Optional list of rows to test. If provided, runs per-row significance tests.")
+
+class SignificanceResultItem(BaseModel):
+    """Result for one metric/column/row comparison using proportion-based testing."""
+    metric_id: str = Field(..., description="Metric identifier")
+    column_index: int = Field(..., description="Index of the treatment column")
+    row_id: Optional[str] = Field(None, description="Row identifier if per-row testing, None for totals")
+    prob_beat_control: float = Field(..., ge=0, le=1, description="Probability that treatment beats control (0-1)")
+    credible_interval_lower: float = Field(..., description="Lower bound of 95% confidence interval for difference in proportions")
+    credible_interval_upper: float = Field(..., description="Upper bound of 95% confidence interval for difference in proportions")
+    mean_difference: float = Field(..., description="Difference in proportions (treatment - control)")
+    relative_difference: float = Field(..., description="Relative difference as decimal (0.05 = 5% improvement)")
+    is_significant: bool = Field(..., description="Whether the difference is statistically significant at 95% threshold")
+    direction: Literal["better", "worse", "neutral"] = Field(..., description="Direction of the effect")
+    control_mean: float = Field(..., description="Control proportion (successes/trials)")
+    treatment_mean: float = Field(..., description="Treatment proportion (successes/trials)")
+    # Event-based fields (proportion test)
+    n_control_events: int = Field(..., description="Number of events (denominator/trials) for control group")
+    n_treatment_events: int = Field(..., description="Number of events (denominator/trials) for treatment group")
+    control_successes: int = Field(..., description="Number of successes (numerator) for control group")
+    treatment_successes: int = Field(..., description="Number of successes (numerator) for treatment group")
+    warning: Optional[str] = Field(None, description="Warning message if sample size is small")
+
+class SignificanceResponse(BaseModel):
+    """Response containing all significance results."""
+    control_column_index: int = Field(..., description="Index of the control column")
+    results: Dict[str, List[SignificanceResultItem]] = Field(..., description="Results per metric: {metric_id: [results per treatment column]}")

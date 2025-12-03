@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useMemo } from 'react'
 import { X, GripVertical, Settings, Database, Calendar, ChevronDown, ChevronRight, Plus, Edit, Copy, Trash2 } from 'lucide-react'
+import { SearchInput } from '@/components/ui/search-input'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   fetchBigQueryInfo,
@@ -264,6 +265,11 @@ export function PivotConfigPanel({
   const [isMetricsExpanded, setIsMetricsExpanded] = useState(false)
   const [isFiltersExpanded, setIsFiltersExpanded] = useState(false)
 
+  // Search state
+  const [dimensionSearch, setDimensionSearch] = useState('')
+  const [metricSearch, setMetricSearch] = useState('')
+  const [filterSearch, setFilterSearch] = useState('')
+
   // Custom Dimension Modal State
   const [isModalOpen, setIsModalOpen] = useState(false)
   const [modalMode, setModalMode] = useState<'create' | 'edit'>('create')
@@ -453,6 +459,17 @@ export function PivotConfigPanel({
     (m) => !selectedMetrics.includes(m.id)
   )
 
+  // Filter metrics by search term
+  const filteredMetrics = availableMetricsToAdd.filter((m) => {
+    if (!metricSearch) return true
+    const term = metricSearch.toLowerCase()
+    return (
+      m.label.toLowerCase().includes(term) ||
+      m.id.toLowerCase().includes(term) ||
+      m.category.toLowerCase().includes(term)
+    )
+  })
+
   // Filter out dimensions that are already selected (either as row or table dimensions)
   const selectedDimensions = config.selectedDimensions || []
   const selectedTableDimensions = config.selectedTableDimensions || []
@@ -460,8 +477,35 @@ export function PivotConfigPanel({
     (d) => !selectedDimensions.includes(d.value) && !selectedTableDimensions.includes(d.value)
   )
 
+  // Filter dimensions by search term
+  const filteredDimensions = availableDimensionsToAdd.filter((d) => {
+    if (!dimensionSearch) return true
+    const term = dimensionSearch.toLowerCase()
+    return (
+      d.label.toLowerCase().includes(term) ||
+      d.value.toLowerCase().includes(term)
+    )
+  })
+
+  // Filter custom dimensions by search term
+  const filteredCustomDimensions = customDimensions.filter((d) => {
+    if (!dimensionSearch) return true
+    const term = dimensionSearch.toLowerCase()
+    return d.name.toLowerCase().includes(term)
+  })
+
+  // Filter filterable dimensions by search term
+  const filteredFilterableDimensions = filterableDimensions.filter((d) => {
+    if (!filterSearch) return true
+    const term = filterSearch.toLowerCase()
+    return (
+      d.display_name.toLowerCase().includes(term) ||
+      d.id.toLowerCase().includes(term)
+    )
+  })
+
   // Group available metrics by category
-  const metricsByCategory = availableMetricsToAdd.reduce((acc, metric) => {
+  const metricsByCategory = filteredMetrics.reduce((acc, metric) => {
     if (!acc[metric.category]) {
       acc[metric.category] = []
     }
@@ -703,6 +747,13 @@ export function PivotConfigPanel({
           </button>
           {isDimensionsExpanded && (
             <div className="space-y-3">
+              {/* Search Input */}
+              <SearchInput
+                placeholder="Search dimensions..."
+                value={dimensionSearch}
+                onChange={setDimensionSearch}
+              />
+
               {/* Create Custom Dimension Button */}
               <button
                 onClick={handleCreateNewDimension}
@@ -713,10 +764,10 @@ export function PivotConfigPanel({
               </button>
 
               {/* Custom Dimensions */}
-              {customDimensions.length > 0 && (
+              {filteredCustomDimensions.length > 0 && (
                 <div className="space-y-2">
                   <h6 className="text-xs font-medium text-gray-600">Custom Dimensions</h6>
-                  {customDimensions.map((dimension) => {
+                  {filteredCustomDimensions.map((dimension) => {
                     const dimensionValue = `custom_${dimension.id}`
                     const isSelected = selectedDimensions.includes(dimensionValue) ||
                                       selectedTableDimensions.includes(dimensionValue)
@@ -783,10 +834,10 @@ export function PivotConfigPanel({
               )}
 
               {/* Built-in Dimensions */}
-              {availableDimensionsToAdd.length > 0 && (
+              {filteredDimensions.length > 0 && (
                 <div className="space-y-2">
                   <h6 className="text-xs font-medium text-gray-600">Built-in Dimensions</h6>
-                  {availableDimensionsToAdd.map((dimension) => (
+                  {filteredDimensions.map((dimension) => (
                     <div
                       key={dimension.value}
                       draggable
@@ -811,10 +862,10 @@ export function PivotConfigPanel({
                 </div>
               )}
 
-              {availableDimensionsToAdd.length === 0 && customDimensions.length === 0 && (
+              {filteredDimensions.length === 0 && filteredCustomDimensions.length === 0 && (
                 <div className="p-4 text-center bg-white border border-gray-200 rounded">
-                  <p className="text-xs text-gray-500">All dimensions added</p>
-                  <p className="text-xs text-gray-400 mt-1">Remove dimensions from table or create a custom one</p>
+                  <p className="text-xs text-gray-500">{dimensionSearch ? 'No dimensions match your search' : 'All dimensions added'}</p>
+                  <p className="text-xs text-gray-400 mt-1">{dimensionSearch ? 'Try a different search term' : 'Remove dimensions from table or create a custom one'}</p>
                 </div>
               )}
             </div>
@@ -842,6 +893,13 @@ export function PivotConfigPanel({
             <div className="space-y-2">
               {filterableDimensions.length > 0 ? (
                 <>
+                  {/* Search Input */}
+                  <SearchInput
+                    placeholder="Search filters..."
+                    value={filterSearch}
+                    onChange={setFilterSearch}
+                  />
+
                   {/* Active filter count */}
                   {Object.keys(dimensionFilters || {}).length > 0 && (
                     <div className="px-2 py-1 bg-blue-50 rounded">
@@ -852,7 +910,7 @@ export function PivotConfigPanel({
                   )}
 
                   {/* Dimension filter dropdowns */}
-                  {filterableDimensions.map(dimension => (
+                  {filteredFilterableDimensions.map(dimension => (
                     <DimensionFilterInline
                       key={dimension.id}
                       dimension={dimension}
@@ -862,6 +920,13 @@ export function PivotConfigPanel({
                       tableId={config.selectedTable || undefined}
                     />
                   ))}
+
+                  {/* No results message */}
+                  {filteredFilterableDimensions.length === 0 && filterSearch && (
+                    <div className="p-3 text-center bg-gray-50 border border-gray-200 rounded">
+                      <p className="text-xs text-gray-500">No filters match your search</p>
+                    </div>
+                  )}
 
                   {/* Apply/Clear buttons */}
                   <div className="flex gap-2 pt-2">
@@ -920,10 +985,22 @@ export function PivotConfigPanel({
           </button>
           {isMetricsExpanded && (
             <div className="space-y-3">
+              {/* Search Input */}
+              <SearchInput
+                placeholder="Search metrics..."
+                value={metricSearch}
+                onChange={setMetricSearch}
+              />
+
               {availableMetricsToAdd.length === 0 ? (
                 <div className="p-4 text-center bg-white border border-gray-200 rounded">
                   <p className="text-xs text-gray-500">All metrics added</p>
                   <p className="text-xs text-gray-400 mt-1">Remove metrics from table to add more</p>
+                </div>
+              ) : filteredMetrics.length === 0 ? (
+                <div className="p-4 text-center bg-white border border-gray-200 rounded">
+                  <p className="text-xs text-gray-500">No metrics match your search</p>
+                  <p className="text-xs text-gray-400 mt-1">Try a different search term</p>
                 </div>
               ) : (
                 <>

@@ -813,7 +813,7 @@ export function ChartWidget({ widget }: ChartWidgetProps) {
                       stroke={colors[colIdx % colors.length]}
                       strokeWidth={2}
                       name={seriesName}
-                      dot={{ r: 3 }}
+                      dot={false}
                       activeDot={{ r: 5 }}
                     />
                   )
@@ -831,7 +831,7 @@ export function ChartWidget({ widget }: ChartWidgetProps) {
                     stroke={colors[idx % colors.length]}
                     strokeWidth={2}
                     name={metricDef?.label || metric}
-                    dot={{ r: 3 }}
+                    dot={false}
                     activeDot={{ r: 5 }}
                   />
                 )

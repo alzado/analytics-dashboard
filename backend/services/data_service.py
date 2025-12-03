@@ -29,6 +29,38 @@ def safe_float(value: float) -> float:
     return float(value)
 
 
+def _add_percent_metrics(metrics: Dict, total_metrics: Dict, metrics_data: Dict) -> Dict:
+    """
+    Add {metric}_pct fields for volume metrics (both base and calculated).
+
+    Computes percentage of total for each volume metric:
+    - metrics[metric_id + '_pct'] = (row_value / total_value) * 100
+
+    Args:
+        metrics: Dictionary of metric values for the current row
+        total_metrics: Dictionary of total metric values (grand total or parent total)
+        metrics_data: Dictionary containing base_metrics and calculated_metrics from schema
+
+    Returns:
+        Updated metrics dictionary with _pct fields added
+    """
+    # Get list of volume metrics from both base and calculated metrics
+    base_metrics = metrics_data.get('base_metrics', [])
+    calculated_metrics = metrics_data.get('calculated_metrics', [])
+
+    volume_metrics = [m for m in base_metrics if m.category == 'volume']
+    volume_metrics += [m for m in calculated_metrics if m.category == 'volume']
+
+    for metric in volume_metrics:
+        metric_id = metric.id
+        pct_key = f"{metric_id}_pct"
+        row_value = metrics.get(metric_id, 0)
+        total_value = total_metrics.get(metric_id, 0)
+        metrics[pct_key] = safe_float((row_value / total_value * 100)) if total_value > 0 else 0.0
+
+    return metrics
+
+
 def _get_all_metrics_for_pivot(table_id: Optional[str] = None, requested_metrics: Optional[List[str]] = None):
     """
     Load all base and calculated metrics from schema service for pivot table.
@@ -58,6 +90,15 @@ def _get_all_metrics_for_pivot(table_id: Optional[str] = None, requested_metrics
             # Filter metrics if requested_metrics is provided
             if requested_metrics:
                 requested_set = set(requested_metrics)
+
+                # Handle _pct metrics: they are computed dynamically, so we need to include their base metrics
+                # e.g., if "queries_pct" is requested, we also need "queries"
+                pct_base_metrics = set()
+                for metric_id in list(requested_set):
+                    if metric_id.endswith('_pct'):
+                        base_metric_id = metric_id[:-4]  # Remove "_pct" suffix
+                        pct_base_metrics.add(base_metric_id)
+                requested_set.update(pct_base_metrics)
 
                 # Keep only requested metrics
                 base_metrics = [m for m in all_base_metrics if m.id in requested_set]
@@ -316,6 +357,25 @@ def _extract_metrics_from_row(row, metrics_data):
             else:
                 metrics[metric_id] = safe_float(value)
 
+    # Also extract any columns from the row that are NOT in metrics_data but exist in the row
+    # This captures metrics computed at SQL level like "queries" (raw SQL aggregation)
+    row_columns = set(row.index)
+    extracted_ids = set(metrics_data['all_metric_ids'])
+    # Columns to skip (non-metric columns)
+    skip_columns = {'date', 'dimension_value', 'search_term'}
+    for col in row_columns:
+        if col not in extracted_ids and col not in skip_columns:
+            value = row[col]
+            if pd.isna(value):
+                metrics[col] = 0.0
+            elif isinstance(value, str):
+                # Skip string values - they are not metrics
+                continue
+            elif 'int' in str(value.__class__.__name__).lower():
+                metrics[col] = int(value)
+            else:
+                metrics[col] = safe_float(value)
+
     return metrics
 
 
@@ -351,42 +411,47 @@ def _compute_calculated_metrics(base_metrics: Dict, schema_config=None) -> Dict:
     # For each calculated metric in schema, compute its value
     for calc_metric in schema_config.calculated_metrics:
         try:
-            # Build expression by replacing metric IDs with their values
-            expression = calc_metric.sql_expression
+            # Use the formula (e.g., "{Purchases} / {queries}") rather than sql_expression
+            # since formulas use cleaner {metric_id} syntax
+            formula = calc_metric.formula
+            expression = formula if formula else calc_metric.sql_expression
 
-            # Simple approach: replace AGG(column) patterns with actual values
-            # This works for post-aggregation calculations
-            for base_metric in schema_config.base_metrics:
-                # Replace patterns like "SUM(queries)" with the actual value
-                patterns = [
-                    f"{base_metric.aggregation}({base_metric.column_name})",
-                    base_metric.id
-                ]
-                for pattern in patterns:
-                    if pattern in expression:
-                        value = base_metrics.get(base_metric.id, 0)
-                        expression = expression.replace(pattern, str(value))
+            # Replace {metric_id} patterns with actual values from base_metrics
+            # This handles both base metrics and calculated metrics that were computed at SQL level
+            import re
+            metric_refs = re.findall(r'\{(\w+)\}', expression)
+            for metric_id in metric_refs:
+                if metric_id in base_metrics:
+                    value = base_metrics.get(metric_id, 0)
+                    expression = expression.replace(f'{{{metric_id}}}', str(value))
 
-            # Handle SAFE_DIVIDE specially
-            if "SAFE_DIVIDE" in expression:
-                # Extract numerator and denominator from SAFE_DIVIDE(num, denom)
-                import re
-                match = re.match(r'SAFE_DIVIDE\((.*?),\s*(.*?)\)', expression)
-                if match:
-                    try:
-                        numerator = float(eval(match.group(1)))
-                        denominator = float(eval(match.group(2)))
-                        result = numerator / denominator if denominator != 0 else 0
-                    except:
-                        result = 0
+            # If formula didn't have {metric_id} syntax, fall back to old approach
+            # for metrics that use raw SQL expressions
+            if '{' not in calc_metric.formula if calc_metric.formula else True:
+                for base_metric in schema_config.base_metrics:
+                    patterns = [
+                        f"{base_metric.aggregation}({base_metric.column_name})",
+                        base_metric.id
+                    ]
+                    for pattern in patterns:
+                        if pattern in expression:
+                            value = base_metrics.get(base_metric.id, 0)
+                            expression = expression.replace(pattern, str(value))
+
+            # Convert "/" to Python division
+            expression = expression.replace('/', '/')
+
+            # Evaluate the expression
+            try:
+                # Handle division by zero
+                if '/ 0' in expression or '/0' in expression:
+                    result = 0
                 else:
-                    result = 0
-            else:
-                # Evaluate the expression
-                try:
                     result = eval(expression)
-                except:
-                    result = 0
+            except ZeroDivisionError:
+                result = 0
+            except:
+                result = 0
 
             calculated[calc_metric.id] = safe_float(result)
 
@@ -400,10 +465,11 @@ def _compute_calculated_metrics(base_metrics: Dict, schema_config=None) -> Dict:
 def _query_custom_dimension_pivot(
     custom_dim_id: str,
     filters: FilterParams,
-    limit: int
+    limit: int,
+    table_id: Optional[str] = None
 ) -> Optional[PivotResponse]:
     """Query pivot data for a custom dimension (e.g., date ranges)"""
-    bq_service = get_bigquery_service()
+    bq_service = get_bigquery_service(table_id)
     if bq_service is None:
         return None
 
@@ -415,7 +481,7 @@ def _query_custom_dimension_pivot(
         return None
 
     # Load all metrics dynamically from schema
-    metrics_data = _get_all_metrics_for_pivot()
+    metrics_data = _get_all_metrics_for_pivot(table_id)
     base_select_items, calculated_select_items, all_base_metrics, extra_base_columns = _build_pivot_select_clause(metrics_data)
 
     # Determine metric for sorting and avg per day
@@ -573,15 +639,32 @@ def _query_custom_dimension_pivot(
         else:
             combined_where_clause = base_where_clause
 
-        # Query for "Other" dates with dynamic metrics
-        other_query = f"""
-            SELECT
-                {select_clause},
-                MIN(date) as min_date,
-                MAX(date) as max_date
-            FROM `{bq_service.table_path}`
-            {combined_where_clause}
-        """
+        # Query for "Other" dates with dynamic metrics using subquery pattern
+        if calculated_select_items:
+            other_query = f"""
+                SELECT
+                    {base_aliases_str},
+                    {calculated_select_str},
+                    min_date,
+                    max_date
+                FROM (
+                    SELECT
+                        {base_select_str},
+                        MIN(date) as min_date,
+                        MAX(date) as max_date
+                    FROM `{bq_service.table_path}`
+                    {combined_where_clause}
+                )
+            """
+        else:
+            other_query = f"""
+                SELECT
+                    {base_select_str},
+                    MIN(date) as min_date,
+                    MAX(date) as max_date
+                FROM `{bq_service.table_path}`
+                {combined_where_clause}
+            """
 
         other_df = bq_service._execute_and_log_query(other_query, query_type="pivot", endpoint="data_service")
 
@@ -628,6 +711,9 @@ def _query_custom_dimension_pivot(
             row_primary_value = row.metrics.get(primary_sort, 0)
             row.percentage_of_total = safe_float(row_primary_value / total_primary_metric * 100) if total_primary_metric > 0 else 0.0
 
+            # Add percent metrics for all volume metrics (grand total %)
+            row.metrics = _add_percent_metrics(row.metrics, base_metric_totals, metrics_data)
+
         # Calculate overall num_days
         if overall_min_date and overall_max_date:
             overall_num_days = (overall_max_date - overall_min_date).days + 1
@@ -643,6 +729,9 @@ def _query_custom_dimension_pivot(
         # Add avg per day to total metrics
         total_avg_per_day_value = total_metrics.get(avg_per_day_metric, 0)
         total_metrics[avg_per_day_key] = safe_float(total_avg_per_day_value / overall_num_days) if overall_num_days > 0 else 0.0
+
+        # Add percent metrics for total row (all 100%)
+        total_metrics = _add_percent_metrics(total_metrics, total_metrics, metrics_data)
 
         # Create total row
         total_row = PivotRow(
@@ -691,9 +780,9 @@ def get_overview_metrics(filters: FilterParams) -> OverviewMetrics:
     return OverviewMetrics(metrics=metrics_dict)
 
 
-def get_trend_data(filters: FilterParams, granularity: str = "daily") -> List[TrendData]:
+def get_trend_data(filters: FilterParams, granularity: str = "daily", table_id: Optional[str] = None) -> List[TrendData]:
     """Get time series trend data from BigQuery - fully dynamic"""
-    bq_service = get_bigquery_service()
+    bq_service = get_bigquery_service(table_id)
     if bq_service is None:
         raise ValueError("BigQuery not initialized. Please configure BigQuery connection.")
 
@@ -712,11 +801,23 @@ def get_trend_data(filters: FilterParams, granularity: str = "daily") -> List[Tr
     numeric_columns = df.select_dtypes(include=[np.number]).columns
     df[numeric_columns] = df[numeric_columns].fillna(0)
 
+    # Get schema config for calculated metrics
+    schema_config = bq_service.schema_config if bq_service else None
+
     # Convert to response format with dynamic metrics
     result = []
     for _, row in df.iterrows():
-        # Extract all metrics dynamically
+        # Extract base metrics dynamically
         metrics = _extract_metrics_from_row(row, metrics_data)
+
+        # Compute calculated metrics for this row
+        # But don't overwrite metrics that were already computed at SQL level
+        if schema_config:
+            calculated = _compute_calculated_metrics(metrics, schema_config)
+            for k, v in calculated.items():
+                # Only add/update if metric doesn't already exist OR existing value is 0/None
+                if k not in metrics or metrics.get(k) in (0, 0.0, None):
+                    metrics[k] = v
 
         result.append(TrendData(
             date=row['date'].strftime('%Y-%m-%d') if pd.notna(row['date']) else None,
@@ -898,7 +999,7 @@ def get_pivot_data(dimensions: List[str], filters: FilterParams, limit: int = 50
                 # Extract custom dimension ID
                 custom_dim_id = first_dim.replace("custom_", "")
                 # Use custom dimension query logic
-                result = _query_custom_dimension_pivot(custom_dim_id, filters, limit)
+                result = _query_custom_dimension_pivot(custom_dim_id, filters, limit, table_id)
                 if result:
                     return result
                 else:
@@ -1001,6 +1102,9 @@ def get_pivot_data(dimensions: List[str], filters: FilterParams, limit: int = 50
         avg_per_day_value = metrics.get(avg_per_day_metric, 0)
         metrics[avg_per_day_key] = safe_float(avg_per_day_value / num_days) if num_days > 0 and avg_per_day_value > 0 else 0.0
 
+        # Add percent metrics for total row (all 100% since this is the only row)
+        metrics = _add_percent_metrics(metrics, metrics, metrics_data)
+
         total_row = PivotRow(
             dimension_value="All Data",
             metrics=metrics,
@@ -1034,17 +1138,19 @@ def get_pivot_data(dimensions: List[str], filters: FilterParams, limit: int = 50
     # For multiple dimensions, concat them with " - " separator
     if len(quoted_group_cols) > 1:
         # Convert each column to string and join with separator
-        cast_cols = [f"CAST({col} AS STRING)" for col in quoted_group_cols]
+        # Use COALESCE to handle NULL values - mark them as '__NULL__'
+        cast_cols = [f"COALESCE(CAST({col} AS STRING), '__NULL__')" for col in quoted_group_cols]
         separator = ', " - ", '
         concat_args = separator.join(cast_cols)
         dim_value_clause = f"CONCAT({concat_args}) as dimension_value"
     else:
         # Check if dimension is DATE type and cast to STRING
+        # Use COALESCE to handle NULL values - mark them as '__NULL__'
         dim_def = next((d for d in metrics_data['schema_config'].dimensions if d.column_name == group_cols[0]), None)
         if dim_def and dim_def.data_type == 'DATE':
-            dim_value_clause = f"CAST({quoted_group_cols[0]} AS STRING) as dimension_value"
+            dim_value_clause = f"COALESCE(CAST({quoted_group_cols[0]} AS STRING), '__NULL__') as dimension_value"
         else:
-            dim_value_clause = f"{quoted_group_cols[0]} as dimension_value"
+            dim_value_clause = f"COALESCE(CAST({quoted_group_cols[0]} AS STRING), '__NULL__') as dimension_value"
 
     # Query for pivot data with dynamic metrics
     # Determine which metric to sort by
@@ -1083,14 +1189,48 @@ def get_pivot_data(dimensions: List[str], filters: FilterParams, limit: int = 50
     # Build additional filter for specific dimension values if provided
     dimension_values_filter = ""
     if dimension_values and len(dimension_values) > 0:
-        # Escape single quotes in dimension values
-        escaped_values = [value.replace("'", "\\'") for value in dimension_values]
-        values_list = "', '".join(escaped_values)
-        # Add to where clause
+        # Get the dimension's data type from schema
         dimension_column = group_cols[0]  # Use the first (and should be only) dimension column
-        # Use WHERE if there's no existing where clause, otherwise use AND
-        connector = "AND" if where_clause else "WHERE"
-        dimension_values_filter = f"{connector} {dimension_column} IN ('{values_list}')"
+        quoted_dimension_column = f"`{dimension_column}`" if dimension_column and not dimension_column.startswith('`') else dimension_column
+        dim_def = next((d for d in metrics_data['schema_config'].dimensions if d.column_name == dimension_column), None)
+        data_type = dim_def.data_type if dim_def else "STRING"
+
+        # Handle special __NULL__ marker - separate NULL values from regular values
+        null_marker = "__NULL__"
+        has_null = null_marker in dimension_values
+        non_null_values = [v for v in dimension_values if v != null_marker]
+
+        filter_parts = []
+
+        # Format non-null values based on data type
+        if non_null_values:
+            if data_type in ["STRING", "DATE"]:
+                # Escape single quotes in string values
+                escaped_values = [value.replace("'", "''") for value in non_null_values]
+                values_list = "', '".join(escaped_values)
+                formatted_values = f"('{values_list}')"
+            elif data_type == "BOOLEAN":
+                bool_values = ", ".join([
+                    "TRUE" if v.lower() in ["true", "1", "yes"] else "FALSE"
+                    for v in non_null_values
+                ])
+                formatted_values = f"({bool_values})"
+            else:  # INTEGER, INT64, FLOAT, FLOAT64, NUMERIC
+                values_list = ", ".join(non_null_values)
+                formatted_values = f"({values_list})"
+            filter_parts.append(f"{quoted_dimension_column} IN {formatted_values}")
+
+        # Add IS NULL condition if __NULL__ marker was present
+        if has_null:
+            filter_parts.append(f"{quoted_dimension_column} IS NULL")
+
+        # Combine filter parts
+        if filter_parts:
+            connector = "AND" if where_clause else "WHERE"
+            if len(filter_parts) == 1:
+                dimension_values_filter = f"{connector} {filter_parts[0]}"
+            else:
+                dimension_values_filter = f"{connector} ({' OR '.join(filter_parts)})"
 
     # Main query - get top N dimension values with offset (or specific values if provided)
     # Use subquery pattern to avoid redundant metric calculations
@@ -1230,13 +1370,19 @@ def get_pivot_data(dimensions: List[str], filters: FilterParams, limit: int = 50
         # Extract all metrics dynamically from this row
         metrics = _extract_metrics_from_row(row, metrics_data)
 
-        # Add avg per day as a computed metric
-        avg_per_day_value = metrics.get(avg_per_day_metric, 0)
-        metrics[avg_per_day_key] = safe_float(avg_per_day_value / num_days) if num_days > 0 and avg_per_day_value > 0 else 0.0
+        # Add avg per day as a computed metric ONLY if it wasn't already calculated in SQL
+        # If the metric exists in SQL results (e.g., queries_per_day was calculated with per-row days_in_range),
+        # don't overwrite it with the global num_days calculation
+        if avg_per_day_key not in metrics:
+            avg_per_day_value = metrics.get(avg_per_day_metric, 0)
+            metrics[avg_per_day_key] = safe_float(avg_per_day_value / num_days) if num_days > 0 and avg_per_day_value > 0 else 0.0
 
         # Calculate percentage of total based on primary sort metric
         primary_metric_value = metrics.get(primary_sort, 0)
         percentage_of_total = safe_float((primary_metric_value / total_primary_metric * 100)) if total_primary_metric > 0 else 0.0
+
+        # Add percent metrics for all volume metrics (grand total %)
+        metrics = _add_percent_metrics(metrics, total_metrics_from_query, metrics_data)
 
         rows.append(PivotRow(
             dimension_value=str(row['dimension_value']),
@@ -1251,6 +1397,9 @@ def get_pivot_data(dimensions: List[str], filters: FilterParams, limit: int = 50
     # Add avg per day to total metrics
     total_avg_per_day_value = total_metrics.get(avg_per_day_metric, 0)
     total_metrics[avg_per_day_key] = safe_float(total_avg_per_day_value / num_days) if num_days > 0 else 0.0
+
+    # Add percent metrics for total row (all 100%)
+    total_metrics = _add_percent_metrics(total_metrics, total_metrics, metrics_data)
 
     total_row = PivotRow(
         dimension_value="Total",
@@ -1460,6 +1609,9 @@ def get_pivot_children(
         # Calculate percentage of total based on primary sort metric
         primary_metric_value = metrics.get(primary_sort, 0)
         percentage_of_total = safe_float((primary_metric_value / grand_total_primary * 100)) if grand_total_primary > 0 else 0.0
+
+        # Note: _pct metrics for children would require querying parent totals
+        # For now, children don't have _pct metrics to avoid extra query overhead
 
         children.append(PivotChildRow(
             search_term=str(row['search_term']),

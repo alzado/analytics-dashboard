@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useMemo } from 'react'
 import type { DateRange, DateRangeType, RelativeDatePreset } from '@/lib/types'
 
 const STORAGE_KEY = 'pivot-table-config'
@@ -31,6 +31,21 @@ export interface PivotConfig {
   sortDirection?: 'asc' | 'desc'
   sortMetric?: string // Which metric to sort by
   chartType?: 'bar' | 'line' // Chart type for visualizations
+  // Manual fetch state (not persisted)
+  fetchRequested?: boolean
+  lastFetchedConfigHash?: string | null
+  // Snapshot of config used for the last fetch (used for stable query keys)
+  fetchedConfig?: {
+    selectedTable: string | null
+    selectedDimensions: string[]
+    selectedTableDimensions: string[]
+    selectedMetrics: string[]
+    selectedFilters: DimensionFilter[]
+    startDate: string | null
+    endDate: string | null
+    dateRangeType?: DateRangeType
+    relativeDatePreset?: RelativeDatePreset | null
+  } | null
 }
 
 interface UsePivotConfigReturn {
@@ -62,6 +77,10 @@ interface UsePivotConfigReturn {
   toggleDisplayMetric: (metric: string) => void
   setSortConfig: (column: string | number, subColumn?: 'value' | 'diff' | 'pctDiff', direction?: 'asc' | 'desc', metric?: string) => void
   setChartType: (type: 'bar' | 'line') => void
+  // Manual fetch control
+  triggerFetch: () => void
+  isStale: boolean
+  fetchRequested: boolean
 }
 
 const DEFAULT_CONFIG: PivotConfig = {
@@ -85,6 +104,10 @@ const DEFAULT_CONFIG: PivotConfig = {
   sortSubColumn: undefined,
   sortDirection: undefined,
   chartType: 'bar', // Default chart type
+  // Manual fetch state defaults
+  fetchRequested: false,
+  lastFetchedConfigHash: null,
+  fetchedConfig: null,
 }
 
 export function usePivotConfig(): UsePivotConfigReturn {
@@ -381,6 +404,58 @@ export function usePivotConfig(): UsePivotConfigReturn {
     }))
   }, [])
 
+  // Compute config hash for staleness detection
+  // This includes all fields that affect the BigQuery query
+  const configHash = useMemo(() => JSON.stringify({
+    selectedTable: config.selectedTable,
+    selectedDimensions: config.selectedDimensions,
+    selectedTableDimensions: config.selectedTableDimensions,
+    selectedMetrics: config.selectedMetrics,
+    selectedFilters: config.selectedFilters,
+    startDate: config.startDate,
+    endDate: config.endDate,
+    dateRangeType: config.dateRangeType,
+    relativeDatePreset: config.relativeDatePreset,
+  }), [
+    config.selectedTable,
+    config.selectedDimensions,
+    config.selectedTableDimensions,
+    config.selectedMetrics,
+    config.selectedFilters,
+    config.startDate,
+    config.endDate,
+    config.dateRangeType,
+    config.relativeDatePreset,
+  ])
+
+  // Check if config has changed since last fetch
+  const isStale = !!(
+    config.fetchRequested &&
+    config.lastFetchedConfigHash !== null &&
+    config.lastFetchedConfigHash !== configHash
+  )
+
+  // Trigger a fetch and update the snapshot
+  const triggerFetch = useCallback(() => {
+    setConfig((prev) => ({
+      ...prev,
+      fetchRequested: true,
+      lastFetchedConfigHash: configHash,
+      // Store snapshot of current config for stable query keys
+      fetchedConfig: {
+        selectedTable: prev.selectedTable,
+        selectedDimensions: prev.selectedDimensions,
+        selectedTableDimensions: prev.selectedTableDimensions,
+        selectedMetrics: prev.selectedMetrics,
+        selectedFilters: prev.selectedFilters,
+        startDate: prev.startDate,
+        endDate: prev.endDate,
+        dateRangeType: prev.dateRangeType,
+        relativeDatePreset: prev.relativeDatePreset,
+      },
+    }))
+  }, [configHash])
+
   return {
     config,
     updateTable,
@@ -410,5 +485,9 @@ export function usePivotConfig(): UsePivotConfigReturn {
     toggleDisplayMetric,
     setSortConfig,
     setChartType,
+    // Manual fetch control
+    triggerFetch,
+    isStale,
+    fetchRequested: config.fetchRequested ?? false,
   }
 }

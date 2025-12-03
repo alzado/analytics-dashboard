@@ -2,6 +2,7 @@
 
 import { useState } from 'react'
 import { X, Plus, Minus, Divide, Asterisk, Trash2 } from 'lucide-react'
+import { SearchInput } from '@/components/ui/search-input'
 import type { BaseMetric, CalculatedMetric, DimensionDef } from '@/lib/types'
 
 interface FormulaBuilderModalProps {
@@ -36,6 +37,37 @@ export function FormulaBuilderModal({
       return parseFormulaToTokens(initialFormula, availableMetrics, availableCalculatedMetrics, availableDimensions)
     }
     return []
+  })
+
+  // Search state - single search across all categories
+  const [searchTerm, setSearchTerm] = useState('')
+
+  // Filtered items based on search
+  const filteredBaseMetrics = availableMetrics.filter((m) => {
+    if (!searchTerm) return true
+    const term = searchTerm.toLowerCase()
+    return (
+      m.display_name.toLowerCase().includes(term) ||
+      m.id.toLowerCase().includes(term)
+    )
+  })
+
+  const filteredCalculatedMetrics = availableCalculatedMetrics.filter((m) => {
+    if (!searchTerm) return true
+    const term = searchTerm.toLowerCase()
+    return (
+      m.display_name.toLowerCase().includes(term) ||
+      m.id.toLowerCase().includes(term)
+    )
+  })
+
+  const filteredDimensions = availableDimensions.filter((d) => {
+    if (!searchTerm) return true
+    const term = searchTerm.toLowerCase()
+    return (
+      d.display_name.toLowerCase().includes(term) ||
+      d.id.toLowerCase().includes(term)
+    )
   })
 
   const addMetric = (metric: BaseMetric | CalculatedMetric) => {
@@ -241,21 +273,36 @@ export function FormulaBuilderModal({
             </div>
           </div>
 
+          {/* Search Input */}
+          <div className="mb-4">
+            <SearchInput
+              placeholder="Search metrics and dimensions..."
+              value={searchTerm}
+              onChange={setSearchTerm}
+            />
+          </div>
+
           <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
             {/* Base Metrics */}
             <div>
               <h3 className="text-sm font-medium text-gray-700 mb-3">Base Metrics</h3>
               <div className="space-y-2 max-h-64 overflow-y-auto border rounded-lg p-2">
-                {availableMetrics.map((metric) => (
-                  <button
-                    key={metric.id}
-                    onClick={() => addMetric(metric)}
-                    className="w-full text-left px-3 py-2 text-sm hover:bg-blue-50 rounded border border-transparent hover:border-blue-200 transition-colors"
-                  >
-                    <div className="font-medium">{metric.display_name}</div>
-                    <div className="text-xs text-gray-500">{metric.id}</div>
-                  </button>
-                ))}
+                {filteredBaseMetrics.length > 0 ? (
+                  filteredBaseMetrics.map((metric) => (
+                    <button
+                      key={metric.id}
+                      onClick={() => addMetric(metric)}
+                      className="w-full text-left px-3 py-2 text-sm hover:bg-blue-50 rounded border border-transparent hover:border-blue-200 transition-colors"
+                    >
+                      <div className="font-medium">{metric.display_name}</div>
+                      <div className="text-xs text-gray-500">{metric.id}</div>
+                    </button>
+                  ))
+                ) : (
+                  <div className="text-xs text-gray-400 p-3 text-center">
+                    {searchTerm ? 'No matches' : 'No base metrics'}
+                  </div>
+                )}
               </div>
             </div>
 
@@ -263,8 +310,8 @@ export function FormulaBuilderModal({
             <div>
               <h3 className="text-sm font-medium text-gray-700 mb-3">Calculated Metrics</h3>
               <div className="space-y-2 max-h-64 overflow-y-auto border rounded-lg p-2">
-                {availableCalculatedMetrics.length > 0 ? (
-                  availableCalculatedMetrics.map((metric) => (
+                {filteredCalculatedMetrics.length > 0 ? (
+                  filteredCalculatedMetrics.map((metric) => (
                     <button
                       key={metric.id}
                       onClick={() => addMetric(metric)}
@@ -276,7 +323,7 @@ export function FormulaBuilderModal({
                   ))
                 ) : (
                   <div className="text-xs text-gray-400 p-3 text-center">
-                    No calculated metrics available
+                    {searchTerm ? 'No matches' : 'No calculated metrics'}
                   </div>
                 )}
               </div>
@@ -286,16 +333,22 @@ export function FormulaBuilderModal({
             <div>
               <h3 className="text-sm font-medium text-gray-700 mb-3">Dimensions</h3>
               <div className="space-y-2 max-h-64 overflow-y-auto border rounded-lg p-2">
-                {availableDimensions.map((dimension) => (
-                  <button
-                    key={dimension.id}
-                    onClick={() => addDimension(dimension)}
-                    className="w-full text-left px-3 py-2 text-sm hover:bg-orange-50 rounded border border-transparent hover:border-orange-200 transition-colors"
-                  >
-                    <div className="font-medium">{dimension.display_name}</div>
-                    <div className="text-xs text-gray-500">{dimension.id}</div>
-                  </button>
-                ))}
+                {filteredDimensions.length > 0 ? (
+                  filteredDimensions.map((dimension) => (
+                    <button
+                      key={dimension.id}
+                      onClick={() => addDimension(dimension)}
+                      className="w-full text-left px-3 py-2 text-sm hover:bg-orange-50 rounded border border-transparent hover:border-orange-200 transition-colors"
+                    >
+                      <div className="font-medium">{dimension.display_name}</div>
+                      <div className="text-xs text-gray-500">{dimension.id}</div>
+                    </button>
+                  ))
+                ) : (
+                  <div className="text-xs text-gray-400 p-3 text-center">
+                    {searchTerm ? 'No matches' : 'No dimensions'}
+                  </div>
+                )}
               </div>
             </div>
 

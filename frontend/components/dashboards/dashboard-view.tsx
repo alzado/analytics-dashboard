@@ -2,8 +2,8 @@
 
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { ArrowLeft, Plus, Edit2, Trash2, Settings, LayoutGrid, Pen } from 'lucide-react'
-import { fetchDashboard, updateDashboard, deleteWidget, type Dashboard, type WidgetConfig } from '@/lib/api'
+import { ArrowLeft, Plus, Edit2, Trash2, Settings, LayoutGrid, Pen, Check, X } from 'lucide-react'
+import { fetchDashboard, updateDashboard, deleteWidget, updateDashboardWidget, type Dashboard, type WidgetConfig } from '@/lib/api'
 import { useDashboard } from '@/lib/contexts/dashboard-context'
 import { AddWidgetDialog } from './add-widget-dialog'
 import { DashboardSettingsDialog } from './dashboard-settings-dialog'
@@ -34,6 +34,15 @@ export function DashboardView({ dashboardId, onBack, onTabChange }: DashboardVie
   // Delete widget mutation
   const deleteWidgetMutation = useMutation({
     mutationFn: ({ widgetId }: { widgetId: string }) => deleteWidget(dashboardId, widgetId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['dashboard', dashboardId] })
+    },
+  })
+
+  // Rename widget mutation
+  const renameWidgetMutation = useMutation({
+    mutationFn: ({ widgetId, title }: { widgetId: string; title: string }) =>
+      updateDashboardWidget(dashboardId, widgetId, { title }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['dashboard', dashboardId] })
     },
@@ -83,6 +92,12 @@ export function DashboardView({ dashboardId, onBack, onTabChange }: DashboardVie
     // Switch to Editor tab
     if (onTabChange) {
       onTabChange('pivot')
+    }
+  }
+
+  const handleRenameWidget = (widgetId: string, newTitle: string) => {
+    if (newTitle.trim()) {
+      renameWidgetMutation.mutate({ widgetId, title: newTitle.trim() })
     }
   }
 
@@ -208,6 +223,7 @@ export function DashboardView({ dashboardId, onBack, onTabChange }: DashboardVie
                 isEditMode={isEditMode}
                 onDelete={() => handleDeleteWidget(widget.id)}
                 onEditInEditor={() => handleEditInEditor(widget)}
+                onRename={(newTitle) => handleRenameWidget(widget.id, newTitle)}
               />
             </div>
           ))}
@@ -239,30 +255,105 @@ function WidgetCard({
   isEditMode,
   onDelete,
   onEditInEditor,
+  onRename,
 }: {
   widget: WidgetConfig
   isEditMode: boolean
   onDelete: () => void
   onEditInEditor?: () => void
+  onRename?: (newTitle: string) => void
 }) {
+  const [isEditing, setIsEditing] = useState(false)
+  const [editedTitle, setEditedTitle] = useState(widget.title)
+
+  const handleStartEditing = () => {
+    setEditedTitle(widget.title)
+    setIsEditing(true)
+  }
+
+  const handleSaveTitle = () => {
+    if (editedTitle.trim() && editedTitle !== widget.title && onRename) {
+      onRename(editedTitle.trim())
+    }
+    setIsEditing(false)
+  }
+
+  const handleCancelEditing = () => {
+    setEditedTitle(widget.title)
+    setIsEditing(false)
+  }
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter') {
+      handleSaveTitle()
+    } else if (e.key === 'Escape') {
+      handleCancelEditing()
+    }
+  }
+
   return (
     <div className="h-full flex flex-col">
       {/* Widget header */}
       <div className="flex items-center justify-between p-4 border-b border-gray-200 bg-gray-50">
-        <div className="flex items-center gap-2 flex-1">
+        <div className="flex items-center gap-2 flex-1 min-w-0">
           {isEditMode && (
-            <div className="widget-drag-handle cursor-move">
+            <div className="widget-drag-handle cursor-move flex-shrink-0">
               <LayoutGrid className="h-4 w-4 text-gray-400" />
             </div>
           )}
-          <h3 className="font-semibold text-gray-900">{widget.title}</h3>
-          <span className="text-xs px-2 py-1 bg-blue-100 text-blue-700 rounded">
+          {isEditing ? (
+            <div className="flex items-center gap-1 flex-1 min-w-0">
+              <input
+                type="text"
+                value={editedTitle}
+                onChange={(e) => setEditedTitle(e.target.value)}
+                onKeyDown={handleKeyDown}
+                className="flex-1 min-w-0 px-2 py-1 text-sm font-semibold border border-blue-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
+                autoFocus
+                maxLength={100}
+              />
+              <button
+                onClick={handleSaveTitle}
+                className="p-1 text-green-600 hover:text-green-700 flex-shrink-0"
+                title="Save"
+              >
+                <Check className="h-4 w-4" />
+              </button>
+              <button
+                onClick={handleCancelEditing}
+                className="p-1 text-gray-400 hover:text-gray-600 flex-shrink-0"
+                title="Cancel"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+          ) : (
+            <>
+              <h3
+                className={`font-semibold text-gray-900 truncate ${isEditMode ? 'cursor-pointer hover:text-blue-600' : ''}`}
+                onClick={isEditMode ? handleStartEditing : undefined}
+                title={isEditMode ? 'Click to rename' : widget.title}
+              >
+                {widget.title}
+              </h3>
+              {isEditMode && (
+                <button
+                  onClick={handleStartEditing}
+                  className="p-1 text-gray-400 hover:text-blue-600 flex-shrink-0"
+                  title="Rename widget"
+                >
+                  <Edit2 className="h-3 w-3" />
+                </button>
+              )}
+            </>
+          )}
+          <span className="text-xs px-2 py-1 bg-blue-100 text-blue-700 rounded flex-shrink-0">
             {widget.type === 'table' ? 'Table' : 'Chart'}
           </span>
         </div>
 
-        {isEditMode && (
-          <div className="flex items-center gap-2">
+        {isEditMode && !isEditing && (
+          <div className="flex items-center gap-2 flex-shrink-0">
             {onEditInEditor && (
               <button
                 onClick={onEditInEditor}
