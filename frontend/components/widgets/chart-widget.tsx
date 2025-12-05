@@ -5,6 +5,7 @@ import { useQuery } from '@tanstack/react-query'
 import { BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts'
 import { ArrowUpDown, ArrowUp, ArrowDown, GripVertical, BarChart3, LineChart as LineChartIcon, ChevronDown, ChevronUp } from 'lucide-react'
 import { fetchPivotData, fetchDimensionValues, type WidgetConfig } from '@/lib/api'
+import type { RelativeDatePreset } from '@/lib/types'
 import { usePivotMetrics } from '@/hooks/use-pivot-metrics'
 
 interface ChartWidgetProps {
@@ -76,7 +77,7 @@ export function ChartWidget({ widget }: ChartWidgetProps) {
             start_date: widget.start_date || undefined,
             end_date: widget.end_date || undefined,
             date_range_type: widget.date_range_type || 'absolute',
-            relative_date_preset: widget.relative_date_preset || undefined,
+            relative_date_preset: (widget.relative_date_preset as RelativeDatePreset | null | undefined) || undefined,
             dimension_filters: widget.filters,
           },
           50,

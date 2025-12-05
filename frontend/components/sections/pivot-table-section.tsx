@@ -3,7 +3,7 @@
 import React, { useState, useMemo, useEffect, useCallback } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { fetchPivotData, fetchPivotChildren, fetchDimensionValues, fetchCustomDimensions, fetchTables, updateWidget } from '@/lib/api'
-import type { PivotRow, PivotChildRow, CustomDimension, DateRangeType, RelativeDatePreset } from '@/lib/types'
+import type { PivotRow, PivotChildRow, PivotResponse, CustomDimension, DateRangeType, RelativeDatePreset } from '@/lib/types'
 import { ChevronRight, ChevronDown, Settings2, ArrowUp, ArrowDown, Database, Save, GripVertical, Download } from 'lucide-react'
 import { usePivotConfig } from '@/hooks/use-pivot-config'
 import { usePivotMetrics } from '@/hooks/use-pivot-metrics'
@@ -648,8 +648,8 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
   // Uses fetchedConfig values for stable query keys (only refetches when user clicks "Fetch Data")
   const { data: allColumnData, isLoading: isLoadingColumnData } = useQuery({
     queryKey: ['all-columns', tableCombinations, fetchedFilters, fetchedDimensions, customDimensions, fetchedMetrics, columnOrder],
-    queryFn: async () => {
-      const results: Record<string, any> = {}
+    queryFn: async (): Promise<Record<number, PivotResponse>> => {
+      const results: Record<number, PivotResponse> = {}
 
       if (tableCombinations.length === 0 || !fetchedFilters) {
         return results
@@ -682,7 +682,7 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
           if (key.startsWith('custom_') && customDimensions) {
             const customDimId = key.replace('custom_', '')
             const customDim = customDimensions.find(d => d.id === customDimId)
-            if (customDim) {
+            if (customDim && customDim.values) {
               const dimValue = customDim.values.find(v => v.label === value)
               if (dimValue) {
                 // Set date fields - handle both relative and absolute dates
@@ -768,8 +768,8 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
   // Main pivot data query - uses fetchedConfig values for stable query keys
   const { data: pivotData, isLoading, error } = useQuery({
     queryKey: ['pivot', allFetchedDimensions, fetchedFilters, fetchedTable, fetchedMetrics],
-    queryFn: () => {
-      if (!fetchedFilters) return Promise.resolve({ rows: [], total: {} })
+    queryFn: (): Promise<PivotResponse> => {
+      if (!fetchedFilters) return Promise.resolve({ rows: [], total: {} as PivotRow, available_dimensions: [] })
       // If no dimensions, create a single "All Data" row manually
       if (fetchedDimensions.length === 0) {
         return fetchPivotData([], fetchedFilters, 1, 0, undefined, fetchedTable || undefined, true, fetchedMetrics).then(data => {
@@ -813,7 +813,7 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
     getSignificanceForCell,
     controlColumnIndex,
   } = useSignificance({
-    allColumnData,
+    allColumnData: allColumnData ?? null,
     tableCombinations,
     columnOrder,
     selectedMetrics,
@@ -1064,7 +1064,7 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
                 if (dimKey.startsWith('custom_') && customDimensions) {
                   const customDimId = dimKey.replace('custom_', '')
                   const customDim = customDimensions.find(d => d.id === customDimId)
-                  if (customDim) {
+                  if (customDim && customDim.values) {
                     // Find the value with this label
                     const dimValue = customDim.values.find(v => v.label === value)
                     if (dimValue) {
@@ -1198,7 +1198,7 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
               if (dimKey.startsWith('custom_') && customDimensions) {
                 const customDimId = dimKey.replace('custom_', '')
                 const customDim = customDimensions.find(d => d.id === customDimId)
-                if (customDim) {
+                if (customDim && customDim.values) {
                   // Find the value with this label
                   const dimValue = customDim.values.find(v => v.label === value)
                   if (dimValue) {
@@ -1532,7 +1532,7 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
   }
 
   // Helper to get value from row by metric ID
-  const getRowValue = (row: PivotRow | typeof pivotData.total, metricId: string): number => {
+  const getRowValue = (row: PivotRow | PivotRow, metricId: string): number => {
     return (row as any).metrics?.[metricId] ?? 0
   }
 
@@ -2273,7 +2273,7 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
     })
 
     // Combine all rows
-    const allRows: string[][] = [
+    const allRows: (string | number)[][] = [
       ...metadataRows,
       [],
       data.headers,

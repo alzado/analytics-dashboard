@@ -3,7 +3,7 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { X } from 'lucide-react'
-import { addWidgetToDashboard, fetchTables } from '@/lib/api'
+import { addWidgetToDashboard, fetchTables, type WidgetCreateRequest } from '@/lib/api'
 
 interface AddWidgetDialogProps {
   dashboardId: string

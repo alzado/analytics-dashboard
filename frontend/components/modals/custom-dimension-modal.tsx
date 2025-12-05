@@ -235,7 +235,7 @@ export default function CustomDimensionModal({
             newErrors[`metricValue_${valueIndex}_cond_${condIndex}_valueMax`] = 'Max value is required'
           }
 
-          if (operatorInfo?.requiresMaxValue && condition.value !== null && condition.value_max !== null) {
+          if (operatorInfo?.requiresMaxValue && condition.value !== null && condition.value !== undefined && condition.value_max !== null && condition.value_max !== undefined) {
             if (condition.value_max <= condition.value) {
               newErrors[`metricValue_${valueIndex}_cond_${condIndex}_range`] = 'Max must be greater than min'
             }

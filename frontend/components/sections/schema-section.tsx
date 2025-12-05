@@ -1,13 +1,14 @@
 'use client'
 
 import { useState, useEffect } from 'react'
-import { Pencil, Trash2, Copy, FileText, Calendar } from 'lucide-react'
+import { Pencil, Trash2, Copy, FileText, Calendar, Database } from 'lucide-react'
 import { SearchInput } from '@/components/ui/search-input'
 import { useSchema } from '@/hooks/use-schema'
 import { usePivotMetrics } from '@/hooks/use-pivot-metrics'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { fetchTables, copySchema, applySchemaTemplate, createDailyAverageMetric } from '@/lib/api'
 import { FormulaBuilderModal } from '@/components/modals/formula-builder-modal'
+import { RollupManagementSection } from '@/components/sections/rollup-management-section'
 import type {
   BaseMetric,
   CalculatedMetric,
@@ -25,7 +26,7 @@ interface SchemaSectionProps {
 }
 
 export function SchemaSection({ tableId }: SchemaSectionProps) {
-  const [schemaTab, setSchemaTab] = useState<'base' | 'calculated' | 'dimensions'>('base')
+  const [schemaTab, setSchemaTab] = useState<'base' | 'calculated' | 'dimensions' | 'rollups'>('base')
   const [isDetecting, setIsDetecting] = useState(false)
   const [detectionResult, setDetectionResult] = useState<string | null>(null)
 
@@ -157,7 +158,7 @@ export function SchemaSection({ tableId }: SchemaSectionProps) {
     setIsDetecting(true)
     setDetectionResult(null)
     try {
-      const result = await detectSchema(tableId)
+      const result = await detectSchema()
       const metricsCount = result?.detected_base_metrics?.length || 0
       const dimensionsCount = result?.detected_dimensions?.length || 0
       setDetectionResult(
@@ -334,6 +335,7 @@ export function SchemaSection({ tableId }: SchemaSectionProps) {
     { id: 'base' as const, label: 'Base Metrics', count: baseMetrics?.length || 0 },
     { id: 'calculated' as const, label: 'Calculated Metrics', count: calculatedMetrics?.length || 0 },
     { id: 'dimensions' as const, label: 'Dimensions', count: dimensions?.length || 0 },
+    { id: 'rollups' as const, label: 'Rollups', count: null, icon: Database },
   ]
 
   return (
@@ -550,17 +552,20 @@ export function SchemaSection({ tableId }: SchemaSectionProps) {
                 key={tab.id}
                 onClick={() => setSchemaTab(tab.id)}
                 className={`
-                  py-4 px-6 border-b-2 font-medium text-sm whitespace-nowrap
+                  py-4 px-6 border-b-2 font-medium text-sm whitespace-nowrap flex items-center gap-2
                   ${schemaTab === tab.id
                     ? 'border-blue-500 text-blue-600'
                     : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
                   }
                 `}
               >
+                {'icon' in tab && tab.icon && <tab.icon size={16} />}
                 {tab.label}
-                <span className="ml-2 px-2 py-0.5 rounded-full bg-gray-100 text-gray-600 text-xs">
-                  {tab.count}
-                </span>
+                {tab.count !== null && (
+                  <span className="ml-2 px-2 py-0.5 rounded-full bg-gray-100 text-gray-600 text-xs">
+                    {tab.count}
+                  </span>
+                )}
               </button>
             ))}
           </nav>
@@ -596,6 +601,9 @@ export function SchemaSection({ tableId }: SchemaSectionProps) {
               onDelete={handleDeleteDimension}
               onCreate={() => setIsCreateDimensionModalOpen(true)}
             />
+          )}
+          {schemaTab === 'rollups' && (
+            <RollupManagementSection tableId={tableId} />
           )}
         </div>
       </div>
@@ -770,7 +778,7 @@ function BaseMetricsTab({ metrics, isLoading, onEdit, onDelete, onCreate, calcul
               <td className="px-4 py-3 text-sm">
                 <div className="flex gap-2">
                   {/* Create Daily Average button - only for volume metrics */}
-                  {metric.category === 'volume' && !metric.is_system && (() => {
+                  {metric.category === 'volume' && (() => {
                     const dailyAvgId = `${metric.id}_per_day`
                     const dailyAvgExists = calculatedMetrics?.some(m => m.id === dailyAvgId)
                     return !dailyAvgExists ? (

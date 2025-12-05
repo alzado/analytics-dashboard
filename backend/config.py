@@ -18,6 +18,9 @@ QUERY_LOGS_DB_PATH = "/app/config/query_logs.db"
 # Dashboard configuration paths
 DASHBOARDS_DIR = "/app/config/dashboards"
 
+# Rollup configuration directory
+ROLLUPS_DIR = "/app/config/rollups"
+
 # Legacy paths for migration
 LEGACY_CONFIG_FILE = "/app/config/bigquery_config.json"
 LEGACY_SCHEMA_FILE = "/app/config/schema_config.json"

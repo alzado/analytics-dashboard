@@ -1361,6 +1361,179 @@ class BigQueryService:
         # Convert to list of strings, filtering out any null values
         return [str(val) for val in df['value'].tolist() if pd.notna(val)]
 
+    # =========================================================================
+    # Rollup-Aware Query Methods
+    # =========================================================================
+
+    def _get_query_router(self):
+        """Get query router service if rollups are configured."""
+        from services.query_router_service import QueryRouterService
+        from services.rollup_service import RollupService
+
+        if not self.schema_config:
+            return None
+
+        # Load rollup config
+        rollup_service = RollupService(self.client, self.table_id)
+        rollup_config = rollup_service.load_config()
+
+        if not rollup_config or not rollup_config.rollups:
+            return None
+
+        return QueryRouterService(
+            rollup_config=rollup_config,
+            schema_config=self.schema_config,
+            source_project_id=self.project_id,
+            source_dataset=self.dataset
+        )
+
+    def _has_distinct_metrics(self, metric_ids: List[str]) -> bool:
+        """Check if any of the requested metrics use COUNT_DISTINCT."""
+        if not self.schema_config:
+            return False
+
+        for metric_id in metric_ids:
+            metric = next(
+                (m for m in self.schema_config.base_metrics if m.id == metric_id),
+                None
+            )
+            if metric and metric.aggregation in ("COUNT_DISTINCT", "APPROX_COUNT_DISTINCT"):
+                return True
+        return False
+
+    def query_rollup_table(
+        self,
+        rollup_table_path: str,
+        dimensions: List[str],
+        metrics: List[str],
+        filters: 'FilterParams',
+        needs_reaggregation: bool = False,
+        limit: int = 100,
+        offset: int = 0,
+        sort_by: Optional[str] = None,
+        sort_order: str = "DESC"
+    ) -> pd.DataFrame:
+        """
+        Query a rollup table directly.
+
+        Args:
+            rollup_table_path: Full path to rollup table
+            dimensions: Dimension IDs to include
+            metrics: Metric IDs to include
+            filters: Filter parameters
+            needs_reaggregation: Whether to re-aggregate (for SUM metrics)
+            limit: Max rows to return
+            offset: Row offset for pagination
+            sort_by: Metric to sort by
+            sort_order: ASC or DESC
+
+        Returns:
+            DataFrame with query results
+        """
+        where_clause = self.build_filter_clause(
+            start_date=filters.start_date,
+            end_date=filters.end_date,
+            dimension_filters=filters.dimension_filters,
+            date_range_type=filters.date_range_type,
+            relative_date_preset=filters.relative_date_preset
+        )
+
+        # Build SELECT parts
+        select_parts = []
+        group_parts = []
+
+        for dim_id in dimensions:
+            select_parts.append(dim_id)
+            group_parts.append(dim_id)
+
+        if needs_reaggregation:
+            # Re-aggregate SUM/COUNT metrics
+            for metric_id in metrics:
+                metric = next(
+                    (m for m in self.schema_config.base_metrics if m.id == metric_id),
+                    None
+                )
+                if metric and metric.aggregation in ("SUM", "COUNT"):
+                    select_parts.append(f"SUM({metric_id}) AS {metric_id}")
+                else:
+                    # Non-aggregatable metric - just select (will cause issues)
+                    select_parts.append(metric_id)
+        else:
+            # Direct select (exact match)
+            select_parts.extend(metrics)
+
+        sort_metric = sort_by or (metrics[0] if metrics else None)
+        order_clause = f"ORDER BY {sort_metric} {sort_order}" if sort_metric else ""
+
+        if needs_reaggregation:
+            query = f"""
+                SELECT {', '.join(select_parts)}
+                FROM `{rollup_table_path}`
+                {where_clause}
+                GROUP BY {', '.join(group_parts)}
+                {order_clause}
+                LIMIT {limit} OFFSET {offset}
+            """
+        else:
+            query = f"""
+                SELECT {', '.join(select_parts)}
+                FROM `{rollup_table_path}`
+                {where_clause}
+                {order_clause}
+                LIMIT {limit} OFFSET {offset}
+            """
+
+        filters_dict = {
+            'start_date': filters.start_date,
+            'end_date': filters.end_date,
+            'dimension_filters': filters.dimension_filters,
+            'dimensions': dimensions,
+            'rollup_table': rollup_table_path
+        }
+
+        return self._execute_and_log_query(
+            query=query,
+            query_type='rollup_query',
+            endpoint='/api/pivot',
+            filters=filters_dict
+        )
+
+    def get_route_decision(
+        self,
+        dimensions: List[str],
+        metrics: List[str],
+        filters: Optional['FilterParams'] = None,
+        require_rollup: bool = False
+    ):
+        """
+        Get routing decision for a query without executing.
+
+        Args:
+            dimensions: Dimensions to group by
+            metrics: Metrics to aggregate
+            filters: Filter parameters
+            require_rollup: Error if no suitable rollup
+
+        Returns:
+            RouteDecision object
+        """
+        from services.query_router_service import RouteDecision
+
+        router = self._get_query_router()
+        if not router:
+            return RouteDecision(
+                use_rollup=False,
+                reason="No rollups configured"
+            )
+
+        filter_dims = filters.dimension_filters if filters else None
+        return router.route_query(
+            query_dimensions=dimensions,
+            query_metrics=metrics,
+            query_filters=filter_dims,
+            require_rollup=require_rollup
+        )
+
     def list_tables_in_dataset(self) -> List[Dict]:
         """
         List all tables in the configured dataset.

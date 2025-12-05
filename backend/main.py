@@ -78,7 +78,16 @@ from models.schemas import (
     ColumnDefinition,
     # Cache management models
     CacheStats,
-    CacheClearResponse
+    CacheClearResponse,
+    # Rollup models
+    RollupDef,
+    RollupConfig,
+    RollupCreate,
+    RollupUpdate,
+    RollupRefreshResponse,
+    RollupListResponse,
+    RollupPreviewSqlResponse,
+    RollupMetricDef
 )
 from services.statistical_service import StatisticalService
 
@@ -1648,6 +1657,255 @@ async def clear_cache_by_query_type(query_type: str):
             message=f"Cleared cache for query type {query_type}",
             entries_deleted=count
         )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# ROLLUP (PRE-AGGREGATION) ENDPOINTS
+# ============================================================================
+
+def get_rollup_service(table_id: Optional[str] = None):
+    """Get rollup service for a table."""
+    from services.rollup_service import RollupService
+    from services.bigquery_service import get_bigquery_service
+
+    bq_service = get_bigquery_service(table_id)
+    if not bq_service:
+        return None, None
+
+    rollup_service = RollupService(bq_service.client, bq_service.table_id or table_id)
+    return rollup_service, bq_service
+
+
+@app.get("/api/rollups", response_model=RollupListResponse)
+async def list_rollups(table_id: Optional[str] = None):
+    """List all rollup definitions for a table"""
+    try:
+        rollup_service, bq_service = get_rollup_service(table_id)
+        if not rollup_service:
+            raise HTTPException(status_code=400, detail="BigQuery not configured")
+
+        return rollup_service.list_rollups()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/rollups/{rollup_id}", response_model=RollupDef)
+async def get_rollup(rollup_id: str, table_id: Optional[str] = None):
+    """Get a specific rollup by ID"""
+    try:
+        rollup_service, bq_service = get_rollup_service(table_id)
+        if not rollup_service:
+            raise HTTPException(status_code=400, detail="BigQuery not configured")
+
+        rollup = rollup_service.get_rollup(rollup_id)
+        if not rollup:
+            raise HTTPException(status_code=404, detail=f"Rollup '{rollup_id}' not found")
+
+        return rollup
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/rollups", response_model=RollupDef)
+async def create_rollup(data: RollupCreate, table_id: Optional[str] = None):
+    """Create a new rollup definition"""
+    try:
+        rollup_service, bq_service = get_rollup_service(table_id)
+        if not rollup_service or not bq_service:
+            raise HTTPException(status_code=400, detail="BigQuery not configured")
+
+        if not bq_service.schema_config:
+            raise HTTPException(status_code=400, detail="Schema not configured")
+
+        # Validate dimensions exist in schema
+        valid_dims = {d.id for d in bq_service.schema_config.dimensions}
+        for dim in data.dimensions:
+            if dim not in valid_dims:
+                raise HTTPException(status_code=400, detail=f"Unknown dimension: {dim}")
+
+        # Validate metrics exist in schema
+        valid_metrics = {m.id for m in bq_service.schema_config.base_metrics}
+        for metric_def in data.metrics:
+            if metric_def.metric_id not in valid_metrics:
+                raise HTTPException(status_code=400, detail=f"Unknown metric: {metric_def.metric_id}")
+
+        rollup = rollup_service.create_rollup(data, bq_service.schema_config)
+        return rollup
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/api/rollups/{rollup_id}", response_model=RollupDef)
+async def update_rollup(rollup_id: str, data: RollupUpdate, table_id: Optional[str] = None):
+    """Update a rollup definition"""
+    try:
+        rollup_service, bq_service = get_rollup_service(table_id)
+        if not rollup_service or not bq_service:
+            raise HTTPException(status_code=400, detail="BigQuery not configured")
+
+        if not bq_service.schema_config:
+            raise HTTPException(status_code=400, detail="Schema not configured")
+
+        rollup = rollup_service.update_rollup(rollup_id, data, bq_service.schema_config)
+        return rollup
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/rollups/{rollup_id}")
+async def delete_rollup(
+    rollup_id: str,
+    drop_table: bool = False,
+    table_id: Optional[str] = None
+):
+    """Delete a rollup definition (optionally drop BigQuery table)"""
+    try:
+        rollup_service, bq_service = get_rollup_service(table_id)
+        if not rollup_service or not bq_service:
+            raise HTTPException(status_code=400, detail="BigQuery not configured")
+
+        rollup_service.delete_rollup(
+            rollup_id,
+            drop_table=drop_table,
+            source_project_id=bq_service.project_id,
+            source_dataset=bq_service.dataset
+        )
+
+        return {"success": True, "message": f"Rollup '{rollup_id}' deleted"}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/rollups/{rollup_id}/refresh", response_model=RollupRefreshResponse)
+async def refresh_rollup(
+    rollup_id: str,
+    force: bool = False,
+    table_id: Optional[str] = None
+):
+    """Refresh (rebuild) a rollup table in BigQuery"""
+    try:
+        rollup_service, bq_service = get_rollup_service(table_id)
+        if not rollup_service or not bq_service:
+            raise HTTPException(status_code=400, detail="BigQuery not configured")
+
+        if not bq_service.schema_config:
+            raise HTTPException(status_code=400, detail="Schema not configured")
+
+        result = rollup_service.refresh_rollup(
+            rollup_id=rollup_id,
+            source_table_path=bq_service.table_path,
+            schema_config=bq_service.schema_config,
+            source_project_id=bq_service.project_id,
+            source_dataset=bq_service.dataset,
+            force=force
+        )
+
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/rollups/{rollup_id}/preview-sql", response_model=RollupPreviewSqlResponse)
+async def preview_rollup_sql(rollup_id: str, table_id: Optional[str] = None):
+    """Preview the SQL that would be generated for a rollup"""
+    try:
+        rollup_service, bq_service = get_rollup_service(table_id)
+        if not rollup_service or not bq_service:
+            raise HTTPException(status_code=400, detail="BigQuery not configured")
+
+        if not bq_service.schema_config:
+            raise HTTPException(status_code=400, detail="Schema not configured")
+
+        result = rollup_service.preview_sql(
+            rollup_id=rollup_id,
+            source_table_path=bq_service.table_path,
+            schema_config=bq_service.schema_config,
+            source_project_id=bq_service.project_id,
+            source_dataset=bq_service.dataset
+        )
+
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/rollups/refresh-all")
+async def refresh_all_rollups(
+    only_pending_or_stale: bool = True,
+    table_id: Optional[str] = None
+):
+    """Refresh all rollups (or only pending/stale ones)"""
+    try:
+        rollup_service, bq_service = get_rollup_service(table_id)
+        if not rollup_service or not bq_service:
+            raise HTTPException(status_code=400, detail="BigQuery not configured")
+
+        if not bq_service.schema_config:
+            raise HTTPException(status_code=400, detail="Schema not configured")
+
+        results = rollup_service.refresh_all(
+            source_table_path=bq_service.table_path,
+            schema_config=bq_service.schema_config,
+            source_project_id=bq_service.project_id,
+            source_dataset=bq_service.dataset,
+            only_pending_or_stale=only_pending_or_stale
+        )
+
+        return {
+            "success": True,
+            "total": len(results),
+            "successful": sum(1 for r in results if r.success),
+            "failed": sum(1 for r in results if not r.success),
+            "results": [r.model_dump() for r in results]
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/api/rollups/config/default-dataset")
+async def set_default_rollup_dataset(
+    dataset: Optional[str] = None,
+    table_id: Optional[str] = None
+):
+    """Set the default target dataset for rollups"""
+    try:
+        rollup_service, bq_service = get_rollup_service(table_id)
+        if not rollup_service:
+            raise HTTPException(status_code=400, detail="BigQuery not configured")
+
+        config = rollup_service.set_default_dataset(dataset)
+        return {
+            "success": True,
+            "default_target_dataset": config.default_target_dataset
+        }
     except HTTPException:
         raise
     except Exception as e:

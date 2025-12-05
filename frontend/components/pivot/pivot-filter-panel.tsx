@@ -38,7 +38,7 @@ export function PivotFilterPanel({
   endDate = null,
   onDateRangeChange,
 }: PivotFilterPanelProps) {
-  const { schema, isLoading: schemaLoading } = useSchema(tableId)
+  const { schema, isLoadingSchema: schemaLoading } = useSchema(tableId)
 
   // Get only filterable dimensions from schema
   const filterableDimensions = schema?.dimensions?.filter(d => d.is_filterable) || []
@@ -107,6 +107,7 @@ export function PivotFilterPanel({
               selectedValues={filters[dimension.id] || []}
               onFilterChange={values => onFilterChange(dimension.id, values)}
               currentFilters={currentFilters}
+              tableId={tableId}
             />
           ))
         ) : (
@@ -127,6 +128,7 @@ interface DimensionFilterProps {
   selectedValues: string[]
   onFilterChange: (values: string[]) => void
   currentFilters?: FilterParams
+  tableId?: string
 }
 
 function DimensionFilter({
@@ -134,6 +136,7 @@ function DimensionFilter({
   selectedValues,
   onFilterChange,
   currentFilters,
+  tableId,
 }: DimensionFilterProps) {
   const [isOpen, setIsOpen] = useState(false)
   const [availableValues, setAvailableValues] = useState<string[]>([])

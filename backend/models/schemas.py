@@ -443,6 +443,9 @@ class SchemaConfig(BaseModel):
     avg_per_day_metric: Optional[str] = Field(None, description="Metric ID to use for average per day calculation in pivot tables")
     pagination_threshold: int = Field(default=100, description="Paginate dimension values when count exceeds this")
 
+    # Rollup configuration (populated from separate file, not stored here)
+    rollup_config: Optional["RollupConfig"] = Field(None, description="Pre-aggregation rollup configuration")
+
     version: int = Field(default=1, description="Schema version for migrations")
     created_at: str = Field(..., description="ISO timestamp when schema was created")
     updated_at: str = Field(..., description="ISO timestamp when schema was last updated")
@@ -747,3 +750,124 @@ class CacheClearResponse(BaseModel):
     success: bool
     message: str
     entries_deleted: int
+
+
+# ============================================================================
+# Rollup (Pre-Aggregation) Models
+# ============================================================================
+
+class RollupMetricDef(BaseModel):
+    """Definition of a metric within a rollup table."""
+    metric_id: str = Field(..., description="Reference to base metric ID in schema")
+    include_conditional: bool = Field(default=False, description="Whether to include conditional variant (with flag=1)")
+    flag_column: Optional[str] = Field(None, description="Column name for conditional flag (required if include_conditional=True)")
+
+    @model_validator(mode='after')
+    def validate_conditional_flag(self):
+        if self.include_conditional and not self.flag_column:
+            raise ValueError("flag_column is required when include_conditional is True")
+        return self
+
+
+class RollupDef(BaseModel):
+    """Definition of a pre-aggregated rollup table."""
+    id: str = Field(..., description="Unique rollup identifier (e.g., 'rollup_date_channel')")
+    display_name: str = Field(..., description="Human-readable name for UI")
+    description: Optional[str] = Field(None, description="Description of what this rollup is for")
+
+    # Dimension configuration
+    dimensions: List[str] = Field(..., min_length=1, description="List of dimension IDs to group by (must include date)")
+
+    # Metric configuration
+    metrics: List[RollupMetricDef] = Field(..., min_length=1, description="Metrics to pre-aggregate")
+
+    # BigQuery table configuration
+    target_dataset: Optional[str] = Field(None, description="Target dataset for rollup table (defaults to source dataset)")
+    target_table_name: Optional[str] = Field(None, description="Target table name (auto-generated if not provided)")
+
+    # Status and metadata
+    status: Literal["pending", "building", "ready", "error", "stale"] = Field(default="pending")
+    last_refresh_at: Optional[str] = Field(None)
+    last_refresh_error: Optional[str] = Field(None)
+    row_count: Optional[int] = Field(None)
+    size_bytes: Optional[int] = Field(None)
+
+    # Timestamps
+    created_at: str = Field(...)
+    updated_at: str = Field(...)
+
+    @model_validator(mode='after')
+    def validate_date_dimension(self):
+        """Ensure date is always included as a dimension."""
+        if 'date' not in self.dimensions:
+            raise ValueError("'date' must be included in rollup dimensions")
+        return self
+
+
+class RollupConfig(BaseModel):
+    """Configuration for all rollups for a table."""
+    rollups: List[RollupDef] = Field(default_factory=list)
+    default_target_dataset: Optional[str] = Field(None, description="Default dataset for rollup tables")
+    version: int = Field(default=1)
+    created_at: str = Field(...)
+    updated_at: str = Field(...)
+
+
+class RollupCreate(BaseModel):
+    """Request to create a new rollup definition."""
+    id: Optional[str] = Field(None, description="Rollup ID (auto-generated from dimensions if not provided)")
+    display_name: str = Field(..., min_length=1, max_length=100)
+    description: Optional[str] = Field(None, max_length=500)
+    dimensions: List[str] = Field(..., min_length=1)
+    metrics: List[RollupMetricDef] = Field(..., min_length=1)
+    target_dataset: Optional[str] = Field(None)
+    target_table_name: Optional[str] = Field(None)
+
+    @model_validator(mode='after')
+    def validate_date_dimension(self):
+        """Ensure date is always included as a dimension."""
+        if 'date' not in self.dimensions:
+            raise ValueError("'date' must be included in rollup dimensions")
+        return self
+
+
+class RollupUpdate(BaseModel):
+    """Request to update a rollup definition (partial update)."""
+    display_name: Optional[str] = Field(None, min_length=1, max_length=100)
+    description: Optional[str] = Field(None, max_length=500)
+    dimensions: Optional[List[str]] = Field(None, min_length=1)
+    metrics: Optional[List[RollupMetricDef]] = Field(None, min_length=1)
+    target_dataset: Optional[str] = Field(None)
+    target_table_name: Optional[str] = Field(None)
+
+    @model_validator(mode='after')
+    def validate_date_dimension(self):
+        """Ensure date is always included if dimensions are provided."""
+        if self.dimensions is not None and 'date' not in self.dimensions:
+            raise ValueError("'date' must be included in rollup dimensions")
+        return self
+
+
+class RollupRefreshResponse(BaseModel):
+    """Response after triggering a rollup refresh."""
+    success: bool
+    message: str
+    rollup_id: str
+    status: str
+    table_path: Optional[str] = None
+    bytes_processed: Optional[int] = None
+    row_count: Optional[int] = None
+    execution_time_ms: Optional[int] = None
+
+
+class RollupListResponse(BaseModel):
+    """Response listing all rollups."""
+    rollups: List[RollupDef]
+    default_target_dataset: Optional[str] = None
+
+
+class RollupPreviewSqlResponse(BaseModel):
+    """Response containing preview SQL for a rollup."""
+    rollup_id: str
+    sql: str
+    target_table_path: str
