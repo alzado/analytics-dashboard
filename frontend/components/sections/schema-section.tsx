@@ -683,7 +683,7 @@ interface BaseMetricsTabProps {
 function BaseMetricsTab({ metrics, isLoading, onEdit, onDelete, onCreate, calculatedMetrics, onCreateDailyAverage }: BaseMetricsTabProps) {
   const [searchTerm, setSearchTerm] = useState('')
 
-  const filteredMetrics = metrics?.filter((metric) => {
+  const filteredMetrics = (metrics?.filter((metric) => {
     if (!searchTerm) return true
     const term = searchTerm.toLowerCase()
     return (
@@ -692,7 +692,7 @@ function BaseMetricsTab({ metrics, isLoading, onEdit, onDelete, onCreate, calcul
       metric.column_name.toLowerCase().includes(term) ||
       metric.category.toLowerCase().includes(term)
     )
-  }) ?? []
+  }) ?? []).sort((a, b) => a.display_name.localeCompare(b.display_name))
 
   if (isLoading) {
     return <div className="text-center py-8 text-gray-500">Loading base metrics...</div>
@@ -824,7 +824,7 @@ interface CalculatedMetricsTabProps {
 function CalculatedMetricsTab({ metrics, isLoading, onEdit, onDelete, onCreate, onCreateDailyAverage }: CalculatedMetricsTabProps) {
   const [searchTerm, setSearchTerm] = useState('')
 
-  const filteredMetrics = metrics?.filter((metric) => {
+  const filteredMetrics = (metrics?.filter((metric) => {
     if (!searchTerm) return true
     const term = searchTerm.toLowerCase()
     return (
@@ -833,7 +833,7 @@ function CalculatedMetricsTab({ metrics, isLoading, onEdit, onDelete, onCreate, 
       metric.formula.toLowerCase().includes(term) ||
       metric.category.toLowerCase().includes(term)
     )
-  }) ?? []
+  }) ?? []).sort((a, b) => a.display_name.localeCompare(b.display_name))
 
   if (isLoading) {
     return <div className="text-center py-8 text-gray-500">Loading calculated metrics...</div>
@@ -972,7 +972,7 @@ interface DimensionsTabProps {
 function DimensionsTab({ dimensions, isLoading, onEdit, onDelete, onCreate }: DimensionsTabProps) {
   const [searchTerm, setSearchTerm] = useState('')
 
-  const filteredDimensions = dimensions?.filter((dimension) => {
+  const filteredDimensions = (dimensions?.filter((dimension) => {
     if (!searchTerm) return true
     const term = searchTerm.toLowerCase()
     return (
@@ -981,7 +981,7 @@ function DimensionsTab({ dimensions, isLoading, onEdit, onDelete, onCreate }: Di
       dimension.column_name.toLowerCase().includes(term) ||
       dimension.data_type.toLowerCase().includes(term)
     )
-  }) ?? []
+  }) ?? []).sort((a, b) => a.display_name.localeCompare(b.display_name))
 
   if (isLoading) {
     return <div className="text-center py-8 text-gray-500">Loading dimensions...</div>

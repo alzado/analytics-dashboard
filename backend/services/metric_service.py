@@ -20,15 +20,37 @@ class FormulaParser:
     Parses user-friendly metric formulas and converts them to SQL expressions.
 
     Formula syntax:
-    - {metric_id} - reference to a base metric
+    - {metric_id} - reference to a base or calculated metric
     - Operators: +, -, *, /
     - Parentheses: ( )
+    - Comparison operators: >, <, >=, <=, =, !=, <>
+    - Logical operators: AND, OR, NOT
+    - CASE/WHEN expressions: CASE WHEN condition THEN value ELSE value END
     - Functions: SUM, AVG, COUNT, COUNT_DISTINCT, MIN, MAX
+    - Literals: numbers (0.5, 100), strings ('high', 'low')
 
     Examples:
     - {queries_pdp} / {queries} → SAFE_DIVIDE(SUM(queries_pdp), SUM(queries))
     - ({purchases} + {returns}) / {queries} → SAFE_DIVIDE((SUM(purchases) + SUM(returns)), SUM(queries))
+    - CASE WHEN {conversion_rate} > 0.1 THEN 'high' ELSE 'low' END
+    - CASE WHEN {queries} > 1000 THEN {revenue} / {queries} ELSE 0 END
     """
+
+    # SQL keywords that are allowed in formulas (not dangerous)
+    ALLOWED_KEYWORDS = {
+        'CASE', 'WHEN', 'THEN', 'ELSE', 'END',
+        'AND', 'OR', 'NOT', 'IN', 'BETWEEN',
+        'IS', 'NULL', 'TRUE', 'FALSE',
+        'LIKE', 'ILIKE',
+        'SAFE_DIVIDE', 'COALESCE', 'IFNULL', 'NULLIF',
+        'CAST', 'AS', 'STRING', 'INT64', 'FLOAT64', 'BOOL',
+        'ABS', 'ROUND', 'FLOOR', 'CEIL', 'CEILING',
+        'GREATEST', 'LEAST', 'IF',
+        'SUM', 'AVG', 'COUNT', 'MIN', 'MAX',
+        'COUNT_DISTINCT', 'DISTINCT',
+        # BigQuery optimization functions
+        'APPROX_COUNT_DISTINCT', 'FARM_FINGERPRINT', 'CONCAT'
+    }
 
     def __init__(self, schema_service: SchemaService):
         self.schema_service = schema_service
@@ -303,6 +325,32 @@ class FormulaParser:
         # Check for empty braces
         if '{}' in formula:
             errors.append("Empty metric reference found")
+
+        # Validate CASE/WHEN syntax
+        formula_upper = formula.upper()
+
+        # Count CASE and END keywords (they should be balanced)
+        case_count = len(re.findall(r'\bCASE\b', formula_upper))
+        end_count = len(re.findall(r'\bEND\b', formula_upper))
+        if case_count != end_count:
+            errors.append(f"Unbalanced CASE/END: found {case_count} CASE and {end_count} END")
+
+        # If CASE is present, WHEN and THEN should also be present
+        if case_count > 0:
+            when_count = len(re.findall(r'\bWHEN\b', formula_upper))
+            then_count = len(re.findall(r'\bTHEN\b', formula_upper))
+
+            if when_count == 0:
+                errors.append("CASE expression requires at least one WHEN clause")
+
+            if when_count != then_count:
+                errors.append(f"Unbalanced WHEN/THEN: found {when_count} WHEN and {then_count} THEN")
+
+        # Validate string literals are properly quoted
+        # Simple check: count single quotes (should be even)
+        single_quote_count = formula.count("'")
+        if single_quote_count % 2 != 0:
+            errors.append("Unbalanced single quotes in string literals")
 
         return errors
 

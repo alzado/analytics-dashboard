@@ -11,6 +11,7 @@ import {
 } from '@/lib/api'
 import type { QueryLogEntry, UsageTimeSeries } from '@/lib/types'
 import { getQueryTypeInfo, getCostLevelColor, getCostLevelText } from '@/lib/query-types'
+import { CacheManagementSection } from './cache-management-section'
 
 export function UsageLogsSection() {
   const queryClient = useQueryClient()
@@ -19,6 +20,7 @@ export function UsageLogsSection() {
   const [queryTypeFilter, setQueryTypeFilter] = useState<string>('')
   const [dateRange, setDateRange] = useState<{ start: string; end: string } | null>(null)
   const [showClearConfirm, setShowClearConfirm] = useState(false)
+  const [showCacheSection, setShowCacheSection] = useState(true)
 
   // Fetch usage stats
   const { data: stats } = useQuery({
@@ -114,6 +116,34 @@ export function UsageLogsSection() {
 
   return (
     <div className="space-y-6">
+      {/* Cache Section (collapsible) */}
+      <div className="bg-white rounded-lg shadow">
+        <button
+          onClick={() => setShowCacheSection(!showCacheSection)}
+          className="w-full px-6 py-4 flex justify-between items-center hover:bg-gray-50 transition-colors"
+        >
+          <div className="flex items-center gap-3">
+            <svg className="w-5 h-5 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4m0 5c0 2.21-3.582 4-8 4s-8-1.79-8-4" />
+            </svg>
+            <span className="text-lg font-semibold text-gray-900">Query Cache</span>
+          </div>
+          <svg
+            className={`w-5 h-5 text-gray-400 transform transition-transform ${showCacheSection ? 'rotate-180' : ''}`}
+            fill="none"
+            stroke="currentColor"
+            viewBox="0 0 24 24"
+          >
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+          </svg>
+        </button>
+        {showCacheSection && (
+          <div className="px-6 pb-6">
+            <CacheManagementSection />
+          </div>
+        )}
+      </div>
+
       {/* Header */}
       <div className="flex justify-between items-center">
         <div>

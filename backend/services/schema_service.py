@@ -376,6 +376,11 @@ class SchemaService:
         try:
             with open(schema_file, 'r') as f:
                 data = json.load(f)
+
+                # Backward compatibility: ensure calculated_dimensions field exists
+                if 'calculated_dimensions' not in data:
+                    data['calculated_dimensions'] = []
+
                 schema = SchemaConfig(**data)
 
                 # Migrate old schemas to populate new dependency fields

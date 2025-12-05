@@ -19,6 +19,7 @@ from services.bigquery_service import (
 )
 from services.custom_dimension_service import get_custom_dimension_service
 from services.query_logger import initialize_query_logger
+from services.query_cache_service import initialize_query_cache, get_query_cache, QueryCacheService
 from config import CUSTOM_DIMENSIONS_FILE, QUERY_LOGS_DB_PATH, table_registry, dashboard_registry
 from models.schemas import (
     FilterParams,
@@ -48,6 +49,11 @@ from models.schemas import (
     CalculatedMetricUpdate,
     DimensionUpdate,
     PivotConfigUpdate,
+    # Calculated dimension models
+    CalculatedDimensionDef,
+    CalculatedDimensionCreate,
+    CalculatedDimensionUpdate,
+    ExpressionValidationResult,
     # Multi-table models
     TableInfoResponse,
     TableListResponse,
@@ -69,7 +75,10 @@ from models.schemas import (
     SignificanceRequest,
     SignificanceResponse,
     SignificanceResultItem,
-    ColumnDefinition
+    ColumnDefinition,
+    # Cache management models
+    CacheStats,
+    CacheClearResponse
 )
 from services.statistical_service import StatisticalService
 
@@ -127,7 +136,7 @@ def parse_dimension_filters(request: Request) -> Dict[str, List[str]]:
 # Initialize data on startup
 @app.on_event("startup")
 async def startup_event():
-    """Initialize BigQuery connection and query logger on application startup"""
+    """Initialize BigQuery connection, query logger, and query cache on application startup"""
     # Initialize query logger
     try:
         print(f"Initializing query logger at {QUERY_LOGS_DB_PATH}...")
@@ -135,6 +144,14 @@ async def startup_event():
         print("Query logger initialized successfully")
     except Exception as e:
         print(f"Failed to initialize query logger: {e}")
+
+    # Initialize query cache (same DB as query logger)
+    try:
+        print(f"Initializing query cache at {QUERY_LOGS_DB_PATH}...")
+        initialize_query_cache(QUERY_LOGS_DB_PATH)
+        print("Query cache initialized successfully")
+    except Exception as e:
+        print(f"Failed to initialize query cache: {e}")
 
     # Initialize BigQuery for all configured tables
     try:
@@ -1088,6 +1105,152 @@ async def delete_dimension(dimension_id: str, table_id: Optional[str] = Query(No
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# Calculated Dimension Endpoints
+
+def get_calculated_dimension_service(table_id: Optional[str] = None):
+    """Get the calculated dimension service for a table."""
+    from services.calculated_dimension_service import CalculatedDimensionService
+    from services.dimension_expression_parser import DimensionExpressionParser
+    from services.bigquery_service import get_bigquery_service
+
+    schema_service, _, _ = get_schema_services(table_id)
+
+    # Get BigQuery service for expression validation
+    bq_service = get_bigquery_service(table_id)
+    if bq_service:
+        parser = DimensionExpressionParser(bq_service.client, bq_service.table_path)
+    else:
+        parser = DimensionExpressionParser()
+
+    return CalculatedDimensionService(schema_service, parser)
+
+
+@app.get("/api/dimensions/calculated", response_model=List[CalculatedDimensionDef])
+async def list_calculated_dimensions(table_id: Optional[str] = Query(None, description="Table ID")):
+    """List all calculated dimensions"""
+    try:
+        calc_dim_service = get_calculated_dimension_service(table_id)
+        return calc_dim_service.list_calculated_dimensions()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/dimensions/calculated", response_model=CalculatedDimensionDef)
+async def create_calculated_dimension(
+    dimension: CalculatedDimensionCreate,
+    table_id: Optional[str] = Query(None, description="Table ID")
+):
+    """Create a new calculated dimension with SQL expression"""
+    try:
+        calc_dim_service = get_calculated_dimension_service(table_id)
+        return calc_dim_service.create_calculated_dimension(dimension)
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/dimensions/calculated/{dimension_id}", response_model=CalculatedDimensionDef)
+async def get_calculated_dimension(
+    dimension_id: str,
+    table_id: Optional[str] = Query(None, description="Table ID")
+):
+    """Get a specific calculated dimension by ID"""
+    try:
+        calc_dim_service = get_calculated_dimension_service(table_id)
+        dimension = calc_dim_service.get_calculated_dimension(dimension_id)
+        if not dimension:
+            raise HTTPException(status_code=404, detail=f"Calculated dimension '{dimension_id}' not found")
+        return dimension
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/api/dimensions/calculated/{dimension_id}", response_model=CalculatedDimensionDef)
+async def update_calculated_dimension(
+    dimension_id: str,
+    update: CalculatedDimensionUpdate,
+    table_id: Optional[str] = Query(None, description="Table ID")
+):
+    """Update an existing calculated dimension"""
+    try:
+        calc_dim_service = get_calculated_dimension_service(table_id)
+        return calc_dim_service.update_calculated_dimension(dimension_id, update)
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/dimensions/calculated/{dimension_id}")
+async def delete_calculated_dimension(
+    dimension_id: str,
+    table_id: Optional[str] = Query(None, description="Table ID")
+):
+    """Delete a calculated dimension"""
+    try:
+        calc_dim_service = get_calculated_dimension_service(table_id)
+        calc_dim_service.delete_calculated_dimension(dimension_id)
+        return {"success": True, "message": f"Calculated dimension '{dimension_id}' deleted"}
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/dimensions/validate-expression", response_model=ExpressionValidationResult)
+async def validate_dimension_expression(
+    request: dict,
+    table_id: Optional[str] = Query(None, description="Table ID")
+):
+    """
+    Validate a calculated dimension expression without saving.
+
+    Request body:
+        {"expression": "COALESCE(REGEXP_EXTRACT({col1}, r'pattern'), {col2})"}
+
+    Returns validation result including parsed SQL, dependencies, errors, and warnings.
+    """
+    try:
+        expression = request.get("expression", "")
+        if not expression:
+            raise HTTPException(status_code=400, detail="Expression is required")
+
+        calc_dim_service = get_calculated_dimension_service(table_id)
+        return calc_dim_service.validate_expression(expression)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/dimensions/all", response_model=List[dict])
+async def list_all_dimensions(table_id: Optional[str] = Query(None, description="Table ID")):
+    """
+    List all dimensions (regular and calculated) with type indicator.
+
+    Returns list of dicts with dimension info and 'type' field ('regular' or 'calculated').
+    """
+    try:
+        calc_dim_service = get_calculated_dimension_service(table_id)
+        return calc_dim_service.list_all_dimensions()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # Custom Dimension Endpoints
 
 @app.get("/api/custom-dimensions", response_model=List[CustomDimension])
@@ -1397,6 +1560,93 @@ async def clear_query_logs():
             success=True,
             message=f"Successfully cleared {deleted_count} log entries",
             logs_deleted=deleted_count
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# CACHE MANAGEMENT ENDPOINTS
+# ============================================================================
+
+@app.get("/api/cache/stats", response_model=CacheStats)
+async def get_cache_stats():
+    """Get cache statistics"""
+    try:
+        cache = get_query_cache()
+        if cache is None:
+            raise HTTPException(status_code=503, detail="Cache service not initialized")
+
+        stats = cache.get_stats()
+        return CacheStats(**stats)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/cache/clear", response_model=CacheClearResponse)
+async def clear_all_cache():
+    """Clear entire cache"""
+    try:
+        cache = get_query_cache()
+        if cache is None:
+            raise HTTPException(status_code=503, detail="Cache service not initialized")
+
+        count = cache.clear_all()
+        return CacheClearResponse(
+            success=True,
+            message=f"Cleared all cache entries",
+            entries_deleted=count
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/cache/clear/table/{table_id}", response_model=CacheClearResponse)
+async def clear_cache_by_table(table_id: str):
+    """Clear cache for specific table"""
+    try:
+        cache = get_query_cache()
+        if cache is None:
+            raise HTTPException(status_code=503, detail="Cache service not initialized")
+
+        count = cache.clear_by_table(table_id)
+        return CacheClearResponse(
+            success=True,
+            message=f"Cleared cache for table {table_id}",
+            entries_deleted=count
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/cache/clear/type/{query_type}", response_model=CacheClearResponse)
+async def clear_cache_by_query_type(query_type: str):
+    """Clear cache for specific query type"""
+    try:
+        cache = get_query_cache()
+        if cache is None:
+            raise HTTPException(status_code=503, detail="Cache service not initialized")
+
+        valid_types = QueryCacheService.QUERY_TYPES
+        if query_type not in valid_types:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid query type. Must be one of: {', '.join(valid_types)}"
+            )
+
+        count = cache.clear_by_query_type(query_type)
+        return CacheClearResponse(
+            success=True,
+            message=f"Cleared cache for query type {query_type}",
+            entries_deleted=count
         )
     except HTTPException:
         raise

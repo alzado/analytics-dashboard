@@ -18,7 +18,7 @@ import { SignificanceIndicator, SignificanceButton } from '@/components/pivot/si
 import { useSignificance } from '@/hooks/use-significance'
 import DashboardSelectorModal from '@/components/modals/dashboard-selector-modal'
 import { WidgetSelectorModal, type WidgetSelection } from '@/components/modals/widget-selector-modal'
-import ExportModal, { type ExportFormat, type ExportData } from '@/components/modals/export-modal'
+import ExportModal, { type ExportFormat, type ExportData, type ExportOptions } from '@/components/modals/export-modal'
 import type { WidgetCreateRequest } from '@/lib/api'
 import html2canvas from 'html2canvas'
 
@@ -655,7 +655,8 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
         return results
       }
 
-      const dims = fetchedDimensions.length > 0 ? [fetchedDimensions[0]] : []
+      // Pass ALL selected dimensions to create combined rows (e.g., "Channel A - Country A")
+      const dims = fetchedDimensions
 
       // Helper function to build table filters for a combination
       const buildTableFilters = (combination: any) => {
@@ -760,13 +761,13 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
     enabled: fetchRequested && isConfigured && fetchedTableDimensions.length > 0 && tableCombinations.length > 0,
   })
 
-  // Only query the first dimension for hierarchical drill-down
+  // Pass ALL selected dimensions to create combined rows (e.g., "Channel A - Country A")
   // Use fetched dimensions for stable query keys
-  const firstFetchedDimension = fetchedDimensions.length > 0 ? [fetchedDimensions[0]] : []
+  const allFetchedDimensions = fetchedDimensions
 
   // Main pivot data query - uses fetchedConfig values for stable query keys
   const { data: pivotData, isLoading, error } = useQuery({
-    queryKey: ['pivot', firstFetchedDimension, fetchedFilters, fetchedTable, fetchedMetrics],
+    queryKey: ['pivot', allFetchedDimensions, fetchedFilters, fetchedTable, fetchedMetrics],
     queryFn: () => {
       if (!fetchedFilters) return Promise.resolve({ rows: [], total: {} })
       // If no dimensions, create a single "All Data" row manually
@@ -783,7 +784,8 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
           }
         })
       }
-      return fetchPivotData(firstFetchedDimension, fetchedFilters, 100, 0, undefined, fetchedTable || undefined, true, fetchedMetrics)
+      // Pass all dimensions for combined row display
+      return fetchPivotData(allFetchedDimensions, fetchedFilters, 100, 0, undefined, fetchedTable || undefined, true, fetchedMetrics)
     },
     enabled: fetchRequested && isConfigured, // Only fetch when data source and date range are configured AND fetch is requested
   })
@@ -837,12 +839,11 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
       rows = pivotData?.rows || []
     }
 
-    // Mark rows as having children ONLY if there are more dimensions to drill into (never show search terms)
+    // Combined dimensions don't support drill-down - all dimensions are already in a single row
     // Also convert backend percentage (0-100) to decimal (0-1) for consistent formatting
-    const hasMoreDimensions = selectedDimensions.length > 1
     let rowsWithChildren = rows.map(row => ({
       ...row,
-      has_children: hasMoreDimensions, // Only allow drilling to next dimension, never to search terms
+      has_children: false, // No drill-down for combined dimensions
       percentage_of_total: row.percentage_of_total / 100, // Convert from 0-100 to 0-1
     }))
 
@@ -2056,7 +2057,8 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
   }
 
   // Build export data for modal
-  const getExportData = (): ExportData | null => {
+  // rowLimit: optional limit on number of dimension value rows (for PNG export)
+  const getExportData = (rowLimit?: number): ExportData | null => {
     // Build metadata
     const dateRange = pivotFilters.date_range_type === 'relative' && pivotFilters.relative_date_preset
       ? `${pivotFilters.relative_date_preset} (${config.startDate} to ${config.endDate})`
@@ -2100,7 +2102,7 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
 
       // Build headers: Dimension | Metric | Col1 Value | Col2 Value | Col2 Diff | Col2 % Diff | ...
       const dimensionLabel = selectedDimensions.length > 0
-        ? getDimensionLabel(selectedDimensions[0])
+        ? selectedDimensions.map(d => getDimensionLabel(d)).join(' - ')
         : 'Total'
 
       const headers: string[] = [dimensionLabel, 'Metric']
@@ -2119,9 +2121,15 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
       const rows: (string | number)[][] = []
 
       // Get dimension values from first column
-      const dimensionValues = selectedDimensions.length === 0
+      const allDimensionValues = selectedDimensions.length === 0
         ? ['Total']
         : firstColData.rows.map((r: any) => r.dimension_value)
+
+      // Apply row limit if specified (limit dimension values, not metric rows)
+      const dimensionRowCount = allDimensionValues.length
+      const dimensionValues = rowLimit && rowLimit < allDimensionValues.length
+        ? allDimensionValues.slice(0, rowLimit)
+        : allDimensionValues
 
       dimensionValues.forEach((dimValue: string) => {
         selectedMetrics.forEach((metricId) => {
@@ -2177,18 +2185,25 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
         },
         headers,
         rows,
+        dimensionRowCount,  // Total dimension values before any limit
       }
     } else {
       // Single table mode (original behavior)
       if (!pivotData?.rows) return null
 
       const dimensionLabel = selectedDimensions.length > 0
-        ? getDimensionLabel(selectedDimensions[0])
+        ? selectedDimensions.map(d => getDimensionLabel(d)).join(' - ')
         : 'Dimension'
       const metricHeaders = selectedMetrics.map(m => getMetricById(m)?.label || m)
       const headers = [dimensionLabel, ...metricHeaders]
 
-      const rows = pivotData.rows.map(row => {
+      // Apply row limit if specified
+      const dimensionRowCount = pivotData.rows.length
+      const rowsToExport = rowLimit && rowLimit < pivotData.rows.length
+        ? pivotData.rows.slice(0, rowLimit)
+        : pivotData.rows
+
+      const rows = rowsToExport.map(row => {
         const metricValues = selectedMetrics.map(metricId => {
           const value = row.metrics[metricId]
           return formatMetricValue(value, metricId)
@@ -2208,20 +2223,21 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
         },
         headers,
         rows,
+        dimensionRowCount,  // Total rows before any limit
       }
     }
   }
 
   // Handle export based on format
-  const handleExport = async (format: ExportFormat) => {
-    const data = getExportData()
+  const handleExport = async (options: ExportOptions) => {
+    const data = getExportData(options.rowLimit)
     if (!data) return
 
-    if (format === 'csv') {
+    if (options.format === 'csv') {
       exportAsCSV(data)
-    } else if (format === 'html') {
+    } else if (options.format === 'html') {
       exportAsHTML(data)
-    } else if (format === 'png') {
+    } else if (options.format === 'png') {
       await exportAsPNG(data)
     }
   }
@@ -2532,16 +2548,24 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
         }).join(' | ')
       }
 
-      // Get dimension values from processedRows (which respects sort order)
-      const dimensionValues = selectedDimensions.length === 0
-        ? ['Total']
-        : processedRows.map((r: any) => r.dimension_value)
+      // Extract unique dimension values from data.rows (respects row limit)
+      // In multi-table mode, data.rows format is: [dimValue, metricLabel, ...values]
+      // Each dimension value appears multiple times (once per metric), so we need unique values
+      const dimensionValues: string[] = []
+      const seenDimValues = new Set<string>()
+      data.rows.forEach(row => {
+        const dimValue = String(row[0])
+        if (!seenDimValues.has(dimValue)) {
+          seenDimValues.add(dimValue)
+          dimensionValues.push(dimValue)
+        }
+      })
 
       // Build header rows
       const headerRow1 = `
         <tr style="background: #f9fafb;">
           <th style="padding: 12px 16px; text-align: left; font-weight: 600; border-bottom: 1px solid #e5e7eb; border-right: 1px solid #e5e7eb; white-space: nowrap; color: #111827;">
-            ${selectedDimensions.length > 0 ? getDimensionLabel(selectedDimensions[0]) : 'Summary'}
+            ${selectedDimensions.length > 0 ? selectedDimensions.map(d => getDimensionLabel(d)).join(' - ') : 'Summary'}
           </th>
           <th style="padding: 12px 16px; text-align: left; font-weight: 600; border-bottom: 1px solid #e5e7eb; border-right: 2px solid #d1d5db; white-space: nowrap; color: #111827;">
             Metric
@@ -3004,6 +3028,7 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
                 hasResults={hasSignificanceResults}
                 disabled={!isConfigured}
                 columnCount={columnOrder.length}
+                totalRows={processedRows.length}
               />
             )}
             <button
@@ -3246,7 +3271,7 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
                           <span>
                             {selectedDimensions.length === 0
                               ? 'Summary'
-                              : getDimensionLabel(selectedDimensions[0])}
+                              : selectedDimensions.map(d => getDimensionLabel(d)).join(' - ')}
                           </span>
                           {selectedDimensions.length > 0 && (
                             <span className="text-gray-400">
@@ -3897,7 +3922,7 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
                     <span>
                       {selectedDimensions.length === 0
                         ? 'Summary'
-                        : getDimensionLabel(selectedDimensions[0])}
+                        : selectedDimensions.map(d => getDimensionLabel(d)).join(' - ')}
                     </span>
                     {selectedDimensions.length > 0 && (
                       <span className="text-gray-400">

@@ -337,7 +337,7 @@ class BaseMetric(BaseModel):
     id: str = Field(..., description="Unique identifier (e.g., 'queries', 'revenue')")
     column_name: str = Field(..., description="Actual BigQuery column name (or comma-separated columns for multi-column COUNT_DISTINCT)")
     display_name: str = Field(..., description="Human-readable name for UI")
-    aggregation: Literal["SUM", "COUNT", "AVG", "MIN", "MAX", "COUNT_DISTINCT"] = Field(default="SUM", description="SQL aggregation function")
+    aggregation: Literal["SUM", "COUNT", "AVG", "MIN", "MAX", "COUNT_DISTINCT", "APPROX_COUNT_DISTINCT"] = Field(default="SUM", description="SQL aggregation function")
     data_type: Literal["INTEGER", "FLOAT", "NUMERIC"] = Field(default="INTEGER", description="Data type")
     format_type: Literal["number", "currency", "percent"] = Field(default="number", description="Display format")
     decimal_places: int = Field(default=0, description="Number of decimal places to show")
@@ -382,11 +382,61 @@ class DimensionDef(BaseModel):
     filter_type: Optional[Literal["single", "multi", "range", "date_range", "boolean"]] = Field(None, description="Type of filter UI to show")
     description: Optional[str] = Field(None, description="Dimension description")
 
+
+class CalculatedDimensionDef(BaseModel):
+    """A calculated dimension with a SQL expression that can reference table columns using {column_name} syntax"""
+    id: str = Field(..., description="Unique identifier (e.g., 'rec_id', 'search_category')")
+    display_name: str = Field(..., description="Human-readable name for UI")
+    sql_expression: str = Field(..., description="SQL expression with {column} references. Example: COALESCE(REGEXP_EXTRACT({col1}, r'pattern'), {col2})")
+    data_type: Literal["STRING", "INTEGER", "FLOAT", "DATE", "BOOLEAN"] = Field(default="STRING", description="Output data type")
+    is_filterable: bool = Field(default=True, description="Can be used in filters")
+    is_groupable: bool = Field(default=True, description="Can be used for GROUP BY")
+    sort_order: int = Field(default=999, description="Display order in UI")
+    filter_type: Optional[Literal["single", "multi", "range", "date_range", "boolean"]] = Field(default="multi", description="Type of filter UI to show")
+    depends_on: List[str] = Field(default_factory=list, description="Column names referenced in the expression")
+    description: Optional[str] = Field(None, description="Dimension description")
+
+
+class CalculatedDimensionCreate(BaseModel):
+    """Request to create a calculated dimension"""
+    id: Optional[str] = Field(None, description="Unique ID (auto-generated from display_name if not provided)")
+    display_name: str = Field(..., min_length=1, max_length=100, description="Human-readable name")
+    sql_expression: str = Field(..., min_length=1, description="SQL expression with {column} references")
+    data_type: Literal["STRING", "INTEGER", "FLOAT", "DATE", "BOOLEAN"] = Field(default="STRING", description="Output data type")
+    is_filterable: bool = Field(default=True, description="Can be used in filters")
+    is_groupable: bool = Field(default=True, description="Can be used for GROUP BY")
+    sort_order: int = Field(default=999, description="Display order in UI")
+    filter_type: Optional[Literal["single", "multi", "range", "date_range", "boolean"]] = Field(default="multi", description="Type of filter UI to show")
+    description: Optional[str] = Field(None, description="Dimension description")
+
+
+class CalculatedDimensionUpdate(BaseModel):
+    """Request to update a calculated dimension (partial update)"""
+    display_name: Optional[str] = Field(None, min_length=1, max_length=100, description="Human-readable name")
+    sql_expression: Optional[str] = Field(None, min_length=1, description="SQL expression with {column} references")
+    data_type: Optional[Literal["STRING", "INTEGER", "FLOAT", "DATE", "BOOLEAN"]] = Field(None, description="Output data type")
+    is_filterable: Optional[bool] = Field(None, description="Can be used in filters")
+    is_groupable: Optional[bool] = Field(None, description="Can be used for GROUP BY")
+    sort_order: Optional[int] = Field(None, description="Display order in UI")
+    filter_type: Optional[Literal["single", "multi", "range", "date_range", "boolean"]] = Field(None, description="Type of filter UI to show")
+    description: Optional[str] = Field(None, description="Dimension description")
+
+
+class ExpressionValidationResult(BaseModel):
+    """Result of validating a calculated dimension expression"""
+    valid: bool = Field(..., description="Whether the expression is valid")
+    errors: List[str] = Field(default_factory=list, description="List of validation errors")
+    sql_expression: str = Field(default="", description="Compiled SQL expression (with {column} replaced)")
+    depends_on: List[str] = Field(default_factory=list, description="Column names referenced in the expression")
+    warnings: List[str] = Field(default_factory=list, description="Non-fatal warnings")
+
+
 class SchemaConfig(BaseModel):
     """Complete schema configuration with all metrics and dimensions"""
     base_metrics: List[BaseMetric] = Field(default_factory=list, description="List of base metrics")
     calculated_metrics: List[CalculatedMetric] = Field(default_factory=list, description="List of calculated metrics")
     dimensions: List[DimensionDef] = Field(default_factory=list, description="List of dimensions")
+    calculated_dimensions: List[CalculatedDimensionDef] = Field(default_factory=list, description="List of calculated dimensions with SQL expressions")
 
     # Pivot table settings
     primary_sort_metric: Optional[str] = Field(None, description="Default metric ID to sort pivot tables by")
@@ -409,7 +459,7 @@ class MetricCreate(BaseModel):
     id: str
     column_name: str
     display_name: str
-    aggregation: Literal["SUM", "COUNT", "AVG", "MIN", "MAX", "COUNT_DISTINCT"] = "SUM"
+    aggregation: Literal["SUM", "COUNT", "AVG", "MIN", "MAX", "COUNT_DISTINCT", "APPROX_COUNT_DISTINCT"] = "SUM"
     data_type: Literal["INTEGER", "FLOAT", "NUMERIC"] = "INTEGER"
     format_type: Literal["number", "currency", "percent"] = "number"
     decimal_places: int = 0
@@ -445,7 +495,7 @@ class DimensionCreate(BaseModel):
 class MetricUpdate(BaseModel):
     """Request to update a metric (partial update)"""
     display_name: Optional[str] = None
-    aggregation: Optional[Literal["SUM", "COUNT", "AVG", "MIN", "MAX", "COUNT_DISTINCT"]] = None
+    aggregation: Optional[Literal["SUM", "COUNT", "AVG", "MIN", "MAX", "COUNT_DISTINCT", "APPROX_COUNT_DISTINCT"]] = None
     format_type: Optional[Literal["number", "currency", "percent"]] = None
     decimal_places: Optional[int] = None
     category: Optional[str] = None
@@ -660,3 +710,40 @@ class SignificanceResponse(BaseModel):
     """Response containing all significance results."""
     control_column_index: int = Field(..., description="Index of the control column")
     results: Dict[str, List[SignificanceResultItem]] = Field(..., description="Results per metric: {metric_id: [results per treatment column]}")
+
+
+# ============================================================================
+# Cache Management Models
+# ============================================================================
+
+class CacheTableStats(BaseModel):
+    """Cache statistics per table."""
+    table_id: str
+    entries: int
+    size_bytes: int
+    hits: int
+
+class CacheQueryTypeStats(BaseModel):
+    """Cache statistics per query type."""
+    query_type: str
+    entries: int
+    size_bytes: int
+    hits: int
+
+class CacheStats(BaseModel):
+    """Cache statistics response."""
+    total_entries: int
+    total_size_bytes: int
+    total_size_mb: float
+    total_hits: int
+    avg_hits_per_entry: float
+    oldest_entry: Optional[str] = None
+    newest_entry: Optional[str] = None
+    by_table: List[Dict[str, Any]]
+    by_query_type: List[Dict[str, Any]]
+
+class CacheClearResponse(BaseModel):
+    """Response after clearing cache."""
+    success: bool
+    message: str
+    entries_deleted: int

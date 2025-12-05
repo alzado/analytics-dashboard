@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useEffect, useMemo, useRef } from 'react'
 import { X, GripVertical, Settings, Database, Calendar, ChevronDown, ChevronRight, Plus, Edit, Copy, Trash2 } from 'lucide-react'
 import { SearchInput } from '@/components/ui/search-input'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
@@ -444,14 +444,29 @@ export function PivotConfigPanel({
     retry: false,
   })
 
-  // Auto-set start and end dates when table is selected or changed
+  // Track the previous table to detect actual table changes (not just mount)
+  const prevTableRef = useRef<string | null | undefined>(undefined) // undefined = not yet initialized
+
+  // Auto-set start and end dates only when table actually changes (user selects different table)
   useEffect(() => {
     if (dateRangeInfo?.has_date_column && dateRangeInfo.min_date && dateRangeInfo.max_date) {
-      // Always update dates to match the table's available range
-      updateStartDate(dateRangeInfo.min_date)
-      updateEndDate(dateRangeInfo.max_date)
+      const isFirstMount = prevTableRef.current === undefined
+      const tableActuallyChanged = !isFirstMount && prevTableRef.current !== config.selectedTable
+      const noDatesSet = !config.startDate && !config.endDate
+
+      // Only auto-set dates if:
+      // 1. The table actually changed (user selected a different table), OR
+      // 2. No dates are currently set at all
+      // Do NOT auto-set on first mount if dates already exist
+      if (tableActuallyChanged || noDatesSet) {
+        updateStartDate(dateRangeInfo.min_date)
+        updateEndDate(dateRangeInfo.max_date)
+      }
+
+      // Always update the ref to track current table
+      prevTableRef.current = config.selectedTable
     }
-  }, [dateRangeInfo?.min_date, dateRangeInfo?.max_date, config.selectedTable])
+  }, [dateRangeInfo?.min_date, dateRangeInfo?.max_date, config.selectedTable, config.startDate, config.endDate])
 
   // Filter out metrics that are already selected
   const selectedMetrics = config.selectedMetrics || []
@@ -459,16 +474,18 @@ export function PivotConfigPanel({
     (m) => !selectedMetrics.includes(m.id)
   )
 
-  // Filter metrics by search term
-  const filteredMetrics = availableMetricsToAdd.filter((m) => {
-    if (!metricSearch) return true
-    const term = metricSearch.toLowerCase()
-    return (
-      m.label.toLowerCase().includes(term) ||
-      m.id.toLowerCase().includes(term) ||
-      m.category.toLowerCase().includes(term)
-    )
-  })
+  // Filter metrics by search term and sort alphabetically
+  const filteredMetrics = availableMetricsToAdd
+    .filter((m) => {
+      if (!metricSearch) return true
+      const term = metricSearch.toLowerCase()
+      return (
+        m.label.toLowerCase().includes(term) ||
+        m.id.toLowerCase().includes(term) ||
+        m.category.toLowerCase().includes(term)
+      )
+    })
+    .sort((a, b) => a.label.localeCompare(b.label))
 
   // Filter out dimensions that are already selected (either as row or table dimensions)
   const selectedDimensions = config.selectedDimensions || []
@@ -477,32 +494,38 @@ export function PivotConfigPanel({
     (d) => !selectedDimensions.includes(d.value) && !selectedTableDimensions.includes(d.value)
   )
 
-  // Filter dimensions by search term
-  const filteredDimensions = availableDimensionsToAdd.filter((d) => {
-    if (!dimensionSearch) return true
-    const term = dimensionSearch.toLowerCase()
-    return (
-      d.label.toLowerCase().includes(term) ||
-      d.value.toLowerCase().includes(term)
-    )
-  })
+  // Filter dimensions by search term and sort alphabetically
+  const filteredDimensions = availableDimensionsToAdd
+    .filter((d) => {
+      if (!dimensionSearch) return true
+      const term = dimensionSearch.toLowerCase()
+      return (
+        d.label.toLowerCase().includes(term) ||
+        d.value.toLowerCase().includes(term)
+      )
+    })
+    .sort((a, b) => a.label.localeCompare(b.label))
 
-  // Filter custom dimensions by search term
-  const filteredCustomDimensions = customDimensions.filter((d) => {
-    if (!dimensionSearch) return true
-    const term = dimensionSearch.toLowerCase()
-    return d.name.toLowerCase().includes(term)
-  })
+  // Filter custom dimensions by search term and sort alphabetically
+  const filteredCustomDimensions = customDimensions
+    .filter((d) => {
+      if (!dimensionSearch) return true
+      const term = dimensionSearch.toLowerCase()
+      return d.name.toLowerCase().includes(term)
+    })
+    .sort((a, b) => a.name.localeCompare(b.name))
 
-  // Filter filterable dimensions by search term
-  const filteredFilterableDimensions = filterableDimensions.filter((d) => {
-    if (!filterSearch) return true
-    const term = filterSearch.toLowerCase()
-    return (
-      d.display_name.toLowerCase().includes(term) ||
-      d.id.toLowerCase().includes(term)
-    )
-  })
+  // Filter filterable dimensions by search term and sort alphabetically
+  const filteredFilterableDimensions = filterableDimensions
+    .filter((d) => {
+      if (!filterSearch) return true
+      const term = filterSearch.toLowerCase()
+      return (
+        d.display_name.toLowerCase().includes(term) ||
+        d.id.toLowerCase().includes(term)
+      )
+    })
+    .sort((a, b) => a.display_name.localeCompare(b.display_name))
 
   // Group available metrics by category
   const metricsByCategory = filteredMetrics.reduce((acc, metric) => {

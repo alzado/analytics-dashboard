@@ -290,6 +290,7 @@ export function SignificanceIndicator({
 
   // Format probability as percentage with 2 decimals
   const probPercent = (prob_beat_control * 100).toFixed(2)
+  const inverseProbPercent = ((1 - prob_beat_control) * 100).toFixed(2)
 
   // Determine display based on probability and significance
   // Always show arrow direction and probability, but color indicates significance
@@ -310,7 +311,7 @@ export function SignificanceIndicator({
     } else if (direction === 'worse') {
       icon = '▼'
       colorClass = 'text-red-600'
-      label = `${100 - probPercent}%`  // Show probability of being worse
+      label = `${inverseProbPercent}%`  // Show probability of being worse
     } else {
       icon = '~'
       colorClass = 'text-gray-500'
@@ -325,7 +326,7 @@ export function SignificanceIndicator({
     } else if (likelyWorse) {
       icon = '▼'
       colorClass = 'text-gray-400'  // Gray - not significant
-      label = `${100 - probPercent}%`  // Show probability of being worse
+      label = `${inverseProbPercent}%`  // Show probability of being worse
     } else {
       // Exactly 50%
       icon = '~'
@@ -384,11 +385,12 @@ export function SignificanceIndicator({
  * Badge showing significance test button or status
  */
 interface SignificanceButtonProps {
-  onClick: () => void
+  onClick: (rowLimit?: number) => void
   isLoading: boolean
   hasResults: boolean
   disabled?: boolean
   columnCount: number
+  totalRows: number
 }
 
 export function SignificanceButton({
@@ -396,56 +398,138 @@ export function SignificanceButton({
   isLoading,
   hasResults,
   disabled = false,
-  columnCount
+  columnCount,
+  totalRows
 }: SignificanceButtonProps) {
+  const [isModalOpen, setIsModalOpen] = useState(false)
+  const [rowLimit, setRowLimit] = useState<string>('')
   const canRun = columnCount >= 2 && !disabled
 
+  const handleRunTest = () => {
+    const limit = rowLimit ? parseInt(rowLimit, 10) : undefined
+    if (limit && !isNaN(limit) && limit > 0) {
+      onClick(limit)
+    } else {
+      onClick(undefined)
+    }
+    setIsModalOpen(false)
+  }
+
+  const modalContent = isModalOpen && typeof window !== 'undefined' ? createPortal(
+    <div className="fixed inset-0 z-50 flex items-center justify-center">
+      {/* Backdrop */}
+      <div
+        className="absolute inset-0 bg-black/50"
+        onClick={() => setIsModalOpen(false)}
+      />
+
+      {/* Modal */}
+      <div className="relative bg-white rounded-lg shadow-xl w-full max-w-sm mx-4">
+        {/* Header */}
+        <div className="px-5 py-3 border-b border-gray-200">
+          <h2 className="text-lg font-semibold text-gray-900 flex items-center gap-2">
+            📊 Run Significance Test
+          </h2>
+        </div>
+
+        {/* Content */}
+        <div className="p-5">
+          <p className="text-sm text-gray-600 mb-4">
+            Run statistical significance test comparing treatment columns against the control (starred) column.
+          </p>
+
+          <div className="mb-4">
+            <label htmlFor="sigRowLimit" className="block text-sm font-medium text-gray-700 mb-1">
+              Number of rows to test
+            </label>
+            <div className="flex items-center gap-2">
+              <input
+                id="sigRowLimit"
+                type="number"
+                min="1"
+                max={totalRows}
+                value={rowLimit}
+                onChange={(e) => setRowLimit(e.target.value)}
+                placeholder={`All (${totalRows})`}
+                className="flex-1 px-3 py-2 text-sm border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+              />
+              <span className="text-sm text-gray-500">of {totalRows}</span>
+            </div>
+            <p className="mt-1 text-xs text-gray-500">
+              Leave empty to test all rows. Limiting rows can speed up the test.
+            </p>
+          </div>
+        </div>
+
+        {/* Footer */}
+        <div className="px-5 py-3 border-t border-gray-200 flex justify-end gap-2">
+          <button
+            onClick={() => setIsModalOpen(false)}
+            className="px-4 py-2 text-sm border border-gray-300 text-gray-700 rounded-md hover:bg-gray-50 transition-colors"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={handleRunTest}
+            className="px-4 py-2 text-sm bg-blue-600 text-white rounded-md hover:bg-blue-700 transition-colors flex items-center gap-1.5"
+          >
+            📊 Run Test
+          </button>
+        </div>
+      </div>
+    </div>,
+    document.body
+  ) : null
+
   return (
-    <button
-      onClick={onClick}
-      disabled={!canRun || isLoading}
-      className={`
-        px-3 py-1.5 text-xs font-medium rounded-md transition-colors
-        flex items-center gap-1.5
-        ${canRun
-          ? hasResults
-            ? 'bg-green-100 text-green-700 hover:bg-green-200 border border-green-300'
-            : 'bg-blue-100 text-blue-700 hover:bg-blue-200 border border-blue-300'
-          : 'bg-gray-100 text-gray-400 cursor-not-allowed border border-gray-200'
+    <>
+      <button
+        onClick={() => setIsModalOpen(true)}
+        disabled={!canRun || isLoading}
+        className={`
+          px-3 py-1.5 text-xs font-medium rounded-md transition-colors
+          flex items-center gap-1.5
+          ${canRun
+            ? hasResults
+              ? 'bg-green-100 text-green-700 hover:bg-green-200 border border-green-300'
+              : 'bg-blue-100 text-blue-700 hover:bg-blue-200 border border-blue-300'
+            : 'bg-gray-100 text-gray-400 cursor-not-allowed border border-gray-200'
+          }
+        `}
+        title={
+          !canRun
+            ? 'Need at least 2 columns to run significance test'
+            : 'Run significance test for rate metrics (only percent-format metrics with simple A/B formulas)'
         }
-      `}
-      title={
-        !canRun
-          ? 'Need at least 2 columns to run significance test'
-          : 'Run significance test for rate metrics (only percent-format metrics with simple A/B formulas)'
-      }
-    >
-      {isLoading ? (
-        <>
-          <svg className="animate-spin h-3 w-3" viewBox="0 0 24 24">
-            <circle
-              className="opacity-25"
-              cx="12"
-              cy="12"
-              r="10"
-              stroke="currentColor"
-              strokeWidth="4"
-              fill="none"
-            />
-            <path
-              className="opacity-75"
-              fill="currentColor"
-              d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
-            />
-          </svg>
-          <span>Testing...</span>
-        </>
-      ) : (
-        <>
-          <span>{hasResults ? '✓' : '📊'}</span>
-          <span>Run Significance Test</span>
-        </>
-      )}
-    </button>
+      >
+        {isLoading ? (
+          <>
+            <svg className="animate-spin h-3 w-3" viewBox="0 0 24 24">
+              <circle
+                className="opacity-25"
+                cx="12"
+                cy="12"
+                r="10"
+                stroke="currentColor"
+                strokeWidth="4"
+                fill="none"
+              />
+              <path
+                className="opacity-75"
+                fill="currentColor"
+                d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
+              />
+            </svg>
+            <span>Testing...</span>
+          </>
+        ) : (
+          <>
+            <span>{hasResults ? '✓' : '📊'}</span>
+            <span>Run Significance Test</span>
+          </>
+        )}
+      </button>
+      {modalContent}
+    </>
   )
 }

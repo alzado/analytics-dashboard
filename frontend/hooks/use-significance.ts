@@ -44,8 +44,8 @@ interface UseSignificanceReturn {
   isLoading: boolean
   /** Error message if test failed */
   error: string | null
-  /** Run the significance test */
-  runSignificanceTest: () => void
+  /** Run the significance test with optional row limit */
+  runSignificanceTest: (rowLimit?: number) => void
   /** Clear significance results */
   clearResults: () => void
   /** Get significance result for a specific cell (with optional rowId for per-row results) */
@@ -133,20 +133,37 @@ export function useSignificance({
     if (treatmentColumns.length === 0) return null
 
     // Build rows array for per-row testing
-    // Each row is defined by its dimension value(s) from the first row dimension
+    // Each row is defined by its dimension value(s) from the row dimensions
+    // When multiple dimensions are combined (e.g., "value1 - value2"), split them back
     const rows: RowDefinition[] = []
     if (pivotRows.length > 0 && selectedRowDimensions.length > 0) {
-      const primaryRowDimension = selectedRowDimensions[0]
-
       for (const row of pivotRows) {
         // Skip "Other" merged rows - they can't be tested individually
         if (row.dimension_value === 'Other') continue
 
+        const dimensionFilters: Record<string, string[]> = {}
+
+        if (selectedRowDimensions.length === 1) {
+          // Single dimension - use value directly
+          dimensionFilters[selectedRowDimensions[0]] = [row.dimension_value]
+        } else {
+          // Multiple dimensions - split the combined value by " - " separator
+          const values = row.dimension_value.split(' - ')
+          selectedRowDimensions.forEach((dim, index) => {
+            if (values[index] !== undefined) {
+              // Handle __NULL__ marker
+              const value = values[index] === '__NULL__' ? null : values[index]
+              if (value !== null) {
+                dimensionFilters[dim] = [value]
+              }
+              // Note: If value is null, we don't add a filter (backend handles NULL separately)
+            }
+          })
+        }
+
         rows.push({
           row_id: row.dimension_value,
-          dimension_filters: {
-            [primaryRowDimension]: [row.dimension_value]
-          }
+          dimension_filters: dimensionFilters
         })
       }
     }
@@ -180,11 +197,21 @@ export function useSignificance({
     retry: false
   })
 
-  // Run the significance test
-  const runSignificanceTest = useCallback(() => {
+  // Run the significance test with optional row limit
+  const runSignificanceTest = useCallback((rowLimit?: number) => {
     if (!significanceRequest) return
+
+    // Apply row limit if specified
+    let requestToRun = significanceRequest
+    if (rowLimit && significanceRequest.rows && significanceRequest.rows.length > rowLimit) {
+      requestToRun = {
+        ...significanceRequest,
+        rows: significanceRequest.rows.slice(0, rowLimit)
+      }
+    }
+
     // Store current request as snapshot for stable query keys
-    setFetchedRequest(significanceRequest)
+    setFetchedRequest(requestToRun)
     if (!testRequested) {
       // First time - enable the query
       setTestRequested(true)

@@ -126,6 +126,17 @@ class BigQueryService:
                 # BigQuery syntax: COUNT(DISTINCT col1, col2, col3)
                 columns = metric.column_name.strip()
                 select_parts.append(f"COUNT(DISTINCT {columns}) as {metric.id}")
+            elif metric.aggregation == 'APPROX_COUNT_DISTINCT':
+                # Approximate count distinct - faster and cheaper for large datasets (~2% error)
+                # Support multi-column with FARM_FINGERPRINT for combining columns
+                columns = metric.column_name.strip()
+                if ',' in columns:
+                    # Multiple columns: use FARM_FINGERPRINT(CONCAT(...)) for hashing
+                    col_list = [c.strip() for c in columns.split(',')]
+                    concat_cols = ', '.join([f"COALESCE(CAST({c} AS STRING), '')" for c in col_list])
+                    select_parts.append(f"APPROX_COUNT_DISTINCT(FARM_FINGERPRINT(CONCAT({concat_cols}))) as {metric.id}")
+                else:
+                    select_parts.append(f"APPROX_COUNT_DISTINCT({columns}) as {metric.id}")
             else:
                 select_parts.append(f"{metric.aggregation}({metric.column_name}) as {metric.id}")
 
@@ -151,6 +162,264 @@ class BigQueryService:
 
         return [dim.column_name for dim in self.schema_config.dimensions]
 
+    def _get_calculated_dimension(self, dimension_id: str):
+        """
+        Get a calculated dimension definition by ID from schema.
+
+        Args:
+            dimension_id: The calculated dimension ID to look up
+
+        Returns:
+            CalculatedDimensionDef if found, None otherwise
+        """
+        if not self.schema_config:
+            return None
+
+        if not hasattr(self.schema_config, 'calculated_dimensions') or not self.schema_config.calculated_dimensions:
+            return None
+
+        return next(
+            (d for d in self.schema_config.calculated_dimensions if d.id == dimension_id),
+            None
+        )
+
+    def _is_calculated_dimension(self, dimension_id: str) -> bool:
+        """
+        Check if a dimension ID refers to a calculated dimension.
+
+        Args:
+            dimension_id: Dimension ID to check
+
+        Returns:
+            True if it's a calculated dimension
+        """
+        return self._get_calculated_dimension(dimension_id) is not None
+
+    def _get_regular_dimension(self, dimension_id: str):
+        """
+        Get a regular dimension definition by ID from schema.
+
+        Args:
+            dimension_id: The dimension ID to look up
+
+        Returns:
+            DimensionDef if found, None otherwise
+        """
+        if not self.schema_config:
+            return None
+
+        return next(
+            (d for d in self.schema_config.dimensions if d.id == dimension_id),
+            None
+        )
+
+    def build_subquery_with_calculated_dimensions(
+        self,
+        calculated_dim_ids: List[str],
+        base_where_clause: str = ""
+    ) -> str:
+        """
+        Build a subquery that computes calculated dimension values.
+
+        This wraps the base table in a subquery that adds calculated dimension columns.
+        The outer query can then GROUP BY or filter on these calculated dimension aliases.
+
+        Args:
+            calculated_dim_ids: List of calculated dimension IDs to include
+            base_where_clause: WHERE clause for base filters (dates, regular dimensions)
+
+        Returns:
+            Subquery SQL string ready to be used as FROM source
+        """
+        if not calculated_dim_ids:
+            # No calculated dimensions - just return table reference
+            return f"`{self.table_path}`"
+
+        # Build calculated dimension expressions
+        calc_dim_expressions = []
+        for dim_id in calculated_dim_ids:
+            calc_dim = self._get_calculated_dimension(dim_id)
+            if calc_dim:
+                # Wrap expression in parentheses and alias with dimension ID
+                calc_dim_expressions.append(f"({calc_dim.sql_expression}) AS {dim_id}")
+
+        if not calc_dim_expressions:
+            # No valid calculated dimensions found
+            return f"`{self.table_path}`"
+
+        calc_dims_str = ",\n                ".join(calc_dim_expressions)
+
+        return f"""(
+            SELECT *,
+                {calc_dims_str}
+            FROM `{self.table_path}`
+            {base_where_clause}
+        )"""
+
+    def build_filter_clause_for_calculated_dimension(
+        self,
+        dimension_id: str,
+        values: List[str]
+    ) -> str:
+        """
+        Build WHERE clause condition for filtering on a calculated dimension alias.
+
+        This generates a filter condition that references the calculated dimension
+        by its alias (since it's computed in an inner subquery).
+
+        Args:
+            dimension_id: Calculated dimension ID (used as alias in subquery)
+            values: List of values to filter by
+
+        Returns:
+            WHERE condition string (e.g., "rec_id IN ('val1', 'val2')")
+        """
+        calc_dim = self._get_calculated_dimension(dimension_id)
+        if not calc_dim:
+            raise ValueError(f"Calculated dimension '{dimension_id}' not found")
+
+        data_type = calc_dim.data_type
+
+        # Handle special __NULL__ marker
+        null_marker = "__NULL__"
+        has_null = null_marker in values
+        non_null_values = [v for v in values if v != null_marker]
+
+        filter_parts = []
+
+        if non_null_values:
+            if len(non_null_values) == 1:
+                # Single value - use equality
+                value = non_null_values[0]
+                if data_type in ["STRING", "DATE"]:
+                    escaped_value = value.replace("'", "''")
+                    filter_parts.append(f"{dimension_id} = '{escaped_value}'")
+                elif data_type == "BOOLEAN":
+                    bool_value = "TRUE" if value.lower() in ["true", "1", "yes"] else "FALSE"
+                    filter_parts.append(f"{dimension_id} = {bool_value}")
+                else:  # INTEGER, FLOAT
+                    filter_parts.append(f"{dimension_id} = {value}")
+            else:
+                # Multiple values - use IN clause
+                if data_type in ["STRING", "DATE"]:
+                    escaped_values = [v.replace("'", "''") for v in non_null_values]
+                    values_str = "', '".join(escaped_values)
+                    filter_parts.append(f"{dimension_id} IN ('{values_str}')")
+                elif data_type == "BOOLEAN":
+                    bool_values = ", ".join([
+                        "TRUE" if v.lower() in ["true", "1", "yes"] else "FALSE"
+                        for v in non_null_values
+                    ])
+                    filter_parts.append(f"{dimension_id} IN ({bool_values})")
+                else:  # INTEGER, FLOAT
+                    values_str = ", ".join(non_null_values)
+                    filter_parts.append(f"{dimension_id} IN ({values_str})")
+
+        # Add IS NULL condition if __NULL__ marker was present
+        if has_null:
+            filter_parts.append(f"{dimension_id} IS NULL")
+
+        # Combine with OR if multiple conditions
+        if len(filter_parts) == 1:
+            return filter_parts[0]
+        elif len(filter_parts) > 1:
+            return f"({' OR '.join(filter_parts)})"
+
+        return ""
+
+    def separate_dimension_filters(
+        self,
+        dimension_filters: Optional[Dict[str, List[str]]]
+    ) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
+        """
+        Separate dimension filters into regular vs calculated dimension filters.
+
+        Args:
+            dimension_filters: Dictionary of dimension_id -> values
+
+        Returns:
+            Tuple of (regular_filters, calculated_filters)
+        """
+        if not dimension_filters:
+            return {}, {}
+
+        regular_filters = {}
+        calculated_filters = {}
+
+        for dim_id, values in dimension_filters.items():
+            if self._is_calculated_dimension(dim_id):
+                calculated_filters[dim_id] = values
+            else:
+                regular_filters[dim_id] = values
+
+        return regular_filters, calculated_filters
+
+    def query_calculated_dimension_values(
+        self,
+        dimension_id: str,
+        filters: 'FilterParams',
+        limit: int = 1000
+    ) -> List[str]:
+        """
+        Get distinct values for a calculated dimension.
+
+        Uses a subquery to compute the calculated dimension values first,
+        then selects distinct values from the result.
+
+        Args:
+            dimension_id: Calculated dimension ID
+            filters: FilterParams object with filter criteria
+            limit: Maximum number of distinct values to return
+
+        Returns:
+            List of distinct values for the calculated dimension
+        """
+        calc_dim = self._get_calculated_dimension(dimension_id)
+        if not calc_dim:
+            raise ValueError(f"Calculated dimension '{dimension_id}' not found")
+
+        # Build base where clause (excluding calculated dimension filters)
+        regular_filters, _ = self.separate_dimension_filters(filters.dimension_filters)
+
+        base_where_clause = self.build_filter_clause(
+            start_date=filters.start_date,
+            end_date=filters.end_date,
+            dimension_filters=regular_filters,
+            date_range_type=filters.date_range_type,
+            relative_date_preset=filters.relative_date_preset
+        )
+
+        # Build subquery with calculated dimension
+        subquery = self.build_subquery_with_calculated_dimensions(
+            [dimension_id],
+            base_where_clause
+        )
+
+        query = f"""
+            SELECT DISTINCT {dimension_id} as value
+            FROM {subquery}
+            WHERE {dimension_id} IS NOT NULL
+            ORDER BY value
+            LIMIT {limit}
+        """
+
+        filters_dict = {
+            'start_date': filters.start_date,
+            'end_date': filters.end_date,
+            'dimension_filters': filters.dimension_filters,
+            'dimension': dimension_id
+        }
+
+        df = self._execute_and_log_query(
+            query=query,
+            query_type='calculated_dimension_values',
+            endpoint=f'/api/pivot/dimension/{dimension_id}/values',
+            filters=filters_dict
+        )
+
+        # Convert to list of strings
+        return [str(val) for val in df['value'].tolist() if pd.notna(val)]
+
     def _execute_and_log_query(
         self,
         query: str,
@@ -160,6 +429,7 @@ class BigQueryService:
     ) -> pd.DataFrame:
         """
         Execute a BigQuery query and log its metrics.
+        Includes caching layer - checks cache before BigQuery, stores result after.
 
         Args:
             query: SQL query to execute
@@ -172,7 +442,19 @@ class BigQueryService:
         """
         # Import here to avoid circular dependency
         from services.query_logger import get_query_logger
+        from services.query_cache_service import get_query_cache, QueryCacheService
 
+        # Check cache first
+        cache = get_query_cache()
+        cache_key = QueryCacheService.sql_to_cache_key(query) if cache else None
+
+        if cache and cache_key:
+            cached_rows = cache.get(cache_key)
+            if cached_rows is not None:
+                # Cache hit - return DataFrame from cached rows
+                return pd.DataFrame(cached_rows)
+
+        # Cache miss - execute BigQuery query
         start_time = time.time()
         error_msg = None
         bytes_processed = 0
@@ -192,6 +474,21 @@ class BigQueryService:
 
             row_count = len(df)
 
+            # Store in cache (raw DataFrame as list of dicts)
+            if cache and cache_key:
+                try:
+                    cache.set(
+                        cache_key=cache_key,
+                        query_type=query_type,
+                        table_id=self.table_id or 'default',
+                        sql_query=query,
+                        result=df.to_dict('records'),
+                        row_count=row_count
+                    )
+                except Exception as cache_error:
+                    # Don't fail the query if caching fails
+                    pass
+
             return df
 
         except Exception as e:
@@ -199,7 +496,7 @@ class BigQueryService:
             raise
 
         finally:
-            # Log query execution
+            # Log query execution (only for actual BigQuery calls, not cache hits)
             execution_time_ms = int((time.time() - start_time) * 1000)
 
             logger = get_query_logger()

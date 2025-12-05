@@ -1005,12 +1005,26 @@ def get_pivot_data(dimensions: List[str], filters: FilterParams, limit: int = 50
                 else:
                     raise ValueError(f"Custom dimension {custom_dim_id} not found")
 
-    # Build dimension map dynamically from schema
+    # Build dimension map dynamically from schema (regular dimensions)
     dimension_map = {}
     if metrics_data['schema_config'] and metrics_data['schema_config'].dimensions:
         for dim in metrics_data['schema_config'].dimensions:
             # Map dimension ID to column name
             dimension_map[dim.id] = dim.column_name
+
+    # Build calculated dimension map from schema
+    calculated_dimension_map = {}
+    if metrics_data['schema_config'] and hasattr(metrics_data['schema_config'], 'calculated_dimensions') and metrics_data['schema_config'].calculated_dimensions:
+        for calc_dim in metrics_data['schema_config'].calculated_dimensions:
+            # Map calculated dimension ID to its SQL expression
+            calculated_dimension_map[calc_dim.id] = calc_dim.sql_expression
+
+    # Check if any requested dimension is a calculated dimension
+    calc_dims_in_request = [d for d in dimensions if d in calculated_dimension_map] if dimensions else []
+    has_calculated_dimensions = len(calc_dims_in_request) > 0
+
+    # Separate regular vs calculated dimension filters
+    regular_filters, calculated_filters = bq_service.separate_dimension_filters(filters.dimension_filters)
 
     # Query actual date range from filtered data for accurate avg_queries_per_day calculation
     # Use cached method to avoid redundant queries for same table/filters/dimensions
@@ -1118,20 +1132,43 @@ def get_pivot_data(dimensions: List[str], filters: FilterParams, limit: int = 50
             total_count=1
         )
 
-    # Build filter clause
-    where_clause = bq_service.build_filter_clause(
+    # Build filter clause - use only regular dimension filters for base query
+    # Calculated dimension filters will be applied in the outer query
+    base_where_clause = bq_service.build_filter_clause(
         start_date=filters.start_date,
         end_date=filters.end_date,
-        dimension_filters=filters.dimension_filters,
+        dimension_filters=regular_filters if has_calculated_dimensions else filters.dimension_filters,
         date_range_type=filters.date_range_type,
         relative_date_preset=filters.relative_date_preset
     )
 
-    # Map all dimensions to their column names
-    group_cols = [dimension_map.get(dim, dim) for dim in dimensions]
+    # Map dimensions to column names or expressions
+    # For regular dimensions: use column name
+    # For calculated dimensions: use the SQL expression (will be aliased in subquery)
+    group_cols = []
+    for dim in dimensions:
+        if dim in calculated_dimension_map:
+            # Calculated dimension - use the ID as alias (computed in subquery)
+            group_cols.append(dim)
+        elif dim in dimension_map:
+            # Regular dimension - use column name
+            group_cols.append(dimension_map[dim])
+        else:
+            # Unknown dimension - use as-is
+            group_cols.append(dim)
 
     # Quote column names if they contain special characters (like hyphens in custom dimensions)
-    quoted_group_cols = [bq_service._quote_column_name(col) for col in group_cols]
+    # Don't quote calculated dimension aliases (they'll be simple identifiers)
+    quoted_group_cols = []
+    for i, col in enumerate(group_cols):
+        dim_id = dimensions[i]
+        if dim_id in calculated_dimension_map:
+            # Calculated dimension alias - don't quote
+            quoted_group_cols.append(col)
+        else:
+            # Regular column - may need quoting
+            quoted_group_cols.append(bq_service._quote_column_name(col))
+
     group_by_clause = ", ".join(quoted_group_cols)
 
     # Build SELECT clause for dimension values
@@ -1189,52 +1226,81 @@ def get_pivot_data(dimensions: List[str], filters: FilterParams, limit: int = 50
     # Build additional filter for specific dimension values if provided
     dimension_values_filter = ""
     if dimension_values and len(dimension_values) > 0:
-        # Get the dimension's data type from schema
-        dimension_column = group_cols[0]  # Use the first (and should be only) dimension column
-        quoted_dimension_column = f"`{dimension_column}`" if dimension_column and not dimension_column.startswith('`') else dimension_column
-        dim_def = next((d for d in metrics_data['schema_config'].dimensions if d.column_name == dimension_column), None)
-        data_type = dim_def.data_type if dim_def else "STRING"
+        connector = "AND" if base_where_clause else "WHERE"
 
-        # Handle special __NULL__ marker - separate NULL values from regular values
-        null_marker = "__NULL__"
-        has_null = null_marker in dimension_values
-        non_null_values = [v for v in dimension_values if v != null_marker]
+        if len(group_cols) > 1:
+            # Multiple dimensions: filter on the CONCAT expression
+            # The dimension_values are already in "value1 - value2" format
+            cast_cols = [f"COALESCE(CAST({col} AS STRING), '__NULL__')" for col in quoted_group_cols]
+            separator = ', " - ", '
+            concat_args = separator.join(cast_cols)
+            concat_expr = f"CONCAT({concat_args})"
 
-        filter_parts = []
+            # Escape single quotes in values
+            escaped_values = [value.replace("'", "''") for value in dimension_values]
+            values_list = "', '".join(escaped_values)
+            dimension_values_filter = f"{connector} {concat_expr} IN ('{values_list}')"
+        else:
+            # Single dimension: use existing logic with type-aware formatting
+            dimension_column = group_cols[0]
+            quoted_dimension_column = f"`{dimension_column}`" if dimension_column and not dimension_column.startswith('`') else dimension_column
+            dim_def = next((d for d in metrics_data['schema_config'].dimensions if d.column_name == dimension_column), None)
+            data_type = dim_def.data_type if dim_def else "STRING"
 
-        # Format non-null values based on data type
-        if non_null_values:
-            if data_type in ["STRING", "DATE"]:
-                # Escape single quotes in string values
-                escaped_values = [value.replace("'", "''") for value in non_null_values]
-                values_list = "', '".join(escaped_values)
-                formatted_values = f"('{values_list}')"
-            elif data_type == "BOOLEAN":
-                bool_values = ", ".join([
-                    "TRUE" if v.lower() in ["true", "1", "yes"] else "FALSE"
-                    for v in non_null_values
-                ])
-                formatted_values = f"({bool_values})"
-            else:  # INTEGER, INT64, FLOAT, FLOAT64, NUMERIC
-                values_list = ", ".join(non_null_values)
-                formatted_values = f"({values_list})"
-            filter_parts.append(f"{quoted_dimension_column} IN {formatted_values}")
+            # Handle special __NULL__ marker - separate NULL values from regular values
+            null_marker = "__NULL__"
+            has_null = null_marker in dimension_values
+            non_null_values = [v for v in dimension_values if v != null_marker]
 
-        # Add IS NULL condition if __NULL__ marker was present
-        if has_null:
-            filter_parts.append(f"{quoted_dimension_column} IS NULL")
+            filter_parts = []
 
-        # Combine filter parts
-        if filter_parts:
-            connector = "AND" if where_clause else "WHERE"
-            if len(filter_parts) == 1:
-                dimension_values_filter = f"{connector} {filter_parts[0]}"
-            else:
-                dimension_values_filter = f"{connector} ({' OR '.join(filter_parts)})"
+            # Format non-null values based on data type
+            if non_null_values:
+                if data_type in ["STRING", "DATE"]:
+                    # Escape single quotes in string values
+                    escaped_values = [value.replace("'", "''") for value in non_null_values]
+                    values_list = "', '".join(escaped_values)
+                    formatted_values = f"('{values_list}')"
+                elif data_type == "BOOLEAN":
+                    bool_values = ", ".join([
+                        "TRUE" if v.lower() in ["true", "1", "yes"] else "FALSE"
+                        for v in non_null_values
+                    ])
+                    formatted_values = f"({bool_values})"
+                else:  # INTEGER, INT64, FLOAT, FLOAT64, NUMERIC
+                    values_list = ", ".join(non_null_values)
+                    formatted_values = f"({values_list})"
+                filter_parts.append(f"{quoted_dimension_column} IN {formatted_values}")
+
+            # Add IS NULL condition if __NULL__ marker was present
+            if has_null:
+                filter_parts.append(f"{quoted_dimension_column} IS NULL")
+
+            # Combine filter parts
+            if filter_parts:
+                if len(filter_parts) == 1:
+                    dimension_values_filter = f"{connector} {filter_parts[0]}"
+                else:
+                    dimension_values_filter = f"{connector} ({' OR '.join(filter_parts)})"
 
     # Main query - get top N dimension values with offset (or specific values if provided)
     # Use subquery pattern to avoid redundant metric calculations
     base_select_str = ',\n                '.join(base_select_items)
+
+    # Build calculated dimension expressions for the innermost subquery (if any)
+    calc_dim_select_items = []
+    for dim_id in calc_dims_in_request:
+        if dim_id in calculated_dimension_map:
+            calc_dim_select_items.append(f"({calculated_dimension_map[dim_id]}) AS {dim_id}")
+
+    # Build calculated dimension filter clause for outer query (if any)
+    calc_dim_filter_parts = []
+    for dim_id, values in calculated_filters.items():
+        if values:
+            filter_clause = bq_service.build_filter_clause_for_calculated_dimension(dim_id, values)
+            if filter_clause:
+                calc_dim_filter_parts.append(filter_clause)
+    calc_dim_filter_clause = " AND ".join(calc_dim_filter_parts) if calc_dim_filter_parts else ""
 
     if calculated_select_items:
         # List base metric aliases to select from inner query (including extra columns like days_in_range)
@@ -1242,72 +1308,164 @@ def get_pivot_data(dimensions: List[str], filters: FilterParams, limit: int = 50
         base_aliases_str = ', '.join(base_metric_aliases)
         calculated_select_str = ',\n            '.join(calculated_select_items)
 
-        if dimension_values and len(dimension_values) > 0:
-            # When fetching specific dimension values, don't use LIMIT/OFFSET and sort alphabetically for consistent ordering
-            query = f"""
-                SELECT
-                    dimension_value,
-                    {base_aliases_str},
-                    {calculated_select_str}
-                FROM (
+        if has_calculated_dimensions:
+            # Query with calculated dimensions - use triple subquery pattern:
+            # 1. Innermost: compute calculated dimension expressions
+            # 2. Middle: GROUP BY and aggregate metrics
+            # 3. Outermost: compute calculated metrics and apply calculated dimension filters
+            calc_dim_select_str = ',\n                    '.join(calc_dim_select_items)
+
+            if dimension_values and len(dimension_values) > 0:
+                query = f"""
                     SELECT
-                        {dim_value_clause},
-                        {base_select_str}
-                    FROM `{bq_service.table_path}`
-                    {where_clause}
-                    {dimension_values_filter}
-                    GROUP BY {group_by_clause}
-                )
-                ORDER BY dimension_value
-            """
+                        dimension_value,
+                        {base_aliases_str},
+                        {calculated_select_str}
+                    FROM (
+                        SELECT
+                            {dim_value_clause},
+                            {base_select_str}
+                        FROM (
+                            SELECT *,
+                                {calc_dim_select_str}
+                            FROM `{bq_service.table_path}`
+                            {base_where_clause}
+                        )
+                        {dimension_values_filter}
+                        GROUP BY {group_by_clause}
+                    )
+                    {"WHERE " + calc_dim_filter_clause if calc_dim_filter_clause else ""}
+                    ORDER BY dimension_value
+                """
+            else:
+                query = f"""
+                    SELECT
+                        dimension_value,
+                        {base_aliases_str},
+                        {calculated_select_str}
+                    FROM (
+                        SELECT
+                            {dim_value_clause},
+                            {base_select_str}
+                        FROM (
+                            SELECT *,
+                                {calc_dim_select_str}
+                            FROM `{bq_service.table_path}`
+                            {base_where_clause}
+                        )
+                        GROUP BY {group_by_clause}
+                    )
+                    {"WHERE " + calc_dim_filter_clause if calc_dim_filter_clause else ""}
+                    ORDER BY {primary_sort} DESC
+                    LIMIT {limit}
+                    OFFSET {offset}
+                """
         else:
-            # Normal top-N query
-            query = f"""
-                SELECT
-                    dimension_value,
-                    {base_aliases_str},
-                    {calculated_select_str}
-                FROM (
+            # No calculated dimensions - use standard double subquery pattern
+            if dimension_values and len(dimension_values) > 0:
+                query = f"""
                     SELECT
-                        {dim_value_clause},
-                        {base_select_str}
-                    FROM `{bq_service.table_path}`
-                    {where_clause}
-                    GROUP BY {group_by_clause}
-                )
-                ORDER BY {primary_sort} DESC
-                LIMIT {limit}
-                OFFSET {offset}
-            """
+                        dimension_value,
+                        {base_aliases_str},
+                        {calculated_select_str}
+                    FROM (
+                        SELECT
+                            {dim_value_clause},
+                            {base_select_str}
+                        FROM `{bq_service.table_path}`
+                        {base_where_clause}
+                        {dimension_values_filter}
+                        GROUP BY {group_by_clause}
+                    )
+                    ORDER BY dimension_value
+                """
+            else:
+                query = f"""
+                    SELECT
+                        dimension_value,
+                        {base_aliases_str},
+                        {calculated_select_str}
+                    FROM (
+                        SELECT
+                            {dim_value_clause},
+                            {base_select_str}
+                        FROM `{bq_service.table_path}`
+                        {base_where_clause}
+                        GROUP BY {group_by_clause}
+                    )
+                    ORDER BY {primary_sort} DESC
+                    LIMIT {limit}
+                    OFFSET {offset}
+                """
     else:
         # If no calculated metrics, use base metrics directly
-        if dimension_values and len(dimension_values) > 0:
-            query = f"""
-                SELECT
-                    {dim_value_clause},
-                    {base_select_str}
-                FROM `{bq_service.table_path}`
-                {where_clause}
-                {dimension_values_filter}
-                GROUP BY {group_by_clause}
-                ORDER BY {group_by_clause}
-            """
+        if has_calculated_dimensions:
+            # With calculated dimensions but no calculated metrics
+            calc_dim_select_str = ',\n                '.join(calc_dim_select_items)
+
+            if dimension_values and len(dimension_values) > 0:
+                query = f"""
+                    SELECT
+                        {dim_value_clause},
+                        {base_select_str}
+                    FROM (
+                        SELECT *,
+                            {calc_dim_select_str}
+                        FROM `{bq_service.table_path}`
+                        {base_where_clause}
+                    )
+                    {dimension_values_filter}
+                    {"AND " + calc_dim_filter_clause if calc_dim_filter_clause and dimension_values_filter else ("WHERE " + calc_dim_filter_clause if calc_dim_filter_clause else "")}
+                    GROUP BY {group_by_clause}
+                    ORDER BY {group_by_clause}
+                """
+            else:
+                query = f"""
+                    SELECT
+                        {dim_value_clause},
+                        {base_select_str}
+                    FROM (
+                        SELECT *,
+                            {calc_dim_select_str}
+                        FROM `{bq_service.table_path}`
+                        {base_where_clause}
+                    )
+                    {"WHERE " + calc_dim_filter_clause if calc_dim_filter_clause else ""}
+                    GROUP BY {group_by_clause}
+                    ORDER BY {primary_sort} DESC
+                    LIMIT {limit}
+                    OFFSET {offset}
+                """
         else:
-            query = f"""
-                SELECT
-                    {dim_value_clause},
-                    {base_select_str}
-                FROM `{bq_service.table_path}`
-                {where_clause}
-                GROUP BY {group_by_clause}
-                ORDER BY {primary_sort} DESC
-                LIMIT {limit}
-                OFFSET {offset}
-            """
+            # No calculated dimensions, no calculated metrics - simple query
+            if dimension_values and len(dimension_values) > 0:
+                query = f"""
+                    SELECT
+                        {dim_value_clause},
+                        {base_select_str}
+                    FROM `{bq_service.table_path}`
+                    {base_where_clause}
+                    {dimension_values_filter}
+                    GROUP BY {group_by_clause}
+                    ORDER BY {group_by_clause}
+                """
+            else:
+                query = f"""
+                    SELECT
+                        {dim_value_clause},
+                        {base_select_str}
+                    FROM `{bq_service.table_path}`
+                    {base_where_clause}
+                    GROUP BY {group_by_clause}
+                    ORDER BY {primary_sort} DESC
+                    LIMIT {limit}
+                    OFFSET {offset}
+                """
 
     df = bq_service._execute_and_log_query(query, query_type="pivot", endpoint="data_service")
 
     # Totals query - get overall totals in a separate query with subquery pattern
+    # Note: totals should NOT include calculated dimension filters (we want overall totals)
     if calculated_select_items:
         totals_query = f"""
             SELECT
@@ -1317,7 +1475,7 @@ def get_pivot_data(dimensions: List[str], filters: FilterParams, limit: int = 50
                 SELECT
                     {base_select_str}
                 FROM `{bq_service.table_path}`
-                {where_clause}
+                {base_where_clause}
             )
         """
     else:
@@ -1325,7 +1483,7 @@ def get_pivot_data(dimensions: List[str], filters: FilterParams, limit: int = 50
             SELECT
                 {base_select_str}
             FROM `{bq_service.table_path}`
-            {where_clause}
+            {base_where_clause}
         """
 
     totals_df = bq_service._execute_and_log_query(totals_query, query_type="pivot_totals", endpoint="data_service")

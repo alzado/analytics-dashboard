@@ -42,33 +42,39 @@ export function FormulaBuilderModal({
   // Search state - single search across all categories
   const [searchTerm, setSearchTerm] = useState('')
 
-  // Filtered items based on search
-  const filteredBaseMetrics = availableMetrics.filter((m) => {
-    if (!searchTerm) return true
-    const term = searchTerm.toLowerCase()
-    return (
-      m.display_name.toLowerCase().includes(term) ||
-      m.id.toLowerCase().includes(term)
-    )
-  })
+  // Filtered items based on search, sorted alphabetically
+  const filteredBaseMetrics = availableMetrics
+    .filter((m) => {
+      if (!searchTerm) return true
+      const term = searchTerm.toLowerCase()
+      return (
+        m.display_name.toLowerCase().includes(term) ||
+        m.id.toLowerCase().includes(term)
+      )
+    })
+    .sort((a, b) => a.display_name.localeCompare(b.display_name))
 
-  const filteredCalculatedMetrics = availableCalculatedMetrics.filter((m) => {
-    if (!searchTerm) return true
-    const term = searchTerm.toLowerCase()
-    return (
-      m.display_name.toLowerCase().includes(term) ||
-      m.id.toLowerCase().includes(term)
-    )
-  })
+  const filteredCalculatedMetrics = availableCalculatedMetrics
+    .filter((m) => {
+      if (!searchTerm) return true
+      const term = searchTerm.toLowerCase()
+      return (
+        m.display_name.toLowerCase().includes(term) ||
+        m.id.toLowerCase().includes(term)
+      )
+    })
+    .sort((a, b) => a.display_name.localeCompare(b.display_name))
 
-  const filteredDimensions = availableDimensions.filter((d) => {
-    if (!searchTerm) return true
-    const term = searchTerm.toLowerCase()
-    return (
-      d.display_name.toLowerCase().includes(term) ||
-      d.id.toLowerCase().includes(term)
-    )
-  })
+  const filteredDimensions = availableDimensions
+    .filter((d) => {
+      if (!searchTerm) return true
+      const term = searchTerm.toLowerCase()
+      return (
+        d.display_name.toLowerCase().includes(term) ||
+        d.id.toLowerCase().includes(term)
+      )
+    })
+    .sort((a, b) => a.display_name.localeCompare(b.display_name))
 
   const addMetric = (metric: BaseMetric | CalculatedMetric) => {
     // Add metric as a reference {metric_id} for both base and calculated metrics
@@ -92,7 +98,7 @@ export function FormulaBuilderModal({
     setTokens([...tokens, newToken])
   }
 
-  const addFunction = (funcName: 'COUNT' | 'SUM' | 'AVG' | 'MIN' | 'MAX' | 'CONCAT' | 'DISTINCT' | 'COALESCE') => {
+  const addFunction = (funcName: 'COUNT' | 'SUM' | 'AVG' | 'MIN' | 'MAX' | 'CONCAT' | 'DISTINCT' | 'COALESCE' | 'CASE' | 'WHEN' | 'THEN' | 'ELSE' | 'END' | 'APPROX_COUNT_DISTINCT' | 'FARM_FINGERPRINT') => {
     const newToken: FormulaToken = {
       id: `token-${Date.now()}-${Math.random()}`,
       type: 'function',
@@ -110,7 +116,7 @@ export function FormulaBuilderModal({
     setTokens([...tokens, newToken])
   }
 
-  const addOperator = (operator: '+' | '-' | '*' | '/') => {
+  const addOperator = (operator: '+' | '-' | '*' | '/' | '>' | '<' | '>=' | '<=' | '=' | '<>') => {
     const newToken: FormulaToken = {
       id: `token-${Date.now()}-${Math.random()}`,
       type: 'operator',
@@ -391,6 +397,48 @@ export function FormulaBuilderModal({
                 </div>
 
                 <div>
+                  <p className="text-xs text-gray-600 mb-2">Comparison Operators</p>
+                  <div className="grid grid-cols-3 gap-2">
+                    <button
+                      onClick={() => addOperator('>')}
+                      className="px-3 py-2 bg-purple-100 text-purple-800 rounded hover:bg-purple-200 font-medium"
+                    >
+                      &gt;
+                    </button>
+                    <button
+                      onClick={() => addOperator('<')}
+                      className="px-3 py-2 bg-purple-100 text-purple-800 rounded hover:bg-purple-200 font-medium"
+                    >
+                      &lt;
+                    </button>
+                    <button
+                      onClick={() => addOperator('=')}
+                      className="px-3 py-2 bg-purple-100 text-purple-800 rounded hover:bg-purple-200 font-medium"
+                    >
+                      =
+                    </button>
+                    <button
+                      onClick={() => addOperator('>=')}
+                      className="px-3 py-2 bg-purple-100 text-purple-800 rounded hover:bg-purple-200 font-medium"
+                    >
+                      &gt;=
+                    </button>
+                    <button
+                      onClick={() => addOperator('<=')}
+                      className="px-3 py-2 bg-purple-100 text-purple-800 rounded hover:bg-purple-200 font-medium"
+                    >
+                      &lt;=
+                    </button>
+                    <button
+                      onClick={() => addOperator('<>')}
+                      className="px-3 py-2 bg-purple-100 text-purple-800 rounded hover:bg-purple-200 font-medium"
+                    >
+                      &lt;&gt;
+                    </button>
+                  </div>
+                </div>
+
+                <div>
                   <p className="text-xs text-gray-600 mb-2">Parentheses & Comma</p>
                   <div className="grid grid-cols-3 gap-2">
                     <button
@@ -469,6 +517,60 @@ export function FormulaBuilderModal({
                 </div>
 
                 <div>
+                  <p className="text-xs text-gray-600 mb-2">BigQuery Optimization</p>
+                  <div className="space-y-2">
+                    <button
+                      onClick={() => addFunction('APPROX_COUNT_DISTINCT')}
+                      className="w-full px-3 py-2 bg-emerald-100 text-emerald-800 rounded hover:bg-emerald-200 font-medium text-sm"
+                    >
+                      APPROX_COUNT_DISTINCT
+                    </button>
+                    <button
+                      onClick={() => addFunction('FARM_FINGERPRINT')}
+                      className="w-full px-3 py-2 bg-emerald-100 text-emerald-800 rounded hover:bg-emerald-200 font-medium text-sm"
+                    >
+                      FARM_FINGERPRINT
+                    </button>
+                  </div>
+                </div>
+
+                <div>
+                  <p className="text-xs text-gray-600 mb-2">Conditional (CASE/WHEN)</p>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      onClick={() => addFunction('CASE')}
+                      className="px-3 py-2 bg-teal-100 text-teal-800 rounded hover:bg-teal-200 font-medium text-sm"
+                    >
+                      CASE
+                    </button>
+                    <button
+                      onClick={() => addFunction('WHEN')}
+                      className="px-3 py-2 bg-teal-100 text-teal-800 rounded hover:bg-teal-200 font-medium text-sm"
+                    >
+                      WHEN
+                    </button>
+                    <button
+                      onClick={() => addFunction('THEN')}
+                      className="px-3 py-2 bg-teal-100 text-teal-800 rounded hover:bg-teal-200 font-medium text-sm"
+                    >
+                      THEN
+                    </button>
+                    <button
+                      onClick={() => addFunction('ELSE')}
+                      className="px-3 py-2 bg-teal-100 text-teal-800 rounded hover:bg-teal-200 font-medium text-sm"
+                    >
+                      ELSE
+                    </button>
+                    <button
+                      onClick={() => addFunction('END')}
+                      className="col-span-2 px-3 py-2 bg-teal-100 text-teal-800 rounded hover:bg-teal-200 font-medium text-sm"
+                    >
+                      END
+                    </button>
+                  </div>
+                </div>
+
+                <div>
                   <p className="text-xs text-gray-600 mb-2">Special</p>
                   <div className="space-y-2">
                     <button
@@ -501,9 +603,16 @@ export function FormulaBuilderModal({
                   <li>Use COUNT with DISTINCT for unique counts</li>
                   <li>Example: COUNT ( DISTINCT [user_id] )</li>
                   <li>Use CONCAT to combine text fields</li>
-                  <li>Example: CONCAT ( [country] , [channel] )</li>
+                  <li>Use CASE/WHEN for conditionals</li>
+                  <li>Example: CASE WHEN &#123;metric&#125; &gt; 0 THEN 1 ELSE 0 END</li>
                   <li>Division uses SAFE_DIVIDE (no errors)</li>
                   <li>Click X on tokens to remove them</li>
+                </ul>
+                <p className="font-medium mt-3 mb-1">BigQuery Optimization:</p>
+                <ul className="list-disc list-inside space-y-1">
+                  <li>APPROX_COUNT_DISTINCT - Fast approximate count (~2% error)</li>
+                  <li>FARM_FINGERPRINT - Fast hash for multi-column distinct</li>
+                  <li>Example: APPROX_COUNT_DISTINCT ( FARM_FINGERPRINT ( CONCAT ( [col1] , [col2] ) ) )</li>
                 </ul>
               </div>
             </div>
@@ -540,7 +649,8 @@ function parseFormulaToTokens(
 ): FormulaToken[] {
   const tokens: FormulaToken[] = []
   // Note: COUNT_DISTINCT is kept for backward compatibility, but we'll convert it to COUNT DISTINCT
-  const parts = formula.split(/(\{[^}]+\}|\[[^\]]+\]|COUNT_DISTINCT|DISTINCT|COUNT|SUM|AVG|MIN|MAX|CONCAT|[+\-*/(),]|\s+)/).filter(p => p.trim())
+  // Order matters: APPROX_COUNT_DISTINCT must come before COUNT_DISTINCT and COUNT
+  const parts = formula.split(/(\{[^}]+\}|\[[^\]]+\]|APPROX_COUNT_DISTINCT|FARM_FINGERPRINT|COUNT_DISTINCT|DISTINCT|COUNT|SUM|AVG|MIN|MAX|CONCAT|COALESCE|CASE|WHEN|THEN|ELSE|END|>=|<=|<>|[+\-*/(),><=]|\s+)/).filter(p => p.trim())
 
   parts.forEach((part, index) => {
     const metricMatch = part.match(/^\{([^}]+)\}$/)
@@ -578,7 +688,7 @@ function parseFormulaToTokens(
         type: 'function',
         value: 'DISTINCT',
       })
-    } else if (['COUNT', 'DISTINCT', 'SUM', 'AVG', 'MIN', 'MAX', 'CONCAT'].includes(part)) {
+    } else if (['COUNT', 'DISTINCT', 'SUM', 'AVG', 'MIN', 'MAX', 'CONCAT', 'COALESCE', 'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'APPROX_COUNT_DISTINCT', 'FARM_FINGERPRINT'].includes(part)) {
       tokens.push({
         id: `token-init-${index}`,
         type: 'function',
@@ -591,7 +701,7 @@ function parseFormulaToTokens(
         type: 'wildcard',
         value: part,
       })
-    } else if (['+', '-', '*', '/'].includes(part)) {
+    } else if (['+', '-', '*', '/', '>', '<', '>=', '<=', '=', '<>'].includes(part)) {
       tokens.push({
         id: `token-init-${index}`,
         type: 'operator',

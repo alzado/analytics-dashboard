@@ -6,6 +6,11 @@ import { X, Download, FileSpreadsheet, FileCode, BarChart3, Image } from 'lucide
 
 export type ExportFormat = 'csv' | 'html' | 'png'
 
+export interface ExportOptions {
+  format: ExportFormat
+  rowLimit?: number  // For PNG: limit number of dimension value rows
+}
+
 export interface ExportData {
   metadata: {
     exportDate: string
@@ -18,12 +23,13 @@ export interface ExportData {
   }
   headers: string[]
   rows: (string | number)[][]
+  dimensionRowCount?: number  // Total unique dimension values (for multi-table: rows / metrics count)
 }
 
 interface ExportModalProps {
   isOpen: boolean
   onClose: () => void
-  onExport: (format: ExportFormat) => void
+  onExport: (options: ExportOptions) => void
   data: ExportData | null
 }
 
@@ -34,11 +40,22 @@ export default function ExportModal({
   data,
 }: ExportModalProps) {
   const [selectedFormat, setSelectedFormat] = useState<ExportFormat>('csv')
+  const [pngRowLimit, setPngRowLimit] = useState<string>('')  // Empty = all rows
 
   if (!isOpen) return null
 
+  // Calculate dimension row count from data
+  const dimensionRowCount = data?.dimensionRowCount ?? data?.rows.length ?? 0
+
   const handleExport = () => {
-    onExport(selectedFormat)
+    const options: ExportOptions = { format: selectedFormat }
+    if (selectedFormat === 'png' && pngRowLimit) {
+      const limit = parseInt(pngRowLimit, 10)
+      if (!isNaN(limit) && limit > 0) {
+        options.rowLimit = limit
+      }
+    }
+    onExport(options)
     onClose()
   }
 
@@ -158,6 +175,25 @@ export default function ExportModal({
                   High-resolution image of the complete table.
                   Perfect for presentations, reports, or sharing.
                 </p>
+                {/* Row limit input - only shown when PNG is selected */}
+                {selectedFormat === 'png' && (
+                  <div className="mt-3 flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
+                    <label htmlFor="pngRowLimit" className="text-sm text-gray-700">
+                      Rows to export:
+                    </label>
+                    <input
+                      id="pngRowLimit"
+                      type="number"
+                      min="1"
+                      max={dimensionRowCount}
+                      value={pngRowLimit}
+                      onChange={(e) => setPngRowLimit(e.target.value)}
+                      placeholder={`All (${dimensionRowCount})`}
+                      className="w-28 px-2 py-1 text-sm border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-500"
+                    />
+                    <span className="text-xs text-gray-500">of {dimensionRowCount}</span>
+                  </div>
+                )}
               </div>
             </label>
           </div>
