@@ -1,6 +1,6 @@
 'use client'
 
-import React, { useState, useMemo, useEffect, useCallback } from 'react'
+import React, { useState, useMemo, useEffect, useCallback, useRef } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { fetchPivotData, fetchPivotChildren, fetchDimensionValues, fetchCustomDimensions, fetchTables, updateWidget } from '@/lib/api'
 import type { PivotRow, PivotChildRow, PivotResponse, CustomDimension, DateRangeType, RelativeDatePreset } from '@/lib/types'
@@ -407,6 +407,7 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
       // Load column order and sort state
       if (editingWidget.column_order) {
         setColumnOrder(editingWidget.column_order)
+        isColumnOrderSetRef.current = true // Mark as manually set to prevent auto-sort overwriting
       }
       if (editingWidget.column_sort) {
         setColumnSortConfig(editingWidget.column_sort)
@@ -572,6 +573,7 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
   const [dragOverColumn, setDragOverColumn] = useState<string | null>(null)
   const [combinationError, setCombinationError] = useState<string | null>(null)
   const [columnOrder, setColumnOrder] = useState<number[]>([])
+  const isColumnOrderSetRef = useRef(false) // Track if column order was manually set or loaded from widget
   const [draggedColumnIndex, setDraggedColumnIndex] = useState<number | null>(null)
   const [dimensionSortOrder, setDimensionSortOrder] = useState<'asc' | 'desc'>('desc')
   const [columnSortConfig, setColumnSortConfig] = useState<{ metric: string; direction: 'asc' | 'desc' } | null>(null)
@@ -646,7 +648,7 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
 
   // Fetch data for all column combinations using two-step approach
   // Uses fetchedConfig values for stable query keys (only refetches when user clicks "Fetch Data")
-  const { data: allColumnData, isLoading: isLoadingColumnData } = useQuery({
+  const { data: allColumnData, isLoading: isLoadingColumnData, error: columnError } = useQuery({
     queryKey: ['all-columns', tableCombinations, fetchedFilters, fetchedDimensions, customDimensions, fetchedMetrics, columnOrder],
     queryFn: async (): Promise<Record<number, PivotResponse>> => {
       const results: Record<number, PivotResponse> = {}
@@ -907,15 +909,24 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
   // Initialize column order when table combinations change
   React.useEffect(() => {
     if (tableCombinations.length > 0) {
-      setColumnOrder(tableCombinations.map((_, idx) => idx))
+      // Only initialize if not already set manually or from widget
+      if (!isColumnOrderSetRef.current) {
+        setColumnOrder(tableCombinations.map((_, idx) => idx))
+      }
     } else {
       // Reset column order when combinations become empty
       setColumnOrder([])
+      isColumnOrderSetRef.current = false // Reset flag when combinations cleared
     }
   }, [tableCombinations])
 
   // Auto-sort columns by query volume when data loads
   React.useEffect(() => {
+    // Skip auto-sort if column order was manually set or loaded from widget
+    if (isColumnOrderSetRef.current) {
+      return
+    }
+
     if (allColumnData && Object.keys(allColumnData).length > 0) {
       // Sort column indices by primary sort metric (descending)
       const sortedIndices = Object.keys(allColumnData)
@@ -927,7 +938,7 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
         })
       setColumnOrder(sortedIndices)
     }
-  }, [allColumnData])
+  }, [allColumnData, primarySortMetric])
 
   // Clear significance results when table configuration changes
   React.useEffect(() => {
@@ -940,6 +951,7 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
     setChildrenCache({})
     setCurrentPage({})
     setLoadingRows(new Set())
+    isColumnOrderSetRef.current = false // Reset flag to allow fresh auto-sorting
   }, [selectedDimensions])
 
   // Handle drop events
@@ -1342,6 +1354,52 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
     return 'number'
   }
 
+  // Helper to check if a metric has inflation warning
+  // Returns true if metric is in the metric_warnings from backend
+  // In multi-table mode, checks warnings from any column
+  const hasMetricWarning = (metricId: string, columnIndex?: number): boolean => {
+    // Skip _pct and _per_day metrics (derived metrics)
+    if (metricId.endsWith('_pct') || metricId.endsWith('_per_day')) {
+      return false
+    }
+
+    // In multi-table mode, check warnings from allColumnData
+    const isMultiTableMode = selectedTableDimensions.length > 0 && allColumnData && columnOrder.length > 0
+    if (isMultiTableMode) {
+      // If specific column is provided, check only that column
+      if (columnIndex !== undefined) {
+        return allColumnData[columnIndex]?.metric_warnings?.[metricId] === true
+      }
+      // Otherwise, check if ANY column has a warning for this metric
+      return Object.values(allColumnData).some(
+        (colData: any) => colData?.metric_warnings?.[metricId] === true
+      )
+    }
+
+    // Single-table mode: use pivotData
+    return pivotData?.metric_warnings?.[metricId] === true
+  }
+
+  // Render metric value with optional warning icon
+  const MetricValueWithWarning = ({ value, metricId, columnIndex }: { value: number | null | undefined, metricId: string, columnIndex?: number }) => {
+    const formattedValue = value != null && value !== undefined ? formatMetricValue(value, metricId) : '-'
+    const showWarning = hasMetricWarning(metricId, columnIndex)
+
+    return (
+      <span className="inline-flex items-center gap-1">
+        {formattedValue}
+        {showWarning && (
+          <span
+            className="text-amber-500 cursor-help"
+            title="This metric may be inflated with this dimension configuration. The value exceeds the baseline (no-dimension) total. Consider using a different dimension combination."
+          >
+            ⚠️
+          </span>
+        )}
+      </span>
+    )
+  }
+
   // Reset sort when dimensions change
   useEffect(() => {
     setSortConfig(undefined as any, undefined, undefined)
@@ -1605,7 +1663,7 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
                 key={metricId}
                 className={`px-6 py-4 whitespace-nowrap text-sm text-gray-700 text-right`}
               >
-                {value != null && value !== undefined ? formatMetricValue(value, metricId) : '-'}
+                <MetricValueWithWarning value={value} metricId={metricId} />
               </td>
             )
           })}
@@ -1876,10 +1934,25 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
     return <div className="flex items-center justify-center h-64">Loading...</div>
   }
 
-  if (error) {
+  // Handle errors from both single-table (error) and multi-table (columnError) queries
+  const displayError = error || columnError
+  if (displayError) {
+    const errorMessage = displayError instanceof Error ? displayError.message : String(displayError)
+    const isRollupError = errorMessage.includes('No suitable rollup found') ||
+                          errorMessage.includes('Missing metrics') ||
+                          errorMessage.includes('Missing filter dimensions') ||
+                          errorMessage.includes('rollup')
     return (
       <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded">
-        Error loading pivot table
+        <div className="font-medium">
+          {isRollupError ? 'Rollup Required' : 'Error loading pivot table'}
+        </div>
+        <div className="text-sm mt-1">{errorMessage}</div>
+        {isRollupError && (
+          <div className="text-sm mt-2 text-red-600">
+            Go to <strong>Tables → Rollups</strong> to create a rollup with the required dimensions and metrics.
+          </div>
+        )}
       </div>
     )
   }
@@ -2120,10 +2193,10 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
       // Build rows - one row per dimension value per metric
       const rows: (string | number)[][] = []
 
-      // Get dimension values from first column
+      // Get dimension values from sorted rows (respects current table sorting)
       const allDimensionValues = selectedDimensions.length === 0
         ? ['Total']
-        : firstColData.rows.map((r: any) => r.dimension_value)
+        : sortRows(processedRows).map(row => row.dimension_value)
 
       // Apply row limit if specified (limit dimension values, not metric rows)
       const dimensionRowCount = allDimensionValues.length
@@ -2197,11 +2270,12 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
       const metricHeaders = selectedMetrics.map(m => getMetricById(m)?.label || m)
       const headers = [dimensionLabel, ...metricHeaders]
 
-      // Apply row limit if specified
-      const dimensionRowCount = pivotData.rows.length
-      const rowsToExport = rowLimit && rowLimit < pivotData.rows.length
-        ? pivotData.rows.slice(0, rowLimit)
-        : pivotData.rows
+      // Apply sorting and row limit (respects current table sorting)
+      const sortedRows = sortRows(processedRows)
+      const dimensionRowCount = sortedRows.length
+      const rowsToExport = rowLimit && rowLimit < sortedRows.length
+        ? sortedRows.slice(0, rowLimit)
+        : sortedRows
 
       const rows = rowsToExport.map(row => {
         const metricValues = selectedMetrics.map(metricId => {
@@ -3316,6 +3390,7 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
                                 const [removed] = newOrder.splice(draggedColumnIndex, 1)
                                 newOrder.splice(orderIndex, 0, removed)
                                 setColumnOrder(newOrder)
+                                isColumnOrderSetRef.current = true // Mark as manually set to prevent auto-sort
                                 // Clear children cache to refetch for new first column
                                 setChildrenCache({})
                                 setExpandedRows([])
@@ -3472,7 +3547,7 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
                                             key={`col-${originalColIndex}`}
                                             className={`px-6 ${isFirstMetric ? 'pt-3' : 'pt-1'} ${isLastMetric ? 'pb-3' : 'pb-1'} text-sm text-gray-900 text-right border-r-2 border-gray-300`}
                                           >
-                                            <span className="font-medium">{value != null ? formatMetricValue(value, metricId) : '-'}</span>
+                                            <span className="font-medium"><MetricValueWithWarning value={value} metricId={metricId} columnIndex={originalColIndex} /></span>
                                           </td>
                                         )
                                       } else {
@@ -3489,7 +3564,7 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
                                         return (
                                           <React.Fragment key={`col-${originalColIndex}`}>
                                             <td className={`px-4 ${isFirstMetric ? 'pt-3' : 'pt-1'} ${isLastMetric ? 'pb-3' : 'pb-1'} text-sm text-gray-900 text-right border-l border-gray-200`}>
-                                              <span className="font-medium">{value != null ? formatMetricValue(value, metricId) : '-'}</span>
+                                              <span className="font-medium"><MetricValueWithWarning value={value} metricId={metricId} columnIndex={originalColIndex} /></span>
                                             </td>
                                             <td className={`px-4 ${isFirstMetric ? 'pt-3' : 'pt-1'} ${isLastMetric ? 'pb-3' : 'pb-1'} text-sm ${diffColorClass} text-right`}>
                                               {diff != null ? formatMetricValue(diff, metricId) : '-'}
@@ -3832,7 +3907,7 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
                                       key={`col-${originalColIndex}`}
                                       className={`px-6 ${isFirstMetric ? 'pt-3' : 'pt-1'} ${isLastMetric ? 'pb-3' : 'pb-1'} whitespace-nowrap text-sm text-gray-900 text-right border-r-2 border-gray-300`}
                                     >
-                                      {value != null ? formatMetricValue(value, metricId) : '-'}
+                                      <MetricValueWithWarning value={value} metricId={metricId} columnIndex={originalColIndex} />
                                     </td>
                                   )
                                 } else {
@@ -3849,7 +3924,7 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
                                   return (
                                     <React.Fragment key={`col-${originalColIndex}`}>
                                       <td className={`px-4 ${isFirstMetric ? 'pt-3' : 'pt-1'} ${isLastMetric ? 'pb-3' : 'pb-1'} whitespace-nowrap text-sm text-gray-900 text-right border-l border-gray-200`}>
-                                        {value != null ? formatMetricValue(value, metricId) : '-'}
+                                        <MetricValueWithWarning value={value} metricId={metricId} columnIndex={originalColIndex} />
                                       </td>
                                       <td className={`px-4 ${isFirstMetric ? 'pt-3' : 'pt-1'} ${isLastMetric ? 'pb-3' : 'pb-1'} whitespace-nowrap text-sm ${diffColorClass} text-right`}>
                                         {diff != null ? formatMetricValue(diff, metricId) : '-'}
@@ -3968,10 +4043,16 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
                       }}
                       className={`px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider cursor-move hover:bg-gray-200 transition-colors ${
                         dragOverColumn === metricId ? 'bg-blue-100' : isSorted ? 'bg-gray-100' : ''
-                      }`}
-                      title={metric?.description}
+                      } ${hasMetricWarning(metricId) ? 'bg-amber-50' : ''}`}
+                      title={hasMetricWarning(metricId)
+                        ? 'Warning: This metric may be inflated with the current dimension configuration'
+                        : metric?.description
+                      }
                     >
                       <div className="flex items-center justify-end gap-1">
+                        {hasMetricWarning(metricId) && (
+                          <span className="text-amber-500">⚠️</span>
+                        )}
                         {metric?.label || metricId}
                         {isSorted && (
                           sortConfig.direction === 'desc' ? <ArrowDown size={14} /> : <ArrowUp size={14} />
@@ -4050,7 +4131,7 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
                             key={metricId}
                             className="px-6 py-4 whitespace-nowrap text-sm text-gray-900 text-right"
                           >
-                            {formatMetricValue(value, metricId)}
+                            <MetricValueWithWarning value={value} metricId={metricId} />
                           </td>
                         )
                       })}
