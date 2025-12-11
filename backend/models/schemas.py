@@ -92,6 +92,8 @@ class PivotResponse(BaseModel):
     available_dimensions: List[str]
     dimension_metadata: Optional[dict] = None  # Metadata about the dimension used (e.g., custom dimension name)
     total_count: Optional[int] = None  # Total number of dimension values (for pagination)
+    baseline_totals: Optional[Dict[str, float]] = None  # Totals from simplest rollup (no dimensions) for comparison
+    metric_warnings: Optional[Dict[str, bool]] = None  # Metrics that are potentially inflated (current > baseline)
 
 
 class BigQueryInfo(BaseModel):
@@ -100,6 +102,7 @@ class BigQueryInfo(BaseModel):
     dataset: str
     table: str
     table_full_path: str
+    billing_project: Optional[str] = None  # Project for query computation/billing
     connection_status: str
     date_range: dict
     total_rows: int
@@ -114,6 +117,7 @@ class BigQueryConfig(BaseModel):
     project_id: str
     dataset: str
     table: str
+    billing_project: Optional[str] = None  # Project for query computation/billing (defaults to project_id if not set)
     use_adc: bool = True  # Use Application Default Credentials (gcloud auth)
     credentials_json: str = ""  # Service account JSON (only if use_adc=False)
     allowed_min_date: Optional[str] = None  # Minimum allowed date for queries (YYYY-MM-DD)
@@ -124,6 +128,19 @@ class BigQueryConfigResponse(BaseModel):
     success: bool
     message: str
     connection_status: str
+
+
+# App Settings Models
+
+class AppSettingsResponse(BaseModel):
+    """Global application settings"""
+    default_billing_project: Optional[str] = None
+
+
+class AppSettingsUpdate(BaseModel):
+    """Request to update app settings"""
+    default_billing_project: Optional[str] = None
+
 
 # Multi-Table Management Models
 
@@ -136,6 +153,7 @@ class TableInfoResponse(BaseModel):
     table: str
     created_at: str
     last_used_at: str
+    is_active: bool = False
 
 class TableListResponse(BaseModel):
     """List of all configured tables"""
@@ -148,6 +166,7 @@ class TableCreateRequest(BaseModel):
     dataset: str
     table: str
     credentials_json: str = ""
+    billing_project: Optional[str] = None  # Project for query billing (defaults to project_id if not set)
     allowed_min_date: Optional[str] = None
     allowed_max_date: Optional[str] = None
 
@@ -161,6 +180,7 @@ class TableConfigUpdateRequest(BaseModel):
     dataset: str
     table: str
     credentials_json: str = ""
+    billing_project: Optional[str] = None  # Project for query billing (defaults to project_id if not set)
     allowed_min_date: Optional[str] = None
     allowed_max_date: Optional[str] = None
 
@@ -332,8 +352,14 @@ class ClearLogsResponse(BaseModel):
 
 # Dynamic Schema Models
 
+# DEPRECATED: BaseMetric is no longer used. All metrics should be CalculatedMetric.
+# This class is kept ONLY for backward compatibility with existing stored configs.
 class BaseMetric(BaseModel):
-    """A base metric representing a raw BigQuery column that can be aggregated"""
+    """DEPRECATED: Base metrics are no longer used.
+
+    All metrics should be defined as CalculatedMetric with SQL expressions.
+    This class is kept only for backward compatibility with existing stored schema configs.
+    """
     id: str = Field(..., description="Unique identifier (e.g., 'queries', 'revenue')")
     column_name: str = Field(..., description="Actual BigQuery column name (or comma-separated columns for multi-column COUNT_DISTINCT)")
     display_name: str = Field(..., description="Human-readable name for UI")
@@ -363,6 +389,7 @@ class CalculatedMetric(BaseModel):
     depends_on: List[str] = Field(default_factory=list, description="List of all metric IDs used in formula (both base and calculated)")
     depends_on_base: List[str] = Field(default_factory=list, description="List of base metric IDs used in formula")
     depends_on_calculated: List[str] = Field(default_factory=list, description="List of calculated metric IDs used in formula")
+    depends_on_dimensions: List[str] = Field(default_factory=list, description="List of dimension IDs used in formula SQL expression")
     format_type: Literal["number", "currency", "percent"] = Field(default="number", description="Display format")
     decimal_places: int = Field(default=2, description="Number of decimal places to show")
     category: str = Field(default="other", description="Metric category")
@@ -433,7 +460,9 @@ class ExpressionValidationResult(BaseModel):
 
 class SchemaConfig(BaseModel):
     """Complete schema configuration with all metrics and dimensions"""
-    base_metrics: List[BaseMetric] = Field(default_factory=list, description="List of base metrics")
+    # DEPRECATED: base_metrics kept for backward compatibility but no longer used
+    # All metrics should be defined as calculated_metrics with SQL expressions
+    base_metrics: List[BaseMetric] = Field(default_factory=list, description="DEPRECATED: List of base metrics (kept for backward compatibility)")
     calculated_metrics: List[CalculatedMetric] = Field(default_factory=list, description="List of calculated metrics")
     dimensions: List[DimensionDef] = Field(default_factory=list, description="List of dimensions")
     calculated_dimensions: List[CalculatedDimensionDef] = Field(default_factory=list, description="List of calculated dimensions with SQL expressions")
@@ -450,15 +479,22 @@ class SchemaConfig(BaseModel):
     created_at: str = Field(..., description="ISO timestamp when schema was created")
     updated_at: str = Field(..., description="ISO timestamp when schema was last updated")
 
+# DEPRECATED: SchemaDetectionResult uses detected_base_metrics which are no longer used.
+# Schema detection now creates calculated_metrics directly.
 class SchemaDetectionResult(BaseModel):
-    """Result of auto-detecting schema from BigQuery table"""
-    detected_base_metrics: List[BaseMetric]
+    """Result of auto-detecting schema from BigQuery table.
+
+    Note: detected_base_metrics is DEPRECATED and will always be empty.
+    Detected metrics are now returned as calculated_metrics.
+    """
+    detected_base_metrics: List[BaseMetric] = Field(default_factory=list, description="DEPRECATED: Always empty")
     detected_dimensions: List[DimensionDef]
     column_count: int
     warnings: List[str] = Field(default_factory=list, description="Any warnings during detection")
 
+# DEPRECATED: MetricCreate is no longer used. Use CalculatedMetricCreate instead.
 class MetricCreate(BaseModel):
-    """Request to create a base metric"""
+    """DEPRECATED: Request to create a base metric. Use CalculatedMetricCreate instead."""
     id: str
     column_name: str
     display_name: str
@@ -495,10 +531,13 @@ class DimensionCreate(BaseModel):
     filter_type: Optional[Literal["single", "multi", "range", "date_range", "boolean"]] = None
     description: Optional[str] = None
 
+# DEPRECATED: MetricUpdate is no longer used. Use CalculatedMetricUpdate instead.
 class MetricUpdate(BaseModel):
-    """Request to update a metric (partial update)"""
+    """DEPRECATED: Request to update a base metric. Use CalculatedMetricUpdate instead."""
+    column_name: Optional[str] = None
     display_name: Optional[str] = None
     aggregation: Optional[Literal["SUM", "COUNT", "AVG", "MIN", "MAX", "COUNT_DISTINCT", "APPROX_COUNT_DISTINCT"]] = None
+    data_type: Optional[Literal["INTEGER", "FLOAT", "STRING"]] = None
     format_type: Optional[Literal["number", "currency", "percent"]] = None
     decimal_places: Optional[int] = None
     category: Optional[str] = None
@@ -519,7 +558,9 @@ class CalculatedMetricUpdate(BaseModel):
 
 class DimensionUpdate(BaseModel):
     """Request to update a dimension (partial update)"""
+    column_name: Optional[str] = None
     display_name: Optional[str] = None
+    data_type: Optional[Literal["STRING", "INTEGER", "FLOAT", "DATE", "BOOLEAN"]] = None
     is_filterable: Optional[bool] = None
     is_groupable: Optional[bool] = None
     sort_order: Optional[int] = None
@@ -756,8 +797,10 @@ class CacheClearResponse(BaseModel):
 # Rollup (Pre-Aggregation) Models
 # ============================================================================
 
+# Note: RollupMetricDef is kept for backward compatibility but no longer used
+# in new rollups. All metrics are auto-included from schema.
 class RollupMetricDef(BaseModel):
-    """Definition of a metric within a rollup table."""
+    """Definition of a metric within a rollup table (DEPRECATED - kept for backward compatibility)."""
     metric_id: str = Field(..., description="Reference to base metric ID in schema")
     include_conditional: bool = Field(default=False, description="Whether to include conditional variant (with flag=1)")
     flag_column: Optional[str] = Field(None, description="Column name for conditional flag (required if include_conditional=True)")
@@ -770,18 +813,23 @@ class RollupMetricDef(BaseModel):
 
 
 class RollupDef(BaseModel):
-    """Definition of a pre-aggregated rollup table."""
+    """Definition of a pre-aggregated rollup table.
+
+    Note: Metrics are auto-included from schema (all base metrics + volume calculated metrics).
+    The 'metrics' field is deprecated and kept only for backward compatibility.
+    """
     id: str = Field(..., description="Unique rollup identifier (e.g., 'rollup_date_channel')")
     display_name: str = Field(..., description="Human-readable name for UI")
     description: Optional[str] = Field(None, description="Description of what this rollup is for")
 
     # Dimension configuration
-    dimensions: List[str] = Field(..., min_length=1, description="List of dimension IDs to group by (must include date)")
+    dimensions: List[str] = Field(default_factory=list, description="List of dimension IDs to group by (always includes 'date')")
 
-    # Metric configuration
-    metrics: List[RollupMetricDef] = Field(..., min_length=1, description="Metrics to pre-aggregate")
+    # Metric configuration (DEPRECATED - metrics are auto-included from schema)
+    metrics: Optional[List[RollupMetricDef]] = Field(default=None, description="DEPRECATED: Metrics are auto-included from schema")
 
     # BigQuery table configuration
+    target_project: Optional[str] = Field(None, description="Target project for rollup table (defaults to source project)")
     target_dataset: Optional[str] = Field(None, description="Target dataset for rollup table (defaults to source dataset)")
     target_table_name: Optional[str] = Field(None, description="Target table name (auto-generated if not provided)")
 
@@ -796,17 +844,10 @@ class RollupDef(BaseModel):
     created_at: str = Field(...)
     updated_at: str = Field(...)
 
-    @model_validator(mode='after')
-    def validate_date_dimension(self):
-        """Ensure date is always included as a dimension."""
-        if 'date' not in self.dimensions:
-            raise ValueError("'date' must be included in rollup dimensions")
-        return self
-
-
 class RollupConfig(BaseModel):
     """Configuration for all rollups for a table."""
     rollups: List[RollupDef] = Field(default_factory=list)
+    default_target_project: Optional[str] = Field(None, description="Default project for rollup tables")
     default_target_dataset: Optional[str] = Field(None, description="Default dataset for rollup tables")
     version: int = Field(default=1)
     created_at: str = Field(...)
@@ -814,38 +855,31 @@ class RollupConfig(BaseModel):
 
 
 class RollupCreate(BaseModel):
-    """Request to create a new rollup definition."""
+    """Request to create a new rollup definition.
+
+    Only dimensions need to be specified - all metrics are auto-included from schema.
+    When creating a rollup, ALL dimension combinations are automatically generated
+    (power set), including a baseline rollup with no dimensions.
+    """
     id: Optional[str] = Field(None, description="Rollup ID (auto-generated from dimensions if not provided)")
     display_name: str = Field(..., min_length=1, max_length=100)
     description: Optional[str] = Field(None, max_length=500)
-    dimensions: List[str] = Field(..., min_length=1)
-    metrics: List[RollupMetricDef] = Field(..., min_length=1)
+    dimensions: List[str] = Field(default_factory=list, description="List of dimension IDs - all combinations will be created")
+    # metrics field removed - auto-included from schema
+    target_project: Optional[str] = Field(None)
     target_dataset: Optional[str] = Field(None)
     target_table_name: Optional[str] = Field(None)
-
-    @model_validator(mode='after')
-    def validate_date_dimension(self):
-        """Ensure date is always included as a dimension."""
-        if 'date' not in self.dimensions:
-            raise ValueError("'date' must be included in rollup dimensions")
-        return self
 
 
 class RollupUpdate(BaseModel):
     """Request to update a rollup definition (partial update)."""
     display_name: Optional[str] = Field(None, min_length=1, max_length=100)
     description: Optional[str] = Field(None, max_length=500)
-    dimensions: Optional[List[str]] = Field(None, min_length=1)
-    metrics: Optional[List[RollupMetricDef]] = Field(None, min_length=1)
+    dimensions: Optional[List[str]] = Field(None, description="List of dimension IDs (empty list for baseline rollup)")
+    # metrics field removed - auto-included from schema
+    target_project: Optional[str] = Field(None)
     target_dataset: Optional[str] = Field(None)
     target_table_name: Optional[str] = Field(None)
-
-    @model_validator(mode='after')
-    def validate_date_dimension(self):
-        """Ensure date is always included if dimensions are provided."""
-        if self.dimensions is not None and 'date' not in self.dimensions:
-            raise ValueError("'date' must be included in rollup dimensions")
-        return self
 
 
 class RollupRefreshResponse(BaseModel):
@@ -858,11 +892,28 @@ class RollupRefreshResponse(BaseModel):
     bytes_processed: Optional[int] = None
     row_count: Optional[int] = None
     execution_time_ms: Optional[int] = None
+    # Incremental refresh fields
+    dates_added: Optional[int] = Field(None, description="Number of new dates added (incremental)")
+    dates_processed: Optional[List[str]] = Field(None, description="List of dates that were added")
+    metrics_added: Optional[int] = Field(None, description="Number of new metrics added (incremental)")
+    metrics_processed: Optional[List[str]] = Field(None, description="List of metrics that were added")
+
+
+class RollupStatusResponse(BaseModel):
+    """Response showing rollup status including what's missing."""
+    rollup_id: str
+    table_exists: bool
+    missing_dates: List[str] = Field(default_factory=list)
+    missing_dates_count: int = 0
+    missing_metrics: List[str] = Field(default_factory=list)
+    missing_metrics_count: int = 0
+    is_up_to_date: bool = True
 
 
 class RollupListResponse(BaseModel):
     """Response listing all rollups."""
     rollups: List[RollupDef]
+    default_target_project: Optional[str] = None
     default_target_dataset: Optional[str] = None
 
 
@@ -871,3 +922,93 @@ class RollupPreviewSqlResponse(BaseModel):
     rollup_id: str
     sql: str
     target_table_path: str
+
+
+# ============================================================================
+# Optimized Source Table Models (Precomputed Composite Keys)
+# ============================================================================
+
+class CompositeKeyMapping(BaseModel):
+    """Maps a precomputed composite key column to its source columns."""
+    key_column_name: str = Field(..., description="Name of the precomputed key column (e.g., '_key_query_visit_id')")
+    source_columns: List[str] = Field(..., description="Source columns used in the key (e.g., ['visit_id', 'query'])")
+    metric_ids: List[str] = Field(default_factory=list, description="Metric IDs that use this composite key")
+
+
+class ClusteringConfig(BaseModel):
+    """Clustering configuration for optimized source table."""
+    columns: List[str] = Field(default_factory=list, description="Up to 4 columns for BigQuery clustering")
+    auto_detected: bool = Field(default=False, description="Whether columns were auto-detected based on cardinality")
+
+
+class OptimizedSourceConfig(BaseModel):
+    """Configuration for an optimized source table with precomputed composite keys."""
+    id: str = Field(..., description="Unique ID (UUID)")
+    source_table_path: str = Field(..., description="Original source table path (project.dataset.table)")
+    optimized_table_name: str = Field(..., description="Name of the optimized table")
+    target_project: Optional[str] = Field(None, description="Target project (defaults to source)")
+    target_dataset: Optional[str] = Field(None, description="Target dataset (defaults to source)")
+
+    # Composite key mappings
+    composite_key_mappings: List[CompositeKeyMapping] = Field(default_factory=list)
+
+    # Partitioning and clustering
+    partition_column: str = Field(default="date", description="Column to partition by (always 'date')")
+    clustering: Optional[ClusteringConfig] = Field(None, description="Clustering configuration")
+
+    # Status tracking
+    status: Literal["pending", "building", "ready", "error", "stale"] = Field(default="pending")
+    last_refresh_at: Optional[str] = Field(None)
+    last_refresh_error: Optional[str] = Field(None)
+    row_count: Optional[int] = Field(None)
+    size_bytes: Optional[int] = Field(None)
+
+    # Timestamps
+    created_at: str = Field(...)
+    updated_at: str = Field(...)
+
+
+class OptimizedSourceCreate(BaseModel):
+    """Request to create an optimized source table."""
+    clustering_columns: Optional[List[str]] = Field(None, description="Columns to cluster by (max 4). Auto-detected if not provided.")
+    auto_detect_clustering: bool = Field(default=True, description="Auto-detect high-cardinality columns for clustering")
+    target_project: Optional[str] = Field(None, description="Target project (defaults to source)")
+    target_dataset: Optional[str] = Field(None, description="Target dataset (defaults to source)")
+
+
+class OptimizedSourceResponse(BaseModel):
+    """Response after creating/refreshing optimized source table."""
+    success: bool
+    message: str
+    optimized_table_path: Optional[str] = Field(None, description="Full path to optimized table")
+    composite_keys_created: List[str] = Field(default_factory=list, description="List of key columns created")
+    clustering_columns: List[str] = Field(default_factory=list, description="Columns used for clustering")
+    bytes_processed: Optional[int] = Field(None)
+    row_count: Optional[int] = Field(None)
+    execution_time_ms: Optional[int] = Field(None)
+
+
+class OptimizedSourceStatusResponse(BaseModel):
+    """Status of the optimized source table."""
+    exists: bool = Field(..., description="Whether an optimized source config exists")
+    config: Optional[OptimizedSourceConfig] = Field(None, description="Current configuration if exists")
+    is_stale: bool = Field(default=False, description="Whether the optimized table needs refresh")
+    stale_reasons: List[str] = Field(default_factory=list, description="Reasons why the table is stale")
+    missing_keys: List[str] = Field(default_factory=list, description="Composite keys in schema not in optimized table")
+    optimized_table_path: Optional[str] = Field(None, description="Full path to optimized table")
+
+
+class OptimizedSourceAnalysis(BaseModel):
+    """Analysis of what composite keys would be created from current schema."""
+    composite_keys: List[CompositeKeyMapping] = Field(..., description="Keys that would be created")
+    recommended_clustering: List[str] = Field(default_factory=list, description="Recommended clustering columns")
+    estimated_key_count: int = Field(default=0, description="Number of composite key columns")
+    metrics_with_composite_keys: List[str] = Field(default_factory=list, description="Metric IDs using composite keys")
+
+
+class OptimizedSourcePreviewSql(BaseModel):
+    """Preview SQL for creating optimized source table."""
+    sql: str = Field(..., description="SQL that would be executed")
+    target_table_path: str = Field(..., description="Target table path")
+    composite_keys: List[str] = Field(default_factory=list, description="Key columns that would be created")
+    clustering_columns: List[str] = Field(default_factory=list, description="Clustering columns")

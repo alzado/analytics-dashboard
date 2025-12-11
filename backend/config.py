@@ -21,9 +21,70 @@ DASHBOARDS_DIR = "/app/config/dashboards"
 # Rollup configuration directory
 ROLLUPS_DIR = "/app/config/rollups"
 
+# Optimized source table configuration directory
+OPTIMIZED_SOURCES_DIR = "/app/config/optimized_sources"
+
+# Global app settings
+APP_SETTINGS_FILE = "/app/config/app_settings.json"
+
 # Legacy paths for migration
 LEGACY_CONFIG_FILE = "/app/config/bigquery_config.json"
 LEGACY_SCHEMA_FILE = "/app/config/schema_config.json"
+
+
+class AppSettings:
+    """Global application settings."""
+
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._load()
+        return cls._instance
+
+    def _load(self) -> None:
+        """Load settings from file."""
+        self.default_billing_project: Optional[str] = None
+
+        if os.path.exists(APP_SETTINGS_FILE):
+            try:
+                with open(APP_SETTINGS_FILE, 'r') as f:
+                    data = json.load(f)
+                    self.default_billing_project = data.get('default_billing_project')
+            except Exception as e:
+                print(f"Failed to load app settings: {e}")
+
+    def _save(self) -> None:
+        """Save settings to file."""
+        try:
+            os.makedirs(os.path.dirname(APP_SETTINGS_FILE), exist_ok=True)
+            data = {
+                'default_billing_project': self.default_billing_project
+            }
+            with open(APP_SETTINGS_FILE, 'w') as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            print(f"Failed to save app settings: {e}")
+
+    def get_default_billing_project(self) -> Optional[str]:
+        """Get the default billing project."""
+        return self.default_billing_project
+
+    def set_default_billing_project(self, project: Optional[str]) -> None:
+        """Set the default billing project."""
+        self.default_billing_project = project if project else None
+        self._save()
+
+    def to_dict(self) -> Dict:
+        """Return settings as a dictionary."""
+        return {
+            'default_billing_project': self.default_billing_project
+        }
+
+
+# Global app settings instance
+app_settings = AppSettings()
 
 
 class TableInfo:
@@ -37,6 +98,7 @@ class TableInfo:
         dataset: str,
         table: str,
         credentials_json: str = "",
+        billing_project: Optional[str] = None,
         allowed_min_date: Optional[str] = None,
         allowed_max_date: Optional[str] = None,
         created_at: Optional[str] = None,
@@ -48,6 +110,7 @@ class TableInfo:
         self.dataset = dataset
         self.table = table
         self.credentials_json = credentials_json
+        self.billing_project = billing_project  # Project for query billing (defaults to project_id if not set)
         self.allowed_min_date = allowed_min_date
         self.allowed_max_date = allowed_max_date
         self.created_at = created_at or datetime.utcnow().isoformat()
@@ -61,6 +124,7 @@ class TableInfo:
             'dataset': self.dataset,
             'table': self.table,
             'credentials_json': self.credentials_json,
+            'billing_project': self.billing_project,
             'allowed_min_date': self.allowed_min_date,
             'allowed_max_date': self.allowed_max_date,
             'created_at': self.created_at,
@@ -166,6 +230,7 @@ class TableRegistry:
         dataset: str,
         table: str,
         credentials_json: str = "",
+        billing_project: Optional[str] = None,
         allowed_min_date: Optional[str] = None,
         allowed_max_date: Optional[str] = None
     ) -> TableInfo:
@@ -176,7 +241,8 @@ class TableRegistry:
             name=name,
             project_id=project_id,
             dataset=dataset,
-            table=table
+            table=table,
+            billing_project=billing_project
         )
 
         # Save table config
@@ -185,6 +251,7 @@ class TableRegistry:
             'dataset': dataset,
             'table': table,
             'credentials_json': credentials_json,
+            'billing_project': billing_project,
             'allowed_min_date': allowed_min_date,
             'allowed_max_date': allowed_max_date
         }
@@ -246,6 +313,7 @@ class TableRegistry:
         dataset: str,
         table: str,
         credentials_json: str = "",
+        billing_project: Optional[str] = None,
         allowed_min_date: Optional[str] = None,
         allowed_max_date: Optional[str] = None
     ) -> bool:
@@ -258,6 +326,7 @@ class TableRegistry:
             'dataset': dataset,
             'table': table,
             'credentials_json': credentials_json,
+            'billing_project': billing_project,
             'allowed_min_date': allowed_min_date,
             'allowed_max_date': allowed_max_date
         }
@@ -267,6 +336,7 @@ class TableRegistry:
         self.tables[table_id].project_id = project_id
         self.tables[table_id].dataset = dataset
         self.tables[table_id].table = table
+        self.tables[table_id].billing_project = billing_project
         self._save_registry({'tables': [t.to_dict() for t in self.tables.values()]})
 
         return True

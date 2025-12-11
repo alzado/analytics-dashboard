@@ -3,12 +3,8 @@ import {
   fetchSchema,
   detectSchema,
   resetSchema,
-  fetchBaseMetrics,
   fetchCalculatedMetrics,
   fetchDimensions,
-  createBaseMetric,
-  updateBaseMetric,
-  deleteBaseMetric,
   createCalculatedMetric,
   updateCalculatedMetric,
   deleteCalculatedMetric,
@@ -22,13 +18,10 @@ import {
 } from '@/lib/api'
 import type {
   SchemaConfig,
-  BaseMetric,
   CalculatedMetric,
   DimensionDef,
-  MetricCreate,
   CalculatedMetricCreate,
   DimensionCreate,
-  MetricUpdate,
   CalculatedMetricUpdate,
   DimensionUpdate,
   SchemaDetectionResult,
@@ -42,12 +35,6 @@ export function useSchema(tableId?: string) {
     queryKey: ['schema', tableId],
     queryFn: () => fetchSchema(tableId),
     staleTime: 5 * 60 * 1000, // 5 minutes
-  })
-
-  const baseMetricsQuery = useQuery<BaseMetric[]>({
-    queryKey: ['base-metrics', tableId],
-    queryFn: () => fetchBaseMetrics(tableId),
-    staleTime: 5 * 60 * 1000,
   })
 
   const calculatedMetricsQuery = useQuery<CalculatedMetric[]>({
@@ -79,7 +66,7 @@ export function useSchema(tableId?: string) {
     mutationFn: () => detectSchema(tableId),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['schema', tableId] })
-      queryClient.invalidateQueries({ queryKey: ['base-metrics', tableId] })
+      queryClient.invalidateQueries({ queryKey: ['calculated-metrics', tableId] })
       queryClient.invalidateQueries({ queryKey: ['dimensions', tableId] })
     },
   })
@@ -88,41 +75,10 @@ export function useSchema(tableId?: string) {
     mutationFn: () => resetSchema(tableId),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['schema', tableId] })
-      queryClient.invalidateQueries({ queryKey: ['base-metrics', tableId] })
       queryClient.invalidateQueries({ queryKey: ['calculated-metrics', tableId] })
       queryClient.invalidateQueries({ queryKey: ['dimensions', tableId] })
       queryClient.invalidateQueries({ queryKey: ['filterable-dimensions', tableId] })
       queryClient.invalidateQueries({ queryKey: ['groupable-dimensions', tableId] })
-    },
-  })
-
-  // Base metric mutations
-  const createBaseMetricMutation = useMutation<BaseMetric, Error, MetricCreate>({
-    mutationFn: (data) => createBaseMetric(data, tableId),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['schema', tableId] })
-      queryClient.invalidateQueries({ queryKey: ['base-metrics', tableId] })
-    },
-  })
-
-  const updateBaseMetricMutation = useMutation<
-    { metric: BaseMetric; cascade_updated_count: number; cascade_updated_metrics: string[] },
-    Error,
-    { id: string; data: MetricUpdate }
-  >({
-    mutationFn: ({ id, data }) => updateBaseMetric(id, data, tableId),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['schema', tableId], exact: true })
-      queryClient.invalidateQueries({ queryKey: ['base-metrics', tableId], exact: true })
-      queryClient.invalidateQueries({ queryKey: ['calculated-metrics', tableId], exact: true })
-    },
-  })
-
-  const deleteBaseMetricMutation = useMutation<{ success: boolean; message: string }, Error, string>({
-    mutationFn: (metricId) => deleteBaseMetric(metricId, tableId),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['schema', tableId] })
-      queryClient.invalidateQueries({ queryKey: ['base-metrics', tableId] })
     },
   })
 
@@ -209,10 +165,6 @@ export function useSchema(tableId?: string) {
     isLoadingSchema: schemaQuery.isLoading,
     schemaError: schemaQuery.error,
 
-    baseMetrics: baseMetricsQuery.data ?? [],
-    isLoadingBaseMetrics: baseMetricsQuery.isLoading,
-    baseMetricsError: baseMetricsQuery.error,
-
     calculatedMetrics: calculatedMetricsQuery.data ?? [],
     isLoadingCalculatedMetrics: calculatedMetricsQuery.isLoading,
     calculatedMetricsError: calculatedMetricsQuery.error,
@@ -235,19 +187,6 @@ export function useSchema(tableId?: string) {
     resetSchema: resetSchemaMutation.mutateAsync,
     isResettingSchema: resetSchemaMutation.isPending,
     resetSchemaError: resetSchemaMutation.error,
-
-    // Base metric actions
-    createBaseMetric: createBaseMetricMutation.mutateAsync,
-    isCreatingBaseMetric: createBaseMetricMutation.isPending,
-    createBaseMetricError: createBaseMetricMutation.error,
-
-    updateBaseMetric: updateBaseMetricMutation.mutateAsync,
-    isUpdatingBaseMetric: updateBaseMetricMutation.isPending,
-    updateBaseMetricError: updateBaseMetricMutation.error,
-
-    deleteBaseMetric: deleteBaseMetricMutation.mutateAsync,
-    isDeletingBaseMetric: deleteBaseMetricMutation.isPending,
-    deleteBaseMetricError: deleteBaseMetricMutation.error,
 
     // Calculated metric actions
     createCalculatedMetric: createCalculatedMetricMutation.mutateAsync,

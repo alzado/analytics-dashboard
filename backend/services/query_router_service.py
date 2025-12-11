@@ -1,11 +1,13 @@
 """
 Query Router Service for selecting optimal rollup tables.
 Determines whether to query raw table or pre-aggregated rollups.
+
+Note: Base metrics are DEPRECATED. All metrics should be calculated metrics.
 """
 from typing import List, Dict, Optional, Set, Tuple
 from dataclasses import dataclass, field
 
-from models.schemas import RollupDef, RollupConfig, SchemaConfig, BaseMetric
+from models.schemas import RollupDef, RollupConfig, SchemaConfig
 
 
 @dataclass
@@ -35,44 +37,111 @@ class QueryRouterService:
         self.source_project_id = source_project_id
         self.source_dataset = source_dataset
 
-        # Build metrics lookup
-        self._base_metrics_by_id = {m.id: m for m in schema_config.base_metrics}
-
     def _get_distinct_metrics(self, metric_ids: List[str]) -> Set[str]:
-        """Get the set of metrics that use COUNT_DISTINCT or APPROX_COUNT_DISTINCT."""
+        """Get the set of metrics that behave like COUNT_DISTINCT when aggregated.
+
+        This includes calculated metrics with category="volume" - these are pre-computed
+        COUNT_DISTINCTs stored in rollups. While they CAN be summed, summing across dates
+        causes inflation when entities appear on multiple dates.
+
+        Returns:
+            Set of metric IDs that may cause inflation when re-aggregated across dates.
+        """
         distinct_metrics = set()
         for metric_id in metric_ids:
-            metric = self._base_metrics_by_id.get(metric_id)
-            if metric and metric.aggregation in ("COUNT_DISTINCT", "APPROX_COUNT_DISTINCT"):
+            # Check calculated metrics - volume metrics are stored COUNT DISTINCTs
+            # These can be summed but may cause inflation when re-aggregating across dates
+            calc_metric = next(
+                (m for m in self.schema_config.calculated_metrics if m.id == metric_id),
+                None
+            )
+            if calc_metric and calc_metric.category == "volume":
                 distinct_metrics.add(metric_id)
         return distinct_metrics
 
     def _get_sum_metrics(self, metric_ids: List[str]) -> Set[str]:
-        """Get the set of metrics that use SUM or COUNT (re-aggregatable)."""
+        """Get the set of metrics that can be re-aggregated by summing."""
         sum_metrics = set()
         for metric_id in metric_ids:
-            metric = self._base_metrics_by_id.get(metric_id)
-            if metric and metric.aggregation in ("SUM", "COUNT"):
+            # Check calculated metrics - volume metrics can be summed
+            calc_metric = next(
+                (m for m in self.schema_config.calculated_metrics if m.id == metric_id),
+                None
+            )
+            if calc_metric and calc_metric.category == "volume":
                 sum_metrics.add(metric_id)
         return sum_metrics
 
     def _get_rollup_table_path(self, rollup: RollupDef) -> str:
         """Get the full BigQuery table path for a rollup."""
+        # Use rollup-specific target, then global default, then source as fallback
+        target_project = (
+            rollup.target_project or
+            (self.rollup_config.default_target_project if self.rollup_config else None) or
+            self.source_project_id
+        )
         target_dataset = (
             rollup.target_dataset or
             (self.rollup_config.default_target_dataset if self.rollup_config else None) or
             self.source_dataset
         )
-        return f"{self.source_project_id}.{target_dataset}.{rollup.target_table_name}"
+        return f"{target_project}.{target_dataset}.{rollup.target_table_name}"
 
     def _get_rollup_metrics(self, rollup: RollupDef) -> Set[str]:
-        """Get all metrics available in a rollup (including conditional variants)."""
+        """
+        Get all metrics available in a rollup.
+
+        Metrics are auto-derived from schema:
+        1. Volume calculated metrics (stored in rollup)
+        2. Conversion metrics (calculated in Python from available volumes)
+        """
         available = set()
-        for metric_def in rollup.metrics:
-            available.add(metric_def.metric_id)
-            if metric_def.include_conditional:
-                available.add(f"{metric_def.metric_id}_flagged")
+
+        # All volume calculated metrics are auto-included
+        for m in self.schema_config.calculated_metrics:
+            if m.category == "volume":
+                available.add(m.id)
+
+        # Conversion metrics can be calculated if their dependencies are available
+        for calc_metric in self.schema_config.calculated_metrics:
+            if calc_metric.category != "volume":
+                # Check if all dependencies are available
+                if calc_metric.depends_on and all(dep in available for dep in calc_metric.depends_on):
+                    available.add(calc_metric.id)
+
         return available
+
+    def find_simplest_rollup(self) -> Optional[RollupDef]:
+        """
+        Find rollup with only 'date' dimension (baseline) for metric comparison.
+
+        Used to detect metric inflation from dimensional aggregation.
+        The baseline rollup has only the date dimension for time-series totals.
+
+        Returns:
+            RollupDef with only 'date' dimension and 'ready' status, or None if not found
+        """
+        if not self.rollup_config or not self.rollup_config.rollups:
+            return None
+
+        # Find rollup with only 'date' dimension and ready status
+        for rollup in self.rollup_config.rollups:
+            if rollup.dimensions == ['date'] and rollup.status == "ready":
+                return rollup
+
+        return None
+
+    def get_baseline_rollup_path(self) -> Optional[str]:
+        """
+        Get the table path for the baseline rollup (no dimensions).
+
+        Returns:
+            Full BigQuery table path for baseline rollup, or None if not found
+        """
+        baseline = self.find_simplest_rollup()
+        if baseline:
+            return self._get_rollup_table_path(baseline)
+        return None
 
     def _score_rollup(
         self,
@@ -84,6 +153,14 @@ class QueryRouterService:
     ) -> Tuple[int, bool, str]:
         """
         Score a rollup for a given query.
+
+        Matching rules:
+        1. Rollup must have all query dimensions
+        2. Rollup must have all filter dimensions
+        3. Rollup must have all required metrics
+        4. SPECIAL CASE: When query has no dimensions (totals query), allow using
+           a date-only rollup with re-aggregation (for non-DISTINCT metrics)
+        5. For DISTINCT metrics, require exact dimension match (no re-aggregation)
 
         Returns:
             Tuple of (score, needs_reaggregation, reason)
@@ -111,26 +188,31 @@ class QueryRouterService:
             missing = query_metrics - rollup_metrics
             return -1, False, f"Missing metrics: {missing}"
 
-        # For COUNT DISTINCT metrics, require exact dimension match
-        # (cannot re-aggregate distinct counts)
-        if distinct_metrics:
-            if rollup_dims != query_dimensions:
-                extra = rollup_dims - query_dimensions
-                return -1, False, f"Cannot re-aggregate COUNT_DISTINCT; rollup has extra dimensions: {extra}"
+        # Check for extra dimensions in rollup
+        # Extra dims are rollup dimensions that are NOT in query dimensions AND NOT in filter dimensions
+        # Filter dimensions don't count as "extra" because we're filtering on them (not re-aggregating)
+        extra_dims = rollup_dims - query_dimensions - filter_dimensions
 
-        # Calculate score
-        extra_dims = len(rollup_dims - query_dimensions)
-        needs_reaggregation = extra_dims > 0
+        if extra_dims:
+            # SPECIAL CASE: Allow re-aggregation when the only extra dimension is 'date'
+            # This enables using rollups with date + other dimensions and summing across dates
+            # Example: query for ['experiment_group'] can use rollup ['date', 'experiment_group']
+            if extra_dims == {'date'}:
+                # For DISTINCT metrics, allow re-aggregation but with lower score (will show warning in UI)
+                # The values will be slightly inflated due to cross-date overlap, but this is often acceptable
+                # Give lower score (80) for DISTINCT vs (100) for non-DISTINCT to prefer exact match when available
+                if distinct_metrics:
+                    return 80, True, "OK (re-aggregating COUNT DISTINCT across dates - may have slight inflation)"
+                # Allow re-aggregation for non-DISTINCT metrics
+                # Give slightly lower score than exact match (100 vs 150) to prefer exact match when available
+                return 100, True, "OK (re-aggregating across dates)"
 
-        # Base score: 100
-        score = 100
+            # For other cases, strict mode - no re-aggregation allowed
+            return -1, False, f"Rollup has extra dimensions: {extra_dims}. Exact match required (strict mode - no re-aggregation allowed)"
 
-        # Bonus for exact match
-        if extra_dims == 0:
-            score += 50
-
-        # Penalty for extra dimensions (need to re-aggregate)
-        score -= extra_dims * 5
+        # Exact dimension match - no re-aggregation needed
+        score = 150
+        needs_reaggregation = False
 
         return score, needs_reaggregation, "OK"
 

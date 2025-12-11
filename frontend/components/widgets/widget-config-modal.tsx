@@ -83,7 +83,6 @@ export function WidgetConfigModal({ dashboardId, widget, onClose }: WidgetConfig
   }
 
   const allMetrics = [
-    ...(schema?.base_metrics || []).map((m) => ({ id: m.id, name: m.display_name })),
     ...(schema?.calculated_metrics || []).map((m) => ({ id: m.id, name: m.display_name })),
   ]
 

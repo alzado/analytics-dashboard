@@ -20,7 +20,7 @@ from services.bigquery_service import (
 from services.custom_dimension_service import get_custom_dimension_service
 from services.query_logger import initialize_query_logger
 from services.query_cache_service import initialize_query_cache, get_query_cache, QueryCacheService
-from config import CUSTOM_DIMENSIONS_FILE, QUERY_LOGS_DB_PATH, table_registry, dashboard_registry
+from config import CUSTOM_DIMENSIONS_FILE, QUERY_LOGS_DB_PATH, table_registry, dashboard_registry, app_settings
 from models.schemas import (
     FilterParams,
     PivotResponse,
@@ -87,7 +87,18 @@ from models.schemas import (
     RollupRefreshResponse,
     RollupListResponse,
     RollupPreviewSqlResponse,
-    RollupMetricDef
+    RollupMetricDef,
+    RollupStatusResponse,
+    # Optimized source models
+    OptimizedSourceConfig,
+    OptimizedSourceCreate,
+    OptimizedSourceResponse,
+    OptimizedSourceStatusResponse,
+    OptimizedSourceAnalysis,
+    OptimizedSourcePreviewSql,
+    # App settings models
+    AppSettingsResponse,
+    AppSettingsUpdate,
 )
 from services.statistical_service import StatisticalService
 
@@ -181,7 +192,8 @@ async def startup_event():
                             dataset=table_info.dataset,
                             table=table_info.table,
                             credentials_json=table_info.credentials_json,
-                            table_id=table_info.table_id
+                            table_id=table_info.table_id,
+                            billing_project=table_info.billing_project
                         )
                     else:
                         bq_service = initialize_bigquery_service(
@@ -189,7 +201,8 @@ async def startup_event():
                             dataset=table_info.dataset,
                             table=table_info.table,
                             credentials_path=None,
-                            table_id=table_info.table_id
+                            table_id=table_info.table_id,
+                            billing_project=table_info.billing_project
                         )
 
                     # Set date limits
@@ -218,6 +231,26 @@ async def health_check():
     """Health check endpoint"""
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
+
+# =============================================================================
+# Global App Settings Endpoints
+# =============================================================================
+
+@app.get("/api/settings", response_model=AppSettingsResponse)
+async def get_app_settings():
+    """Get global application settings"""
+    return AppSettingsResponse(**app_settings.to_dict())
+
+
+@app.put("/api/settings", response_model=AppSettingsResponse)
+async def update_app_settings(settings_update: AppSettingsUpdate):
+    """Update global application settings"""
+    if settings_update.default_billing_project is not None:
+        app_settings.set_default_billing_project(settings_update.default_billing_project)
+
+    return AppSettingsResponse(**app_settings.to_dict())
+
+
 @app.get("/api/bigquery/info", response_model=BigQueryInfo)
 async def get_bigquery_information(table_id: Optional[str] = Query(None, description="Optional table ID to get info for")):
     """Get BigQuery connection status and table information"""
@@ -235,14 +268,14 @@ async def configure_bigquery(bq_config: BigQueryConfig):
         default_table = next((t for t in tables if t.name == "default"), None)
 
         if default_table:
-            # Update existing default table
-            table_registry.update_table(
+            # Update existing default table config
+            table_registry.update_table_config(
                 table_id=default_table.table_id,
-                name="default",
                 project_id=bq_config.project_id,
                 dataset=bq_config.dataset,
                 table=bq_config.table,
                 credentials_json=bq_config.credentials_json if not bq_config.use_adc else "",
+                billing_project=bq_config.billing_project,
                 allowed_min_date=bq_config.allowed_min_date,
                 allowed_max_date=bq_config.allowed_max_date
             )
@@ -255,6 +288,7 @@ async def configure_bigquery(bq_config: BigQueryConfig):
                 dataset=bq_config.dataset,
                 table=bq_config.table,
                 credentials_json=bq_config.credentials_json if not bq_config.use_adc else "",
+                billing_project=bq_config.billing_project,
                 allowed_min_date=bq_config.allowed_min_date,
                 allowed_max_date=bq_config.allowed_max_date
             )
@@ -268,7 +302,8 @@ async def configure_bigquery(bq_config: BigQueryConfig):
                 dataset=bq_config.dataset,
                 table=bq_config.table,
                 credentials_path=None,  # Will use ADC
-                table_id=table_id
+                table_id=table_id,
+                billing_project=bq_config.billing_project
             )
             message = "BigQuery configured successfully using your Google Cloud credentials"
         else:
@@ -280,7 +315,8 @@ async def configure_bigquery(bq_config: BigQueryConfig):
                 dataset=bq_config.dataset,
                 table=bq_config.table,
                 credentials_json=bq_config.credentials_json,
-                table_id=table_id
+                table_id=table_id,
+                billing_project=bq_config.billing_project
             )
             message = "BigQuery configured successfully using service account credentials"
 
@@ -339,7 +375,7 @@ async def disconnect_bigquery(table_id: Optional[str] = Query(None, description=
 # Multi-Table Management Endpoints
 
 @app.get("/api/tables", response_model=TableListResponse)
-async def list_tables():
+async def list_tables(active_table_id: Optional[str] = None):
     """List all configured BigQuery table connections"""
     try:
         tables = table_registry.list_tables()
@@ -352,7 +388,8 @@ async def list_tables():
                 dataset=t.dataset,
                 table=t.table,
                 created_at=t.created_at,
-                last_used_at=t.last_used_at
+                last_used_at=t.last_used_at,
+                is_active=(t.table_id == active_table_id) if active_table_id else False
             )
             for t in tables
         ]
@@ -374,6 +411,7 @@ async def create_table(request: TableCreateRequest):
             dataset=request.dataset,
             table=request.table,
             credentials_json=request.credentials_json,
+            billing_project=request.billing_project,
             allowed_min_date=request.allowed_min_date,
             allowed_max_date=request.allowed_max_date
         )
@@ -385,7 +423,8 @@ async def create_table(request: TableCreateRequest):
                 dataset=request.dataset,
                 table=request.table,
                 credentials_json=request.credentials_json,
-                table_id=table_info.table_id
+                table_id=table_info.table_id,
+                billing_project=request.billing_project
             )
         else:
             bq_service = initialize_bigquery_service(
@@ -393,7 +432,8 @@ async def create_table(request: TableCreateRequest):
                 dataset=request.dataset,
                 table=request.table,
                 credentials_path=None,
-                table_id=table_info.table_id
+                table_id=table_info.table_id,
+                billing_project=request.billing_project
             )
 
         # Set date limits
@@ -486,6 +526,7 @@ async def update_table_config(table_id: str, request: TableConfigUpdateRequest):
             dataset=request.dataset,
             table=request.table,
             credentials_json=request.credentials_json,
+            billing_project=request.billing_project,
             allowed_min_date=request.allowed_min_date,
             allowed_max_date=request.allowed_max_date
         )
@@ -500,7 +541,8 @@ async def update_table_config(table_id: str, request: TableConfigUpdateRequest):
                 dataset=request.dataset,
                 table=request.table,
                 credentials_json=request.credentials_json,
-                table_id=table_id
+                table_id=table_id,
+                billing_project=request.billing_project
             )
         else:
             bq_service = initialize_bigquery_service(
@@ -508,7 +550,8 @@ async def update_table_config(table_id: str, request: TableConfigUpdateRequest):
                 dataset=request.dataset,
                 table=request.table,
                 credentials_path=None,
-                table_id=table_id
+                table_id=table_id,
+                billing_project=request.billing_project
             )
 
         # Set date limits
@@ -803,97 +846,46 @@ async def update_pivot_config(update: PivotConfigUpdate, table_id: Optional[str]
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# Base Metrics Endpoints
+# Base Metrics Endpoints - DEPRECATED
+# Base metrics are no longer used. All metrics should be calculated metrics.
+# These endpoints are kept for backward compatibility but return empty lists.
 
 @app.get("/api/metrics/base", response_model=List[BaseMetric])
 async def list_base_metrics(table_id: Optional[str] = Query(None, description="Table ID to get metrics for")):
-    """List all base metrics"""
-    try:
-        services = get_schema_services(table_id)
-        if services is None:
-            return []  # No tables configured
-        _, metric_service, _ = services
-        return metric_service.list_base_metrics()
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    """DEPRECATED: List all base metrics. Returns empty list - use calculated metrics instead."""
+    return []  # Base metrics are deprecated, always return empty
 
 @app.post("/api/metrics/base", response_model=BaseMetric)
 async def create_base_metric(metric: MetricCreate, table_id: Optional[str] = Query(None, description="Optional table ID")):
-    """Create a new base metric"""
-    try:
-        services = get_schema_services(table_id)
-        if services is None:
-            raise HTTPException(status_code=400, detail="BigQuery not configured")
-        _, metric_service, _ = services
-        return metric_service.create_base_metric(metric)
-    except HTTPException:
-        raise
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    """DEPRECATED: Create a new base metric. Use calculated metrics instead."""
+    raise HTTPException(
+        status_code=410,  # Gone
+        detail="Base metrics are deprecated. Please use calculated metrics instead (POST /api/metrics/calculated)"
+    )
 
 @app.get("/api/metrics/base/{metric_id}", response_model=BaseMetric)
 async def get_base_metric(metric_id: str, table_id: Optional[str] = Query(None, description="Optional table ID")):
-    """Get a specific base metric"""
-    try:
-        services = get_schema_services(table_id)
-        if services is None:
-            raise HTTPException(status_code=400, detail="BigQuery not configured")
-        _, metric_service, _ = services
-        metric = metric_service.get_base_metric(metric_id)
-
-        if metric is None:
-            raise HTTPException(status_code=404, detail=f"Base metric '{metric_id}' not found")
-
-        return metric
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    """DEPRECATED: Get a specific base metric."""
+    raise HTTPException(
+        status_code=410,  # Gone
+        detail="Base metrics are deprecated. Please use calculated metrics instead"
+    )
 
 @app.put("/api/metrics/base/{metric_id}")
 async def update_base_metric(metric_id: str, update: MetricUpdate, table_id: Optional[str] = Query(None, description="Optional table ID")):
-    """Update a base metric and cascade update dependents"""
-    try:
-        services = get_schema_services(table_id)
-        if services is None:
-            raise HTTPException(status_code=400, detail="BigQuery not configured")
-        _, metric_service, _ = services
-
-        # Update the base metric
-        updated_metric = metric_service.update_base_metric(metric_id, update)
-
-        # Cascade update all dependent calculated metrics
-        cascade_result = metric_service.cascade_update_dependents(metric_id, metric_type='base')
-
-        return {
-            "metric": updated_metric,
-            "cascade_updated_count": cascade_result['updated_count'],
-            "cascade_updated_metrics": cascade_result['updated_metrics']
-        }
-    except HTTPException:
-        raise
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    """DEPRECATED: Update a base metric."""
+    raise HTTPException(
+        status_code=410,  # Gone
+        detail="Base metrics are deprecated. Please use calculated metrics instead (PUT /api/metrics/calculated/{metric_id})"
+    )
 
 @app.delete("/api/metrics/base/{metric_id}")
 async def delete_base_metric(metric_id: str, table_id: Optional[str] = Query(None, description="Table ID")):
-    """Delete a base metric"""
-    try:
-        _, metric_service, _ = get_schema_services(table_id)
-        metric_service.delete_base_metric(metric_id)
-        return {"success": True, "message": f"Base metric '{metric_id}' deleted"}
-    except HTTPException:
-        raise
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    """DEPRECATED: Delete a base metric."""
+    raise HTTPException(
+        status_code=410,  # Gone
+        detail="Base metrics are deprecated. Please use calculated metrics instead"
+    )
 
 # Calculated Metrics Endpoints
 
@@ -1338,6 +1330,7 @@ async def get_pivot_table(
     table_id: Optional[str] = Query(None, description="Optional table ID for multi-table widget support"),
     skip_count: bool = Query(False, description="Skip count query for initial load (saves 1 BigQuery query)"),
     metrics: Optional[List[str]] = Query(None, description="Optional list of metric IDs to calculate (default: all metrics)"),
+    require_rollup: bool = Query(True, description="If true (default), return error when no suitable rollup exists. Set to false to fall back to raw table."),
 ):
     """
     Get pivot table data grouped by specified dimension(s).
@@ -1349,6 +1342,7 @@ async def get_pivot_table(
     - Performance: ?skip_count=true (skip count query on initial load)
     - Performance: ?metrics=queries&metrics=revenue (only calculate specified metrics)
     - Relative dates: ?date_range_type=relative&relative_date_preset=last_7_days
+    - Rollup routing: ?require_rollup=true (error if no rollup, otherwise use raw table)
     """
     try:
         # Parse dynamic dimension filters from query parameters
@@ -1361,7 +1355,13 @@ async def get_pivot_table(
             relative_date_preset=relative_date_preset,
             dimension_filters=dimension_filters
         )
-        return data_service.get_pivot_data(dimensions, filters, limit, offset, dimension_values, table_id, skip_count, metrics)
+        return data_service.get_pivot_data(dimensions, filters, limit, offset, dimension_values, table_id, skip_count, metrics, require_rollup)
+    except ValueError as e:
+        # ValueError is raised when no suitable rollup exists
+        error_msg = str(e)
+        if "No suitable rollup found" in error_msg:
+            raise HTTPException(status_code=400, detail=error_msg)
+        raise HTTPException(status_code=500, detail=error_msg)
     except Exception as e:
         import traceback
         traceback.print_exc()  # Print full traceback to console
@@ -1714,9 +1714,21 @@ async def get_rollup(rollup_id: str, table_id: Optional[str] = None):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/rollups", response_model=RollupDef)
+@app.post("/api/rollups", response_model=List[RollupDef])
 async def create_rollup(data: RollupCreate, table_id: Optional[str] = None):
-    """Create a new rollup definition"""
+    """Create rollup definitions for ALL dimension combinations.
+
+    When given dimensions [A, B, C], creates 2^n rollups (8 total):
+    - Baseline (no dimensions - pure totals for metric comparison)
+    - Single dimensions: A, B, C
+    - Pairs: A+B, A+C, B+C
+    - Full: A+B+C
+
+    Only dimensions need to be specified - all metrics are auto-included from schema.
+
+    Returns:
+        List of all created RollupDef objects
+    """
     try:
         rollup_service, bq_service = get_rollup_service(table_id)
         if not rollup_service or not bq_service:
@@ -1731,14 +1743,10 @@ async def create_rollup(data: RollupCreate, table_id: Optional[str] = None):
             if dim not in valid_dims:
                 raise HTTPException(status_code=400, detail=f"Unknown dimension: {dim}")
 
-        # Validate metrics exist in schema
-        valid_metrics = {m.id for m in bq_service.schema_config.base_metrics}
-        for metric_def in data.metrics:
-            if metric_def.metric_id not in valid_metrics:
-                raise HTTPException(status_code=400, detail=f"Unknown metric: {metric_def.metric_id}")
+        # Note: Metrics are auto-included from schema - no validation needed
 
-        rollup = rollup_service.create_rollup(data, bq_service.schema_config)
-        return rollup
+        rollups = rollup_service.create_rollup(data, bq_service.schema_config)
+        return rollups
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except HTTPException:
@@ -1799,10 +1807,20 @@ async def delete_rollup(
 @app.post("/api/rollups/{rollup_id}/refresh", response_model=RollupRefreshResponse)
 async def refresh_rollup(
     rollup_id: str,
-    force: bool = False,
+    incremental: bool = Query(False, description="If true, only add missing dates and metrics"),
+    force: bool = Query(False, description="Force refresh even if status is ready"),
+    use_batched: bool = Query(True, description="Use batched inserts for partition pruning (default: true)"),
+    batch_size: int = Query(7, description="Number of dates per batch (default: 7 for balanced partition pruning)"),
     table_id: Optional[str] = None
 ):
-    """Refresh (rebuild) a rollup table in BigQuery"""
+    """Refresh a rollup table in BigQuery.
+
+    - incremental=false (default): Full rebuild
+    - incremental=true: Only INSERT missing dates and ADD missing metric columns
+    - use_batched=true (default): Use batched inserts to leverage partition pruning on source table.
+      This is more efficient when source table is partitioned by date.
+    - use_batched=false: Use single CREATE TABLE AS SELECT (full table scan)
+    """
     try:
         rollup_service, bq_service = get_rollup_service(table_id)
         if not rollup_service or not bq_service:
@@ -1817,7 +1835,10 @@ async def refresh_rollup(
             schema_config=bq_service.schema_config,
             source_project_id=bq_service.project_id,
             source_dataset=bq_service.dataset,
-            force=force
+            incremental=incremental,
+            force=force,
+            use_batched=use_batched,
+            batch_size=batch_size
         )
 
         return result
@@ -1839,6 +1860,41 @@ async def preview_rollup_sql(rollup_id: str, table_id: Optional[str] = None):
             raise HTTPException(status_code=400, detail="Schema not configured")
 
         result = rollup_service.preview_sql(
+            rollup_id=rollup_id,
+            source_table_path=bq_service.table_path,
+            schema_config=bq_service.schema_config,
+            source_project_id=bq_service.project_id,
+            source_dataset=bq_service.dataset
+        )
+
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/rollups/{rollup_id}/status", response_model=RollupStatusResponse)
+async def get_rollup_status(rollup_id: str, table_id: Optional[str] = None):
+    """Get detailed status of a rollup including what's missing.
+
+    Returns information about:
+    - Whether the rollup table exists
+    - Missing dates (dates in source but not in rollup)
+    - Missing metrics (metrics in schema but not in rollup table)
+    - Whether the rollup is up to date
+    """
+    try:
+        rollup_service, bq_service = get_rollup_service(table_id)
+        if not rollup_service or not bq_service:
+            raise HTTPException(status_code=400, detail="BigQuery not configured")
+
+        if not bq_service.schema_config:
+            raise HTTPException(status_code=400, detail="Schema not configured")
+
+        result = rollup_service.get_rollup_status(
             rollup_id=rollup_id,
             source_table_path=bq_service.table_path,
             schema_config=bq_service.schema_config,
@@ -1890,6 +1946,28 @@ async def refresh_all_rollups(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.put("/api/rollups/config/default-project")
+async def set_default_rollup_project(
+    project: Optional[str] = None,
+    table_id: Optional[str] = None
+):
+    """Set the default target project for rollups"""
+    try:
+        rollup_service, bq_service = get_rollup_service(table_id)
+        if not rollup_service:
+            raise HTTPException(status_code=400, detail="BigQuery not configured")
+
+        config = rollup_service.set_default_project(project)
+        return {
+            "success": True,
+            "default_target_project": config.default_target_project
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.put("/api/rollups/config/default-dataset")
 async def set_default_rollup_dataset(
     dataset: Optional[str] = None,
@@ -1906,6 +1984,197 @@ async def set_default_rollup_dataset(
             "success": True,
             "default_target_dataset": config.default_target_dataset
         }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# OPTIMIZED SOURCE ENDPOINTS (Precomputed Composite Keys)
+# ============================================================================
+
+def get_optimized_source_service(table_id: Optional[str] = None):
+    """Get optimized source service for a table."""
+    from services.optimized_source_service import OptimizedSourceService
+    from services.bigquery_service import get_bigquery_service
+
+    bq_service = get_bigquery_service(table_id)
+    if not bq_service:
+        return None, None
+
+    service = OptimizedSourceService(bq_service.client, bq_service.table_id or table_id)
+    return service, bq_service
+
+
+@app.get("/api/optimized-source/status", response_model=OptimizedSourceStatusResponse)
+async def get_optimized_source_status(table_id: Optional[str] = None):
+    """Get status of optimized source table for a BigQuery table."""
+    try:
+        service, bq_service = get_optimized_source_service(table_id)
+        if not service or not bq_service:
+            raise HTTPException(status_code=400, detail="BigQuery not configured")
+
+        if not bq_service.schema_config:
+            raise HTTPException(status_code=400, detail="Schema not configured")
+
+        source_table_path = f"{bq_service.project_id}.{bq_service.dataset}.{bq_service.table}"
+
+        return service.get_status(source_table_path, bq_service.schema_config)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/optimized-source/analyze", response_model=OptimizedSourceAnalysis)
+async def analyze_optimized_source(table_id: Optional[str] = None):
+    """Analyze schema to show what composite keys would be created."""
+    try:
+        service, bq_service = get_optimized_source_service(table_id)
+        if not service or not bq_service:
+            raise HTTPException(status_code=400, detail="BigQuery not configured")
+
+        if not bq_service.schema_config:
+            raise HTTPException(status_code=400, detail="Schema not configured")
+
+        source_table_path = f"{bq_service.project_id}.{bq_service.dataset}.{bq_service.table}"
+
+        return service.analyze(source_table_path, bq_service.schema_config)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/optimized-source/preview-sql", response_model=OptimizedSourcePreviewSql)
+async def preview_optimized_source_sql(
+    table_id: Optional[str] = None,
+    auto_detect_clustering: bool = Query(True, description="Auto-detect clustering columns"),
+    target_project: Optional[str] = Query(None, description="Target project for optimized table"),
+    target_dataset: Optional[str] = Query(None, description="Target dataset for optimized table"),
+):
+    """Preview the SQL that would be generated for optimized source table."""
+    try:
+        service, bq_service = get_optimized_source_service(table_id)
+        if not service or not bq_service:
+            raise HTTPException(status_code=400, detail="BigQuery not configured")
+
+        if not bq_service.schema_config:
+            raise HTTPException(status_code=400, detail="Schema not configured")
+
+        source_table_path = f"{bq_service.project_id}.{bq_service.dataset}.{bq_service.table}"
+
+        # Get rollup defaults if target_project/target_dataset not provided
+        rollup_service, _ = get_rollup_service(table_id)
+        if rollup_service:
+            rollup_config = rollup_service.load_config()
+            if not target_project and rollup_config.default_target_project:
+                target_project = rollup_config.default_target_project
+            if not target_dataset and rollup_config.default_target_dataset:
+                target_dataset = rollup_config.default_target_dataset
+
+        data = OptimizedSourceCreate(
+            auto_detect_clustering=auto_detect_clustering,
+            target_project=target_project,
+            target_dataset=target_dataset,
+        )
+
+        return service.preview_sql(
+            source_table_path,
+            bq_service.schema_config,
+            data,
+            bq_service.project_id,
+            bq_service.dataset
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/optimized-source/create", response_model=OptimizedSourceResponse)
+async def create_optimized_source(
+    data: OptimizedSourceCreate,
+    table_id: Optional[str] = None
+):
+    """Create optimized source table with precomputed composite keys."""
+    try:
+        service, bq_service = get_optimized_source_service(table_id)
+        if not service or not bq_service:
+            raise HTTPException(status_code=400, detail="BigQuery not configured")
+
+        if not bq_service.schema_config:
+            raise HTTPException(status_code=400, detail="Schema not configured")
+
+        source_table_path = f"{bq_service.project_id}.{bq_service.dataset}.{bq_service.table}"
+
+        # Get rollup defaults if target_project/target_dataset not provided in data
+        rollup_service, _ = get_rollup_service(table_id)
+        if rollup_service:
+            rollup_config = rollup_service.load_config()
+            if not data.target_project and rollup_config.default_target_project:
+                data.target_project = rollup_config.default_target_project
+            if not data.target_dataset and rollup_config.default_target_dataset:
+                data.target_dataset = rollup_config.default_target_dataset
+
+        return service.create_optimized_source(
+            source_table_path,
+            bq_service.schema_config,
+            data,
+            bq_service.project_id,
+            bq_service.dataset
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/optimized-source/refresh", response_model=OptimizedSourceResponse)
+async def refresh_optimized_source(
+    incremental: bool = Query(True, description="If true, only add new dates"),
+    table_id: Optional[str] = None
+):
+    """Refresh the optimized source table."""
+    try:
+        service, bq_service = get_optimized_source_service(table_id)
+        if not service or not bq_service:
+            raise HTTPException(status_code=400, detail="BigQuery not configured")
+
+        if not bq_service.schema_config:
+            raise HTTPException(status_code=400, detail="Schema not configured")
+
+        source_table_path = f"{bq_service.project_id}.{bq_service.dataset}.{bq_service.table}"
+
+        return service.refresh_optimized_source(
+            source_table_path,
+            bq_service.schema_config,
+            incremental
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/optimized-source")
+async def delete_optimized_source(
+    drop_table: bool = Query(False, description="Also drop the BigQuery table"),
+    table_id: Optional[str] = None
+):
+    """Delete optimized source configuration and optionally the BigQuery table."""
+    try:
+        service, bq_service = get_optimized_source_service(table_id)
+        if not service or not bq_service:
+            raise HTTPException(status_code=400, detail="BigQuery not configured")
+
+        success, message = service.delete_optimized_source(drop_table)
+
+        if not success:
+            raise HTTPException(status_code=400, detail=message)
+
+        return {"success": success, "message": message}
     except HTTPException:
         raise
     except Exception as e:
@@ -2113,20 +2382,70 @@ async def calculate_significance(
         base_dim_filters = request.filters.dimension_filters or {}
         control_dim_filters = request.control_column.dimension_filters or {}
 
+        # === ROLLUP ROUTING ===
+        # Collect ALL dimensions used in any filters (table dims + row dims)
+        # A rollup must have ALL these dimensions to be usable
+        filter_dimensions = set()
+        # From base filters
+        filter_dimensions.update(base_dim_filters.keys())
+        # From control column filters (table dimensions)
+        filter_dimensions.update(control_dim_filters.keys())
+        # From treatment column filters
+        for treatment in request.treatment_columns:
+            if treatment.dimension_filters:
+                filter_dimensions.update(treatment.dimension_filters.keys())
+        # From row dimension filters
+        if request.rows:
+            for row in request.rows:
+                if row.dimension_filters:
+                    filter_dimensions.update(row.dimension_filters.keys())
+
+        # Get route decision - need rollup with ALL filter dimensions
+        # Create a dummy filter dict with just the keys (values don't matter for routing)
+        routing_filters = FilterParams(
+            dimension_filters={d: [] for d in filter_dimensions}
+        ) if filter_dimensions else None
+
+        route_decision = bq_service.get_route_decision(
+            dimensions=[],  # No GROUP BY needed (we're aggregating totals)
+            metrics=list(base_metrics_needed),
+            filters=routing_filters,
+            require_rollup=False
+        )
+
+        use_rollup = route_decision.use_rollup
+        rollup_table_path = route_decision.rollup_table_path if use_rollup else None
+
+        # Log routing decision
+        print(f"Significance test routing: use_rollup={use_rollup}, reason={route_decision.reason}")
+
         # Helper function to fetch aggregated totals with combined filters
         def fetch_aggregated_totals(extra_filters: Dict[str, List[str]] = None) -> Dict[str, float]:
             combined_filters = {**base_dim_filters}
             if extra_filters:
                 combined_filters.update(extra_filters)
-            filters = FilterParams(
-                start_date=request.filters.start_date,
-                end_date=request.filters.end_date,
-                date_range_type=request.filters.date_range_type,
-                relative_date_preset=request.filters.relative_date_preset,
-                dimension_filters=combined_filters
-            )
-            # Use query_kpi_metrics for aggregated totals
-            return bq_service.query_kpi_metrics(filters=filters)
+
+            if use_rollup and rollup_table_path:
+                # Use rollup table with re-aggregation (SUM metrics)
+                return bq_service.query_rollup_aggregates(
+                    rollup_table_path=rollup_table_path,
+                    metric_ids=list(base_metrics_needed),
+                    start_date=request.filters.start_date,
+                    end_date=request.filters.end_date,
+                    dimension_filters=combined_filters,
+                    date_range_type=request.filters.date_range_type,
+                    relative_date_preset=request.filters.relative_date_preset
+                )
+            else:
+                # Fallback to raw table
+                filters = FilterParams(
+                    start_date=request.filters.start_date,
+                    end_date=request.filters.end_date,
+                    date_range_type=request.filters.date_range_type,
+                    relative_date_preset=request.filters.relative_date_preset,
+                    dimension_filters=combined_filters
+                )
+                return bq_service.query_kpi_metrics(filters=filters)
 
         # Helper function to run proportion test for a specific row
         def run_test_for_row(row_filters: Dict[str, List[str]] = None, row_id: str = None) -> Dict[str, List]:

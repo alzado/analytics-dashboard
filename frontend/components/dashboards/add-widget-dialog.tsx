@@ -19,7 +19,7 @@ export function AddWidgetDialog({ dashboardId, onClose }: AddWidgetDialogProps) 
   // Fetch available tables
   const { data: tablesData } = useQuery({
     queryKey: ['tables'],
-    queryFn: fetchTables,
+    queryFn: () => fetchTables(),
   })
 
   const tables = tablesData?.tables || []

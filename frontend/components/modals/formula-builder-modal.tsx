@@ -3,12 +3,18 @@
 import { useState } from 'react'
 import { X, Plus, Minus, Divide, Asterisk, Trash2 } from 'lucide-react'
 import { SearchInput } from '@/components/ui/search-input'
-import type { BaseMetric, CalculatedMetric, DimensionDef } from '@/lib/types'
+import type { CalculatedMetric, DimensionDef } from '@/lib/types'
+
+// Simple metric type for formula builder (just needs id and display_name)
+interface SimpleMetric {
+  id: string
+  display_name: string
+}
 
 interface FormulaBuilderModalProps {
   isOpen: boolean
   onClose: () => void
-  availableMetrics: BaseMetric[]
+  availableMetrics: SimpleMetric[]  // DEPRECATED - kept for backward compatibility, pass empty array
   availableCalculatedMetrics?: CalculatedMetric[]
   availableDimensions: DimensionDef[]
   onApply: (formula: string) => void
@@ -76,7 +82,7 @@ export function FormulaBuilderModal({
     })
     .sort((a, b) => a.display_name.localeCompare(b.display_name))
 
-  const addMetric = (metric: BaseMetric | CalculatedMetric) => {
+  const addMetric = (metric: SimpleMetric | CalculatedMetric) => {
     // Add metric as a reference {metric_id} for both base and calculated metrics
     // This allows cascade updates to work - when the metric changes, dependent formulas update automatically
     const newToken: FormulaToken = {
@@ -643,7 +649,7 @@ export function FormulaBuilderModal({
 // Helper function to parse existing formula back to tokens
 function parseFormulaToTokens(
   formula: string,
-  availableMetrics: BaseMetric[],
+  availableMetrics: SimpleMetric[],
   availableCalculatedMetrics: CalculatedMetric[],
   availableDimensions: DimensionDef[]
 ): FormulaToken[] {

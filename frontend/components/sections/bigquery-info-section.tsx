@@ -20,6 +20,7 @@ export function BigQueryInfoSection({ tableId }: BigQueryInfoSectionProps) {
     table: '',
     use_adc: true,  // Default to using Google Cloud credentials
     credentials_json: '',
+    billing_project: null,  // Project for query billing (defaults to project_id if not set)
     allowed_min_date: null,
     allowed_max_date: null
   })
@@ -29,7 +30,7 @@ export function BigQueryInfoSection({ tableId }: BigQueryInfoSectionProps) {
   // Fetch available tables for table management section
   const { data: tablesData } = useQuery({
     queryKey: ['tables'],
-    queryFn: fetchTables,
+    queryFn: () => fetchTables(),
   })
 
   const { data: info, isLoading, error } = useQuery({
@@ -52,6 +53,7 @@ export function BigQueryInfoSection({ tableId }: BigQueryInfoSectionProps) {
           ...prev,
           use_adc: true,
           credentials_json: '',
+          billing_project: null,
           allowed_min_date: null,
           allowed_max_date: null
         }))
@@ -78,6 +80,7 @@ export function BigQueryInfoSection({ tableId }: BigQueryInfoSectionProps) {
         table: '',
         use_adc: true,
         credentials_json: '',
+        billing_project: null,
         allowed_min_date: null,
         allowed_max_date: null
       })
@@ -131,6 +134,7 @@ export function BigQueryInfoSection({ tableId }: BigQueryInfoSectionProps) {
         dataset: formData.dataset,
         table: formData.table,
         credentials_json: formData.use_adc ? '' : formData.credentials_json,
+        billing_project: formData.billing_project || undefined,
         allowed_min_date: null,
         allowed_max_date: null
       })
@@ -309,6 +313,23 @@ export function BigQueryInfoSection({ tableId }: BigQueryInfoSectionProps) {
               />
             </div>
 
+            <div>
+              <label htmlFor="billing_project" className="block text-sm font-medium text-gray-700 mb-1">
+                Billing Project <span className="text-gray-400">(optional)</span>
+              </label>
+              <input
+                type="text"
+                id="billing_project"
+                value={formData.billing_project || ''}
+                onChange={(e) => handleInputChange('billing_project', e.target.value || '')}
+                className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                placeholder="my-billing-project"
+              />
+              <p className="text-xs text-gray-500 mt-1">
+                Project to bill queries to. Leave empty to use the data project.
+              </p>
+            </div>
+
             {/* Authentication Method */}
             <div className="border-t pt-4 mt-4">
               <label className="flex items-center gap-2 cursor-pointer">
@@ -416,6 +437,12 @@ export function BigQueryInfoSection({ tableId }: BigQueryInfoSectionProps) {
             <p className="text-sm text-gray-600">Full Path</p>
             <p className="font-mono text-sm font-medium break-all">{info.table_full_path}</p>
           </div>
+          {info.billing_project && info.billing_project !== info.project_id && (
+            <div>
+              <p className="text-sm text-gray-600">Billing Project</p>
+              <p className="font-mono text-sm font-medium">{info.billing_project}</p>
+            </div>
+          )}
         </div>
       </div>
 

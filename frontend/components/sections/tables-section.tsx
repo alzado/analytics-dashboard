@@ -1,20 +1,46 @@
 'use client'
 
 import { useState, useEffect } from 'react'
-import { useQuery } from '@tanstack/react-query'
-import { fetchTables } from '@/lib/api'
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { fetchTables, fetchAppSettings, updateAppSettings } from '@/lib/api'
 import { BigQueryInfoSection } from './bigquery-info-section'
 import { SchemaSection } from './schema-section'
-import { Database, Plus } from 'lucide-react'
+import { Database, Plus, Settings, CheckCircle } from 'lucide-react'
 
 export function TablesSection() {
+  const queryClient = useQueryClient()
   const [selectedTableId, setSelectedTableId] = useState<string>('')
   const [subTab, setSubTab] = useState<'info' | 'schema'>('info')
+  const [globalBillingProject, setGlobalBillingProject] = useState<string>('')
+  const [showSettingsSuccess, setShowSettingsSuccess] = useState(false)
 
   // Fetch available tables
   const { data: tablesData } = useQuery({
     queryKey: ['tables'],
-    queryFn: fetchTables,
+    queryFn: () => fetchTables(),
+  })
+
+  // Fetch global app settings
+  const { data: appSettings } = useQuery({
+    queryKey: ['app-settings'],
+    queryFn: () => fetchAppSettings(),
+  })
+
+  // Update global billing project when settings load
+  useEffect(() => {
+    if (appSettings?.default_billing_project) {
+      setGlobalBillingProject(appSettings.default_billing_project)
+    }
+  }, [appSettings])
+
+  // Mutation for updating settings
+  const updateSettingsMutation = useMutation({
+    mutationFn: updateAppSettings,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['app-settings'] })
+      setShowSettingsSuccess(true)
+      setTimeout(() => setShowSettingsSuccess(false), 3000)
+    },
   })
 
   const tables = tablesData?.tables || []
@@ -25,6 +51,12 @@ export function TablesSection() {
       setSelectedTableId(tables[0].table_id)
     }
   }, [tables, selectedTableId])
+
+  const handleSaveGlobalSettings = () => {
+    updateSettingsMutation.mutate({
+      default_billing_project: globalBillingProject || null,
+    })
+  }
 
   // Show empty state if no tables
   if (tables.length === 0) {
@@ -51,6 +83,45 @@ export function TablesSection() {
 
   return (
     <div className="space-y-6">
+      {/* Global Settings */}
+      <div className="bg-white rounded-lg border border-gray-200 p-6">
+        <div className="flex items-center gap-2 mb-4">
+          <Settings className="text-gray-600" size={20} />
+          <h2 className="text-lg font-semibold">Global Settings</h2>
+          {showSettingsSuccess && (
+            <span className="flex items-center gap-1 text-green-600 text-sm ml-auto">
+              <CheckCircle size={16} />
+              Saved
+            </span>
+          )}
+        </div>
+        <div className="flex items-end gap-4">
+          <div className="flex-1">
+            <label htmlFor="global_billing_project" className="block text-sm font-medium text-gray-700 mb-1">
+              Default Billing Project
+            </label>
+            <input
+              type="text"
+              id="global_billing_project"
+              value={globalBillingProject}
+              onChange={(e) => setGlobalBillingProject(e.target.value)}
+              className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+              placeholder="my-billing-project"
+            />
+            <p className="text-xs text-gray-500 mt-1">
+              Default GCP project to bill queries to. Used when a table doesn't have its own billing project set.
+            </p>
+          </div>
+          <button
+            onClick={handleSaveGlobalSettings}
+            disabled={updateSettingsMutation.isPending}
+            className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
+          >
+            {updateSettingsMutation.isPending ? 'Saving...' : 'Save'}
+          </button>
+        </div>
+      </div>
+
       {/* Table Selector */}
       <div className="bg-white rounded-lg border border-gray-200 p-6">
         <div className="flex items-center justify-between gap-4">

@@ -226,44 +226,19 @@ def _build_pivot_select_clause(metrics_data):
         Tuple of (base_select_items, calculated_select_items) where calculated metrics
         reference base metrics by their aliases
     """
-    print(f"DEBUG _build_pivot_select_clause called with {len(metrics_data.get('calculated_metrics', []))} calculated metrics")
     base_select_items = []
     calculated_select_items = []
 
     # Separate calculated metrics into categories for proper SQL generation:
     # - Simple: no dependencies, computed in base query
-    # - Intermediate: dependencies on calculated metrics that are used by days_in_range metrics
-    # - Complex: all other calculated metrics
-    #
-    # Key insight: When a metric like "ctr_per_day = ctr / days_in_range" exists,
-    # the "ctr" metric must be computed in the base query so it can be referenced by alias
+    # - Complex: all other calculated metrics (computed in outer query referencing aliases)
     simple_calculated_metrics = []
     complex_calculated_metrics = []
 
-    # First pass: identify metrics that depend on days_in_range
-    metrics_with_days_in_range = set()
+    # Classify metrics based on whether they have dependencies
     for metric in metrics_data['calculated_metrics']:
-        if metric.depends_on and 'days_in_range' in metric.depends_on:
-            metrics_with_days_in_range.add(metric.id)
-
-    # Second pass: find all calculated metric dependencies of days_in_range metrics
-    # These need to be computed in the base query so they can be referenced
-    must_be_in_base_query = set()
-    for metric in metrics_data['calculated_metrics']:
-        if metric.id in metrics_with_days_in_range and metric.depends_on_calculated:
-            for dep_id in metric.depends_on_calculated:
-                must_be_in_base_query.add(dep_id)
-
-    # Third pass: classify metrics
-    for metric in metrics_data['calculated_metrics']:
-        # Skip days_in_range metrics themselves - they go to complex
-        if metric.id in metrics_with_days_in_range:
-            complex_calculated_metrics.append(metric)
         # Check if this calculated metric has no dependencies (simple aggregation)
-        elif not metric.depends_on or len(metric.depends_on) == 0:
-            simple_calculated_metrics.append(metric)
-        # Check if this metric must be in base query (dependency of days_in_range metric)
-        elif metric.id in must_be_in_base_query:
+        if not metric.depends_on or len(metric.depends_on) == 0:
             simple_calculated_metrics.append(metric)
         else:
             complex_calculated_metrics.append(metric)
@@ -273,11 +248,7 @@ def _build_pivot_select_clause(metrics_data):
         # Use aggregation from schema with actual column name from BigQuery
         agg = metric.aggregation
         col = metric.column_name
-        if metric.is_system and metric.id == 'days_in_range':
-            # Special handling for virtual metric - use DATE_DIFF instead of whatever aggregation is in schema
-            base_select_items.append(f"DATE_DIFF(MAX(date), MIN(date), DAY) + 1 as {metric.id}")
-        else:
-            base_select_items.append(f"{agg}({col}) as {metric.id}")
+        base_select_items.append(f"{agg}({col}) as {metric.id}")
 
     # Add simple calculated metrics to base items (they're really just aggregations)
     for metric in simple_calculated_metrics:
@@ -287,7 +258,7 @@ def _build_pivot_select_clause(metrics_data):
     # This is used later when selecting from subquery
     all_base_metrics = list(metrics_data['base_metrics']) + simple_calculated_metrics
 
-    # No need to track extra columns anymore since days_in_range is now a base metric in schema
+    # Reserved for future use
     extra_base_columns = []
 
     # Build complex calculated metrics that reference base metrics by alias (not by re-aggregating)
@@ -322,13 +293,10 @@ def _build_pivot_select_clause(metrics_data):
             # Replace the full SQL expression with the metric ID
             sql_expr = sql_expr.replace(simple_metric.sql_expression, simple_metric.id)
 
-        # Special handling for days_in_range virtual metric
-        sql_expr = sql_expr.replace("DATE_DIFF(MAX(date), MIN(date), DAY) + 1", "days_in_range")
-
         calculated_select_items.append(f"({sql_expr}) as {metric.id}")
 
     # Return base select items, calculated select items, the list of all base-level metrics,
-    # and extra columns that need to be selected from inner query (like days_in_range)
+    # and extra columns (reserved for future use)
     return base_select_items, calculated_select_items, all_base_metrics, extra_base_columns
 
 
@@ -392,24 +360,36 @@ def _get_schema_config():
     return None
 
 
-def _compute_calculated_metrics(base_metrics: Dict, schema_config=None) -> Dict:
+def _compute_calculated_metrics(base_metrics: Dict, schema_config_or_metrics=None) -> Dict:
     """
     Compute calculated metrics from base metrics using schema formulas.
 
     Args:
         base_metrics: Dictionary of base metric values from BigQuery
-        schema_config: Schema configuration with calculated metric definitions
+        schema_config_or_metrics: Either a SchemaConfig object with calculated_metrics,
+                                   or a list of CalculatedMetric objects directly
 
     Returns:
         Dictionary of calculated metric values
     """
     calculated = {}
 
-    if not schema_config or not schema_config.calculated_metrics:
+    if not schema_config_or_metrics:
         return calculated
 
-    # For each calculated metric in schema, compute its value
-    for calc_metric in schema_config.calculated_metrics:
+    # Handle both SchemaConfig objects and direct list of metrics
+    if isinstance(schema_config_or_metrics, list):
+        calc_metrics_list = schema_config_or_metrics
+    elif hasattr(schema_config_or_metrics, 'calculated_metrics'):
+        calc_metrics_list = schema_config_or_metrics.calculated_metrics or []
+    else:
+        return calculated
+
+    if not calc_metrics_list:
+        return calculated
+
+    # For each calculated metric, compute its value
+    for calc_metric in calc_metrics_list:
         try:
             # Use the formula (e.g., "{Purchases} / {queries}") rather than sql_expression
             # since formulas use cleaner {metric_id} syntax
@@ -428,7 +408,11 @@ def _compute_calculated_metrics(base_metrics: Dict, schema_config=None) -> Dict:
             # If formula didn't have {metric_id} syntax, fall back to old approach
             # for metrics that use raw SQL expressions
             if '{' not in calc_metric.formula if calc_metric.formula else True:
-                for base_metric in schema_config.base_metrics:
+                # Try to get base_metrics from schema_config if available
+                base_metrics_defs = []
+                if hasattr(schema_config_or_metrics, 'base_metrics'):
+                    base_metrics_defs = schema_config_or_metrics.base_metrics or []
+                for base_metric in base_metrics_defs:
                     patterns = [
                         f"{base_metric.aggregation}({base_metric.column_name})",
                         base_metric.id
@@ -462,6 +446,358 @@ def _compute_calculated_metrics(base_metrics: Dict, schema_config=None) -> Dict:
     return calculated
 
 
+def _get_baseline_totals(
+    bq_service,
+    filters: FilterParams,
+    metrics_data: dict,
+    table_id: Optional[str] = None
+) -> Dict[str, float]:
+    """
+    Get totals from the baseline rollup (no dimensions) for metric comparison.
+
+    The baseline rollup contains pure totals without any dimensional grouping.
+    This is used to detect metric inflation when querying with dimensions.
+
+    Args:
+        bq_service: BigQuery service instance
+        filters: Filter parameters (date range, etc.)
+        metrics_data: Dict containing base_metrics, calculated_metrics, schema_config
+        table_id: Optional table ID for multi-table support
+
+    Returns:
+        Dict mapping metric_id to baseline total value.
+        Returns empty dict if no baseline rollup exists.
+    """
+    from services.query_router_service import QueryRouterService
+    from services.rollup_service import RollupService
+
+    # Get rollup configuration
+    rollup_service = RollupService(bq_service.client, bq_service.table_id)
+    rollup_config = rollup_service.load_config()
+
+    if not rollup_config or not rollup_config.rollups:
+        return {}
+
+    # Create query router to find baseline rollup
+    schema_config = metrics_data.get('schema_config')
+    if not schema_config:
+        return {}
+
+    router = QueryRouterService(
+        rollup_config=rollup_config,
+        schema_config=schema_config,
+        source_project_id=bq_service.project_id,
+        source_dataset=bq_service.dataset
+    )
+
+    # Find the baseline rollup (no dimensions)
+    baseline_rollup = router.find_simplest_rollup()
+    if not baseline_rollup:
+        return {}
+
+    baseline_table_path = router.get_baseline_rollup_path()
+    if not baseline_table_path:
+        return {}
+
+    try:
+        # Build query to get summed metrics from baseline rollup (date-only)
+        # We need to SUM across all dates to get the total
+        base_metric_ids = [m.id for m in metrics_data.get('base_metrics', [])]
+        volume_calc_ids = [m.id for m in metrics_data.get('calculated_metrics', []) if m.category == 'volume']
+
+        # Build SUM aggregations for all metrics
+        all_metric_ids = base_metric_ids + volume_calc_ids
+        sum_clauses = [f"SUM({metric_id}) as {metric_id}" for metric_id in all_metric_ids]
+        select_clause = ', '.join(sum_clauses)
+
+        # Build date filter if provided
+        where_clause = ""
+        if filters.start_date or filters.end_date:
+            conditions = []
+            if filters.start_date:
+                conditions.append(f"date >= '{filters.start_date}'")
+            if filters.end_date:
+                conditions.append(f"date <= '{filters.end_date}'")
+            where_clause = "WHERE " + " AND ".join(conditions)
+
+        # Query baseline rollup with SUM aggregation
+        query = f"SELECT {select_clause} FROM `{baseline_table_path}` {where_clause}"
+
+        df = bq_service.client.query(query).to_dataframe()
+
+        if df.empty:
+            return {}
+
+        # Extract metrics from the single row
+        row = df.iloc[0]
+        baseline_totals = {}
+        for metric_id in all_metric_ids:
+            if metric_id in row:
+                value = row[metric_id]
+                if pd.isna(value) or (isinstance(value, float) and (math.isnan(value) or math.isinf(value))):
+                    baseline_totals[metric_id] = 0.0
+                else:
+                    baseline_totals[metric_id] = float(value)
+
+        # Calculate conversion metrics from base metrics
+        conversion_calc_metrics = [m for m in metrics_data.get('calculated_metrics', []) if m.category != 'volume']
+        if conversion_calc_metrics:
+            conversion_values = _compute_calculated_metrics(baseline_totals, conversion_calc_metrics)
+            baseline_totals.update(conversion_values)
+
+        return baseline_totals
+
+    except Exception as e:
+        print(f"Warning: Could not get baseline totals: {e}")
+        return {}
+
+
+def _compare_metrics_with_baseline(
+    total_metrics: Dict[str, float],
+    baseline_totals: Dict[str, float],
+    tolerance: float = 0.01
+) -> Dict[str, bool]:
+    """
+    Compare current totals with baseline totals to detect metric inflation.
+
+    A metric is flagged if the current value exceeds the baseline by more
+    than the tolerance (default 1%). This indicates potential inflation
+    from dimensional aggregation.
+
+    Args:
+        total_metrics: Metrics calculated from current query
+        baseline_totals: Metrics from baseline rollup (no dimensions)
+        tolerance: Percentage tolerance for comparison (0.01 = 1%)
+
+    Returns:
+        Dict mapping metric_id to True if metric is potentially inflated
+    """
+    warnings = {}
+
+    for metric_id, current_value in total_metrics.items():
+        # Skip _pct and _per_day metrics
+        if metric_id.endswith('_pct') or metric_id.endswith('_per_day'):
+            continue
+
+        baseline_value = baseline_totals.get(metric_id, 0)
+
+        # Skip if baseline is 0 (can't compare)
+        if baseline_value == 0:
+            continue
+
+        # Flag if current exceeds baseline by more than tolerance
+        if current_value > baseline_value * (1 + tolerance):
+            warnings[metric_id] = True
+
+    return warnings
+
+
+def _query_pivot_from_rollup(
+    bq_service,
+    route_decision,
+    dimensions: List[str],
+    filters: FilterParams,
+    metrics_data: dict,
+    limit: int = 50,
+    offset: int = 0,
+    dimension_values: Optional[List[str]] = None,
+    skip_count: bool = False
+) -> PivotResponse:
+    """Query pivot data from a pre-aggregated rollup table.
+
+    Args:
+        bq_service: BigQuery service instance
+        route_decision: RouteDecision object from query router
+        dimensions: List of dimension IDs to group by
+        filters: Filter parameters
+        metrics_data: Dict containing base_metrics, calculated_metrics, schema_config
+        limit: Max rows to return
+        offset: Row offset for pagination
+        dimension_values: Optional specific dimension values to fetch
+        skip_count: Skip count query
+
+    Returns:
+        PivotResponse with data from rollup table
+    """
+    from models.schemas import PivotResponse, PivotRow
+
+    # Build dimension map from schema
+    dimension_map = {}
+    if metrics_data['schema_config'] and metrics_data['schema_config'].dimensions:
+        for dim in metrics_data['schema_config'].dimensions:
+            dimension_map[dim.id] = dim.column_name
+
+    # Determine sort metric
+    # Note: base_metrics is deprecated, prefer calculated_metrics
+    if metrics_data['primary_sort_metric']:
+        primary_sort = metrics_data['primary_sort_metric']
+    elif metrics_data.get('calculated_metrics'):
+        # Find first volume metric for primary sort
+        volume_metrics = [m for m in metrics_data['calculated_metrics'] if m.category == 'volume']
+        primary_sort = volume_metrics[0].id if volume_metrics else metrics_data['calculated_metrics'][0].id
+    elif metrics_data.get('base_metrics'):  # DEPRECATED fallback
+        primary_sort = metrics_data['base_metrics'][0].id
+    else:
+        raise ValueError("No metrics available in schema")
+
+    avg_per_day_metric = metrics_data.get('avg_per_day_metric') or primary_sort
+    avg_per_day_key = f"{avg_per_day_metric}_per_day"
+
+    # Get ALL metric IDs available in the rollup (both base AND calculated)
+    # Rollups store pre-computed values for calculated metrics like COUNT_DISTINCT
+    available_metrics = set(route_decision.metrics_available)
+
+    # Collect base metrics available in rollup
+    rollup_base_metric_ids = [m.id for m in metrics_data.get('base_metrics', []) if m.id in available_metrics]
+
+    # Collect calculated metrics that are pre-computed in the rollup
+    # Split by category: volume metrics can be summed, conversion metrics need recalculation
+    all_calc_metrics = metrics_data.get('calculated_metrics', [])
+    rollup_calc_metrics_in_rollup = [m for m in all_calc_metrics if m.id in available_metrics]
+
+    # Volume calculated metrics can be queried and summed directly
+    rollup_volume_calc_ids = [m.id for m in rollup_calc_metrics_in_rollup if m.category == "volume"]
+
+    # Conversion calculated metrics need recalculation after re-aggregation
+    rollup_conversion_calc_metrics = [m for m in rollup_calc_metrics_in_rollup if m.category != "volume"]
+
+    # Metrics to query from rollup (base + volume calculated)
+    # Conversion metrics will be recalculated from these
+    rollup_metric_ids = rollup_base_metric_ids + rollup_volume_calc_ids
+
+    # Query the rollup table
+    df = bq_service.query_rollup_table(
+        rollup_table_path=route_decision.rollup_table_path,
+        dimensions=dimensions,
+        metrics=rollup_metric_ids,
+        filters=filters,
+        needs_reaggregation=route_decision.needs_reaggregation,
+        limit=limit,
+        offset=offset,
+        sort_by=primary_sort,
+        sort_order="DESC"
+    )
+
+    # Calculate date range for avg per day metrics
+    min_date, max_date, num_days = bq_service.get_date_range_cached(
+        start_date=filters.start_date,
+        end_date=filters.end_date,
+        dimension_filters=filters.dimension_filters,
+        dimensions=dimensions,
+        date_range_type=filters.date_range_type,
+        relative_date_preset=filters.relative_date_preset
+    )
+
+    # Build dimension value column name (concat if multiple dimensions)
+    if len(dimensions) == 1:
+        dim_col = dimensions[0]
+    else:
+        dim_col = None  # Will need to handle multiple dimensions
+
+    # Process rows
+    rows = []
+    # Track totals for all metrics from the rollup
+    metric_totals = {metric_id: 0 for metric_id in rollup_metric_ids}
+
+    # Calculated metrics NOT in the rollup (need to be computed from rollup metrics)
+    non_rollup_calc_metrics = [m for m in all_calc_metrics if m.id not in available_metrics]
+
+    # Metrics that need recalculation: conversion metrics from rollup + non-rollup metrics
+    # When needs_reaggregation is True, conversion metrics can't be summed - must recalculate
+    metrics_to_recalculate = non_rollup_calc_metrics.copy()
+    if route_decision.needs_reaggregation:
+        metrics_to_recalculate.extend(rollup_conversion_calc_metrics)
+
+    for _, row in df.iterrows():
+        # Build dimension value
+        if dim_col:
+            dim_value = str(row.get(dim_col, ''))
+        else:
+            # Multiple dimensions - concat with separator
+            dim_parts = [str(row.get(d, '')) for d in dimensions]
+            dim_value = ' | '.join(dim_parts)
+
+        # Build metrics dict from rollup metrics (base + volume calculated)
+        row_metrics = {}
+        for metric_id in rollup_metric_ids:
+            val = row.get(metric_id, 0)
+            row_metrics[metric_id] = float(val) if val is not None else 0
+            metric_totals[metric_id] = metric_totals.get(metric_id, 0) + (float(val) if val is not None else 0)
+
+        # Recalculate conversion metrics and non-rollup metrics from volume metrics
+        calculated = _compute_calculated_metrics(row_metrics, metrics_to_recalculate)
+        row_metrics.update(calculated)
+
+        # Add avg per day metric
+        if num_days and num_days > 0 and avg_per_day_metric in row_metrics:
+            row_metrics[avg_per_day_key] = row_metrics[avg_per_day_metric] / num_days
+
+        rows.append(PivotRow(
+            dimension_value=dim_value,
+            metrics=row_metrics,
+            percentage_of_total=0,  # Will be calculated below
+            search_term_count=0,
+            has_children=True
+        ))
+
+    # Build totals from rollup metrics
+    total_metrics = dict(metric_totals)
+    # Recalculate conversion metrics and non-rollup metrics for totals
+    total_calculated = _compute_calculated_metrics(total_metrics, metrics_to_recalculate)
+    total_metrics.update(total_calculated)
+
+    if num_days and num_days > 0 and avg_per_day_metric in total_metrics:
+        total_metrics[avg_per_day_key] = total_metrics[avg_per_day_metric] / num_days
+
+    # Add _pct metrics (percentage of column total) for volume metrics
+    for row in rows:
+        row.metrics = _add_percent_metrics(row.metrics, total_metrics, metrics_data)
+
+    # Add _pct metrics for total row (all 100%)
+    total_metrics = _add_percent_metrics(total_metrics, total_metrics, metrics_data)
+
+    # Calculate percentage of total
+    total_sort_value = total_metrics.get(primary_sort, 0)
+    for row in rows:
+        if total_sort_value > 0:
+            row_sort_value = row.metrics.get(primary_sort, 0)
+            row.percentage_of_total = round((row_sort_value / total_sort_value) * 100, 2)
+
+    # Get total count if needed
+    total_count = len(rows) if not skip_count else None
+
+    # Get available dimensions from schema for the response
+    available_dims = []
+    if metrics_data.get('schema_config') and metrics_data['schema_config'].dimensions:
+        available_dims = [d.id for d in metrics_data['schema_config'].dimensions if d.is_groupable]
+
+    # =========================================================================
+    # BASELINE COMPARISON: Check for metric inflation
+    # =========================================================================
+    # Get baseline totals (from rollup with no dimensions) for comparison
+    baseline_totals = _get_baseline_totals(bq_service, filters, metrics_data)
+
+    # Compare current totals with baseline to detect inflated metrics
+    metric_warnings = {}
+    if baseline_totals:
+        metric_warnings = _compare_metrics_with_baseline(total_metrics, baseline_totals)
+
+    return PivotResponse(
+        rows=rows,
+        total=PivotRow(
+            dimension_value="Total",
+            metrics=total_metrics,
+            percentage_of_total=100.0,
+            search_term_count=0,
+            has_children=False
+        ),
+        available_dimensions=available_dims,
+        total_count=total_count,
+        baseline_totals=baseline_totals if baseline_totals else None,
+        metric_warnings=metric_warnings if metric_warnings else None
+    )
+
+
 def _query_custom_dimension_pivot(
     custom_dim_id: str,
     filters: FilterParams,
@@ -485,9 +821,14 @@ def _query_custom_dimension_pivot(
     base_select_items, calculated_select_items, all_base_metrics, extra_base_columns = _build_pivot_select_clause(metrics_data)
 
     # Determine metric for sorting and avg per day
+    # Note: base_metrics is deprecated, prefer calculated_metrics
     if metrics_data['primary_sort_metric']:
         primary_sort = metrics_data['primary_sort_metric']
-    elif metrics_data['base_metrics']:
+    elif metrics_data.get('calculated_metrics'):
+        # Find first volume metric for primary sort
+        volume_metrics = [m for m in metrics_data['calculated_metrics'] if m.category == 'volume']
+        primary_sort = volume_metrics[0].id if volume_metrics else metrics_data['calculated_metrics'][0].id
+    elif metrics_data.get('base_metrics'):  # DEPRECATED fallback
         primary_sort = metrics_data['base_metrics'][0].id
     else:
         raise ValueError("No metrics available in schema")
@@ -498,8 +839,11 @@ def _query_custom_dimension_pivot(
     if custom_dim.type == "date_range":
         all_rows = []
 
-        # Initialize base metric totals dynamically
-        base_metric_totals = {metric.id: 0 for metric in metrics_data['base_metrics']}
+        # Initialize metric totals dynamically (volume metrics that can be summed)
+        # Note: base_metrics is deprecated, prefer calculated_metrics with category='volume'
+        volume_calc_metrics = [m for m in metrics_data.get('calculated_metrics', []) if m.category == 'volume']
+        base_metric_totals = {metric.id: 0 for metric in metrics_data.get('base_metrics', [])}
+        base_metric_totals.update({metric.id: 0 for metric in volume_calc_metrics})
 
         # Track actual min/max dates across all queries for num_days calculation
         overall_min_date = None
@@ -537,7 +881,7 @@ def _query_custom_dimension_pivot(
             base_select_str = ',\n                    '.join(base_select_items)
 
             if calculated_select_items:
-                # List base metric aliases to select from inner query (including extra columns like days_in_range)
+                # List base metric aliases to select from inner query
                 base_metric_aliases = [metric.id for metric in all_base_metrics] + extra_base_columns
                 base_aliases_str = ', '.join(base_metric_aliases)
                 calculated_select_str = ',\n                '.join(calculated_select_items)
@@ -603,9 +947,9 @@ def _query_custom_dimension_pivot(
                     has_children=False
                 ))
 
-                # Accumulate base metric totals
-                for metric in metrics_data['base_metrics']:
-                    base_metric_totals[metric.id] += metrics.get(metric.id, 0)
+                # Accumulate metric totals (base + volume calculated)
+                for metric_id in base_metric_totals.keys():
+                    base_metric_totals[metric_id] += metrics.get(metric_id, 0)
 
         # Query for "Other" - dates not in any defined date range
         # Build exclusion conditions for all date ranges
@@ -701,9 +1045,9 @@ def _query_custom_dimension_pivot(
                 has_children=False
             ))
 
-            # Accumulate "Other" totals
-            for metric in metrics_data['base_metrics']:
-                base_metric_totals[metric.id] += other_metrics.get(metric.id, 0)
+            # Accumulate "Other" totals (base + volume calculated)
+            for metric_id in base_metric_totals.keys():
+                base_metric_totals[metric_id] += other_metrics.get(metric_id, 0)
 
         # Calculate percentage of total for each row
         total_primary_metric = base_metric_totals.get(primary_sort, 0)
@@ -846,9 +1190,14 @@ def get_dimension_breakdown(dimension: str, filters: FilterParams, limit: int = 
     metrics_data = _load_metrics_data(bq_service)
 
     # Get primary sort metric for percentage calculation
+    # Note: base_metrics is deprecated, prefer calculated_metrics
     if metrics_data.get('primary_sort_metric'):
         primary_sort = metrics_data['primary_sort_metric']
-    elif metrics_data.get('base_metrics'):
+    elif metrics_data.get('calculated_metrics'):
+        # Find first volume metric for primary sort
+        volume_metrics = [m for m in metrics_data['calculated_metrics'] if m.category == 'volume']
+        primary_sort = volume_metrics[0].id if volume_metrics else metrics_data['calculated_metrics'][0].id
+    elif metrics_data.get('base_metrics'):  # DEPRECATED fallback
         primary_sort = metrics_data['base_metrics'][0].id
     else:
         raise ValueError("No metrics available in schema")
@@ -953,7 +1302,7 @@ def get_filter_options() -> FilterOptions:
     )
 
 
-def get_pivot_data(dimensions: List[str], filters: FilterParams, limit: int = 50, offset: int = 0, dimension_values: Optional[List[str]] = None, table_id: Optional[str] = None, skip_count: bool = False, metrics: Optional[List[str]] = None) -> PivotResponse:
+def get_pivot_data(dimensions: List[str], filters: FilterParams, limit: int = 50, offset: int = 0, dimension_values: Optional[List[str]] = None, table_id: Optional[str] = None, skip_count: bool = False, metrics: Optional[List[str]] = None, require_rollup: bool = True) -> PivotResponse:
     """Get hierarchical pivot table data by dimensions from BigQuery
 
     Args:
@@ -965,6 +1314,7 @@ def get_pivot_data(dimensions: List[str], filters: FilterParams, limit: int = 50
         table_id: Optional table ID for multi-table widget support (defaults to active table)
         skip_count: Skip the count query (for initial loads or when total count not needed)
         metrics: Optional list of metric IDs to calculate (defaults to all metrics if None)
+        require_rollup: If True, return error when no suitable rollup exists for the query
     """
     bq_service = get_bigquery_service(table_id)
     if bq_service is None:
@@ -982,6 +1332,49 @@ def get_pivot_data(dimensions: List[str], filters: FilterParams, limit: int = 50
     # Load all metrics dynamically from schema, optionally filtered by requested metrics
     metrics_data = _get_all_metrics_for_pivot(table_id, requested_metrics=metrics)
     base_select_items, calculated_select_items, all_base_metrics, extra_base_columns = _build_pivot_select_clause(metrics_data)
+
+    # =========================================================================
+    # ROLLUP ROUTING: Check if a suitable rollup exists for this query
+    # =========================================================================
+    # Get list of ALL metric IDs for routing decision (base + calculated)
+    # Rollups store pre-computed calculated metrics, so we need to check for them too
+    base_metric_ids = [m.id for m in metrics_data.get('base_metrics', [])]
+    calc_metric_ids = [m.id for m in metrics_data.get('calculated_metrics', [])]
+    all_metric_ids = base_metric_ids + calc_metric_ids
+
+    # Check routing decision (only for regular dimensions, not custom dimensions)
+    has_custom_dims = dimensions and any(d.startswith("custom_") for d in dimensions)
+    if not has_custom_dims:
+        # Always check rollup routing for non-custom dimension queries
+        query_dimensions = dimensions if dimensions else []
+        route_decision = bq_service.get_route_decision(
+            dimensions=query_dimensions,
+            metrics=all_metric_ids,  # Include both base and calculated metrics
+            filters=filters,
+            require_rollup=require_rollup
+        )
+
+        # If require_rollup is True and no rollup found, raise error
+        if require_rollup and not route_decision.use_rollup:
+            raise ValueError(
+                f"No suitable rollup found for dimensions {query_dimensions}. "
+                f"Reason: {route_decision.reason}. "
+                f"Create a rollup with these dimensions to enable this query."
+            )
+
+        # If a suitable rollup exists, use it
+        if route_decision.use_rollup:
+            return _query_pivot_from_rollup(
+                bq_service=bq_service,
+                route_decision=route_decision,
+                dimensions=query_dimensions,
+                filters=filters,
+                metrics_data=metrics_data,
+                limit=limit,
+                offset=offset,
+                dimension_values=dimension_values,
+                skip_count=skip_count
+            )
 
     # Check if any dimension is a custom dimension (starts with "custom_")
     if dimensions and len(dimensions) > 0:
@@ -1053,13 +1446,10 @@ def get_pivot_data(dimensions: List[str], filters: FilterParams, limit: int = 50
         base_select_str = ',\n                '.join(base_select_items)
 
         if calculated_select_items:
-            # List base metric aliases to select from inner query (including extra columns like days_in_range)
+            # List base metric aliases to select from inner query
             base_metric_aliases = [metric.id for metric in all_base_metrics] + extra_base_columns
-            print(f"DEBUG: base_metric_aliases = {base_metric_aliases}")
-            print(f"DEBUG: all_base_metrics = {[m.id for m in all_base_metrics]}")
             base_aliases_str = ', '.join(base_metric_aliases)
             calculated_select_str = ',\n            '.join(calculated_select_items)
-            print(f"DEBUG: calculated_select_items = {calculated_select_items}")
 
             query = f"""
                 SELECT
@@ -1104,11 +1494,16 @@ def get_pivot_data(dimensions: List[str], filters: FilterParams, limit: int = 50
         metrics = _extract_metrics_from_row(row_data, metrics_data)
 
         # Add avg per day as a computed metric
+        # Note: base_metrics is deprecated, prefer calculated_metrics
         if metrics_data['avg_per_day_metric']:
             avg_per_day_metric = metrics_data['avg_per_day_metric']
         elif metrics_data['primary_sort_metric']:
             avg_per_day_metric = metrics_data['primary_sort_metric']
-        elif metrics_data['base_metrics']:
+        elif metrics_data.get('calculated_metrics'):
+            # Find first volume metric for avg per day
+            volume_metrics = [m for m in metrics_data['calculated_metrics'] if m.category == 'volume']
+            avg_per_day_metric = volume_metrics[0].id if volume_metrics else metrics_data['calculated_metrics'][0].id
+        elif metrics_data.get('base_metrics'):  # DEPRECATED fallback
             avg_per_day_metric = metrics_data['base_metrics'][0].id
         else:
             raise ValueError("No metrics available in schema")
@@ -1191,9 +1586,14 @@ def get_pivot_data(dimensions: List[str], filters: FilterParams, limit: int = 50
 
     # Query for pivot data with dynamic metrics
     # Determine which metric to sort by
+    # Note: base_metrics is deprecated, prefer calculated_metrics
     if metrics_data['primary_sort_metric']:
         primary_sort = metrics_data['primary_sort_metric']
-    elif metrics_data['base_metrics']:
+    elif metrics_data.get('calculated_metrics'):
+        # Find first volume metric for primary sort
+        volume_metrics = [m for m in metrics_data['calculated_metrics'] if m.category == 'volume']
+        primary_sort = volume_metrics[0].id if volume_metrics else metrics_data['calculated_metrics'][0].id
+    elif metrics_data.get('base_metrics'):  # DEPRECATED fallback
         primary_sort = metrics_data['base_metrics'][0].id
     else:
         raise ValueError("No metrics available in schema")
@@ -1303,7 +1703,7 @@ def get_pivot_data(dimensions: List[str], filters: FilterParams, limit: int = 50
     calc_dim_filter_clause = " AND ".join(calc_dim_filter_parts) if calc_dim_filter_parts else ""
 
     if calculated_select_items:
-        # List base metric aliases to select from inner query (including extra columns like days_in_range)
+        # List base metric aliases to select from inner query
         base_metric_aliases = [metric.id for metric in all_base_metrics] + extra_base_columns
         base_aliases_str = ', '.join(base_metric_aliases)
         calculated_select_str = ',\n            '.join(calculated_select_items)
@@ -1529,8 +1929,7 @@ def get_pivot_data(dimensions: List[str], filters: FilterParams, limit: int = 50
         metrics = _extract_metrics_from_row(row, metrics_data)
 
         # Add avg per day as a computed metric ONLY if it wasn't already calculated in SQL
-        # If the metric exists in SQL results (e.g., queries_per_day was calculated with per-row days_in_range),
-        # don't overwrite it with the global num_days calculation
+        # If the metric exists in SQL results, don't overwrite it
         if avg_per_day_key not in metrics:
             avg_per_day_value = metrics.get(avg_per_day_metric, 0)
             metrics[avg_per_day_key] = safe_float(avg_per_day_value / num_days) if num_days > 0 and avg_per_day_value > 0 else 0.0
@@ -1566,11 +1965,24 @@ def get_pivot_data(dimensions: List[str], filters: FilterParams, limit: int = 50
         has_children=False
     )
 
+    # =========================================================================
+    # BASELINE COMPARISON: Check for metric inflation (also for direct queries)
+    # =========================================================================
+    # Get baseline totals (from rollup with no dimensions) for comparison
+    baseline_totals = _get_baseline_totals(bq_service, filters, metrics_data)
+
+    # Compare current totals with baseline to detect inflated metrics
+    metric_warnings = {}
+    if baseline_totals:
+        metric_warnings = _compare_metrics_with_baseline(total_metrics, baseline_totals)
+
     return PivotResponse(
         rows=rows,
         total=total_row,
         available_dimensions=list(dimension_map.keys()),
-        total_count=total_count
+        total_count=total_count,
+        baseline_totals=baseline_totals if baseline_totals else None,
+        metric_warnings=metric_warnings if metric_warnings else None
     )
 
 
@@ -1593,9 +2005,14 @@ def get_pivot_children(
     # Load all metrics dynamically from schema
     metrics_data = _get_all_metrics_for_pivot()
     base_select_items, calculated_select_items, all_base_metrics, extra_base_columns = _build_pivot_select_clause(metrics_data)
+    # Note: base_metrics is deprecated, prefer calculated_metrics
     if metrics_data['primary_sort_metric']:
         primary_sort = metrics_data['primary_sort_metric']
-    elif metrics_data['base_metrics']:
+    elif metrics_data.get('calculated_metrics'):
+        # Find first volume metric for primary sort
+        volume_metrics = [m for m in metrics_data['calculated_metrics'] if m.category == 'volume']
+        primary_sort = volume_metrics[0].id if volume_metrics else metrics_data['calculated_metrics'][0].id
+    elif metrics_data.get('base_metrics'):  # DEPRECATED fallback
         primary_sort = metrics_data['base_metrics'][0].id
     else:
         raise ValueError("No metrics available in schema")
@@ -1709,7 +2126,7 @@ def get_pivot_children(
     base_select_str = ',\n                '.join(base_select_items)
 
     if calculated_select_items:
-        # List base metric aliases to select from inner query (including extra columns like days_in_range)
+        # List base metric aliases to select from inner query
         base_metric_aliases = [metric.id for metric in all_base_metrics] + extra_base_columns
         base_aliases_str = ', '.join(base_metric_aliases)
         calculated_select_str = ',\n            '.join(calculated_select_items)

@@ -40,7 +40,7 @@ export function CacheManagementSection() {
   // Fetch tables for dropdown
   const { data: tablesData } = useQuery({
     queryKey: ['tables'],
-    queryFn: fetchTables,
+    queryFn: () => fetchTables(),
   })
 
   // Clear mutations

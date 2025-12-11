@@ -1,6 +1,6 @@
 import { useMemo } from 'react'
 import { useSchema } from './use-schema'
-import type { BaseMetric, CalculatedMetric, DimensionDef } from '@/lib/types'
+import type { CalculatedMetric, DimensionDef } from '@/lib/types'
 
 export type MetricFormat = 'number' | 'currency' | 'percent'
 
@@ -44,18 +44,6 @@ function mapFormatType(formatType: string): MetricFormat {
   }
 }
 
-// Transform BaseMetric to MetricDefinition
-function transformBaseMetric(metric: BaseMetric): MetricDefinition {
-  return {
-    id: metric.id,
-    label: metric.display_name,
-    format: mapFormatType(metric.format_type),
-    description: metric.description || `${metric.display_name} (${metric.aggregation})`,
-    category: metric.category as 'volume' | 'conversion' | 'revenue' | 'other',
-    decimalPlaces: metric.decimal_places,
-  }
-}
-
 // Transform CalculatedMetric to MetricDefinition
 function transformCalculatedMetric(metric: CalculatedMetric): MetricDefinition {
   return {
@@ -81,39 +69,18 @@ function transformDimension(dimension: DimensionDef): DimensionDefinition {
 
 export function usePivotMetrics(tableId?: string): UsePivotMetricsReturn {
   const {
-    baseMetrics,
     calculatedMetrics,
     dimensions,
     groupableDimensions,
-    isLoadingBaseMetrics,
     isLoadingCalculatedMetrics,
     isLoadingDimensions,
   } = useSchema(tableId)
 
-  const isLoading = isLoadingBaseMetrics || isLoadingCalculatedMetrics || isLoadingDimensions
+  const isLoading = isLoadingCalculatedMetrics || isLoadingDimensions
 
-  // Transform and combine base metrics and calculated metrics
+  // Transform calculated metrics
   const metrics = useMemo(() => {
     const allMetrics: MetricDefinition[] = []
-
-    // Add base metrics
-    if (baseMetrics) {
-      allMetrics.push(...baseMetrics.map(transformBaseMetric))
-
-      // Add _pct variants for volume metrics
-      baseMetrics.forEach((metric) => {
-        if (metric.category === 'volume') {
-          allMetrics.push({
-            id: `${metric.id}_pct`,
-            label: `${metric.display_name} %`,
-            format: 'percent',
-            description: `Percentage of total ${metric.display_name}`,
-            category: 'volume',
-            decimalPlaces: 0,
-          })
-        }
-      })
-    }
 
     // Add calculated metrics
     if (calculatedMetrics) {
@@ -135,7 +102,7 @@ export function usePivotMetrics(tableId?: string): UsePivotMetricsReturn {
     }
 
     return allMetrics
-  }, [baseMetrics, calculatedMetrics])
+  }, [calculatedMetrics])
 
   // Transform all dimensions (not just groupable ones)
   const transformedDimensions = useMemo(() => {
@@ -185,18 +152,18 @@ export function usePivotMetrics(tableId?: string): UsePivotMetricsReturn {
     [metrics]
   )
 
-  // Get default metrics - first 6 visible base metrics
+  // Get default metrics - first 6 visible calculated metrics
   const getDefaultMetrics = useMemo(() => {
     return () => {
-      if (!baseMetrics || baseMetrics.length === 0) {
+      if (!calculatedMetrics || calculatedMetrics.length === 0) {
         return []
       }
-      return baseMetrics
+      return calculatedMetrics
         .filter((m) => m.is_visible_by_default)
         .slice(0, 6)
         .map((m) => m.id)
     }
-  }, [baseMetrics])
+  }, [calculatedMetrics])
 
   return {
     metrics,

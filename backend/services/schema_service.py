@@ -39,7 +39,10 @@ class SchemaService:
     ) -> SchemaDetectionResult:
         """
         Auto-detect schema from BigQuery table.
-        Classifies columns as base metrics or dimensions with smart defaults.
+        Classifies columns as dimensions with smart defaults.
+
+        NOTE: Base metrics are DEPRECATED. This function only detects dimensions now.
+        Metrics should be created as calculated_metrics with SQL expressions.
         """
         table_ref = f"{project_id}.{dataset}.{table}"
         table_obj = self.client.get_table(table_ref)
@@ -191,23 +194,6 @@ class SchemaService:
                 # Unknown type - log warning
                 warnings.append(f"Unknown field type {field_type} for column {column_name}")
 
-        # Add virtual days_in_range metric (system-generated, always available)
-        days_in_range_metric = BaseMetric(
-            id='days_in_range',
-            column_name='date',  # Uses date column for calculation
-            display_name='Days in Range',
-            aggregation='COUNT',  # Special: Will be replaced with DATE_DIFF in SQL
-            data_type='INTEGER',
-            format_type='number',
-            decimal_places=0,
-            category='system',
-            is_visible_by_default=False,  # Hidden by default, only used in formulas
-            is_system=True,  # Mark as system metric
-            sort_order=9999,  # Last in lists
-            description='Virtual metric: Number of days in the queried date range (per dimension group)'
-        )
-        detected_metrics.append(days_in_range_metric)
-
         return SchemaDetectionResult(
             detected_base_metrics=detected_metrics,
             detected_dimensions=detected_dimensions,
@@ -232,42 +218,15 @@ class SchemaService:
         """
         Create a default schema based on the original hardcoded configuration.
         Used for backward compatibility or when auto-detection fails.
+
+        NOTE: Base metrics are DEPRECATED. This function returns an empty list for base_metrics.
+        New implementations should define metrics as calculated_metrics with SQL expressions.
         """
         now = datetime.utcnow().isoformat()
 
-        # Default base metrics
-        base_metrics = [
-            BaseMetric(
-                id='queries', column_name='queries', display_name='Queries',
-                aggregation='SUM', data_type='INTEGER', format_type='number',
-                decimal_places=0, category='volume', is_visible_by_default=True,
-                sort_order=1, description='Total search queries'
-            ),
-            BaseMetric(
-                id='queries_pdp', column_name='queries_pdp', display_name='Queries PDP',
-                aggregation='SUM', data_type='INTEGER', format_type='number',
-                decimal_places=0, category='volume', is_visible_by_default=True,
-                sort_order=2, description='Queries with product detail page views'
-            ),
-            BaseMetric(
-                id='queries_a2c', column_name='queries_a2c', display_name='Queries A2C',
-                aggregation='SUM', data_type='INTEGER', format_type='number',
-                decimal_places=0, category='volume', is_visible_by_default=True,
-                sort_order=3, description='Queries with add-to-cart'
-            ),
-            BaseMetric(
-                id='purchases', column_name='purchases', display_name='Purchases',
-                aggregation='SUM', data_type='INTEGER', format_type='number',
-                decimal_places=0, category='conversion', is_visible_by_default=True,
-                sort_order=4, description='Total purchases'
-            ),
-            BaseMetric(
-                id='gross_purchase', column_name='gross_purchase', display_name='Revenue',
-                aggregation='SUM', data_type='FLOAT', format_type='currency',
-                decimal_places=2, category='revenue', is_visible_by_default=True,
-                sort_order=5, description='Total revenue'
-            ),
-        ]
+        # DEPRECATED: Base metrics are no longer used
+        # All metrics should be defined as calculated_metrics with SQL expressions
+        base_metrics = []
 
         # Default calculated metrics
         calculated_metrics = [
@@ -487,7 +446,7 @@ class SchemaService:
         self._schema_cache = None
 
     def get_all_metrics(self, schema: Optional[SchemaConfig] = None) -> List[Dict]:
-        """Get all metrics (base + calculated) as a unified list for API responses"""
+        """Get all metrics (calculated only, base is DEPRECATED) as a unified list for API responses"""
         if not schema:
             schema = self.load_schema()
         if not schema:
@@ -495,7 +454,8 @@ class SchemaService:
 
         all_metrics = []
 
-        # Add base metrics
+        # DEPRECATED: Base metrics are no longer used
+        # Kept for backward compatibility - if any exist in legacy schemas, include them
         for metric in schema.base_metrics:
             all_metrics.append({
                 'id': metric.id,
@@ -511,7 +471,7 @@ class SchemaService:
                 'description': metric.description
             })
 
-        # Add calculated metrics
+        # Add calculated metrics (primary metric type)
         for metric in schema.calculated_metrics:
             all_metrics.append({
                 'id': metric.id,
@@ -592,9 +552,13 @@ class SchemaService:
             with open(target_schema_path, 'w') as f:
                 json.dump(schema_data, f, indent=2)
 
+            # Clear the in-memory cache so it reloads from disk
+            self._schema_cache = None
+
             return True
 
         except Exception as e:
+            print(f"Error copying schema: {e}")
             return False
 
     def apply_template(self, template_name: str) -> bool:
@@ -631,41 +595,14 @@ class SchemaService:
         return self.create_default_schema()
 
     def _create_saas_template(self) -> SchemaConfig:
-        """SaaS/subscription analytics template"""
+        """SaaS/subscription analytics template
+
+        NOTE: Base metrics are DEPRECATED. Templates return empty base_metrics.
+        """
         now = datetime.utcnow().isoformat()
 
-        base_metrics = [
-            BaseMetric(
-                id='sessions', column_name='sessions', display_name='Sessions',
-                aggregation='SUM', data_type='INTEGER', format_type='number',
-                decimal_places=0, category='volume', is_visible_by_default=True,
-                sort_order=1, description='Total user sessions'
-            ),
-            BaseMetric(
-                id='signups', column_name='signups', display_name='Signups',
-                aggregation='SUM', data_type='INTEGER', format_type='number',
-                decimal_places=0, category='conversion', is_visible_by_default=True,
-                sort_order=2, description='New user signups'
-            ),
-            BaseMetric(
-                id='trials', column_name='trials', display_name='Trial Starts',
-                aggregation='SUM', data_type='INTEGER', format_type='number',
-                decimal_places=0, category='conversion', is_visible_by_default=True,
-                sort_order=3, description='Trial subscriptions started'
-            ),
-            BaseMetric(
-                id='conversions', column_name='conversions', display_name='Conversions',
-                aggregation='SUM', data_type='INTEGER', format_type='number',
-                decimal_places=0, category='conversion', is_visible_by_default=True,
-                sort_order=4, description='Trial to paid conversions'
-            ),
-            BaseMetric(
-                id='mrr', column_name='mrr', display_name='MRR',
-                aggregation='SUM', data_type='FLOAT', format_type='currency',
-                decimal_places=2, category='revenue', is_visible_by_default=True,
-                sort_order=5, description='Monthly recurring revenue'
-            ),
-        ]
+        # DEPRECATED: Base metrics are no longer used
+        base_metrics = []
 
         calculated_metrics = [
             CalculatedMetric(
@@ -737,41 +674,14 @@ class SchemaService:
         )
 
     def _create_marketing_template(self) -> SchemaConfig:
-        """Digital marketing/advertising template"""
+        """Digital marketing/advertising template
+
+        NOTE: Base metrics are DEPRECATED. Templates return empty base_metrics.
+        """
         now = datetime.utcnow().isoformat()
 
-        base_metrics = [
-            BaseMetric(
-                id='impressions', column_name='impressions', display_name='Impressions',
-                aggregation='SUM', data_type='INTEGER', format_type='number',
-                decimal_places=0, category='volume', is_visible_by_default=True,
-                sort_order=1, description='Total ad impressions'
-            ),
-            BaseMetric(
-                id='clicks', column_name='clicks', display_name='Clicks',
-                aggregation='SUM', data_type='INTEGER', format_type='number',
-                decimal_places=0, category='volume', is_visible_by_default=True,
-                sort_order=2, description='Total clicks'
-            ),
-            BaseMetric(
-                id='conversions', column_name='conversions', display_name='Conversions',
-                aggregation='SUM', data_type='INTEGER', format_type='number',
-                decimal_places=0, category='conversion', is_visible_by_default=True,
-                sort_order=3, description='Total conversions'
-            ),
-            BaseMetric(
-                id='spend', column_name='spend', display_name='Spend',
-                aggregation='SUM', data_type='FLOAT', format_type='currency',
-                decimal_places=2, category='revenue', is_visible_by_default=True,
-                sort_order=4, description='Total ad spend'
-            ),
-            BaseMetric(
-                id='revenue', column_name='revenue', display_name='Revenue',
-                aggregation='SUM', data_type='FLOAT', format_type='currency',
-                decimal_places=2, category='revenue', is_visible_by_default=True,
-                sort_order=5, description='Total revenue'
-            ),
-        ]
+        # DEPRECATED: Base metrics are no longer used
+        base_metrics = []
 
         calculated_metrics = [
             CalculatedMetric(

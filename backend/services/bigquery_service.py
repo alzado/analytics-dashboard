@@ -3,13 +3,17 @@ BigQuery service for querying search analytics data.
 """
 import os
 import json
+import logging
 import tempfile
 import time
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, Any
 from google.cloud import bigquery
 from google.oauth2 import service_account
 import pandas as pd
 from .date_resolver import resolve_relative_date
+from config import app_settings
+
+logger = logging.getLogger(__name__)
 
 
 class BigQueryService:
@@ -21,23 +25,27 @@ class BigQueryService:
         dataset: str,
         table: str,
         credentials_path: Optional[str] = None,
-        table_id: Optional[str] = None
+        table_id: Optional[str] = None,
+        billing_project: Optional[str] = None
     ):
         """
         Initialize BigQuery service.
 
         Args:
-            project_id: GCP project ID
+            project_id: GCP project ID (where the data resides)
             dataset: BigQuery dataset name
             table: BigQuery table name
             credentials_path: Path to service account JSON (optional)
             table_id: Table ID for multi-table support (optional)
+            billing_project: GCP project ID for query billing (optional, defaults to project_id)
         """
         self.project_id = project_id
         self.dataset = dataset
         self.table = table
         self.table_path = f"{project_id}.{dataset}.{table}"
         self.table_id = table_id
+        # Billing project: use specified billing_project, then global default, then fall back to project_id
+        self.billing_project = billing_project or app_settings.get_default_billing_project() or project_id
 
         # Date limits (optional)
         self.allowed_min_date: Optional[str] = None
@@ -49,12 +57,12 @@ class BigQueryService:
         # Count cache: {cache_key: total_count}
         self._count_cache: Dict[str, int] = {}
 
-        # Create BigQuery client
+        # Create BigQuery client with billing project
         if credentials_path and os.path.exists(credentials_path):
             credentials = service_account.Credentials.from_service_account_file(credentials_path)
-            self.client = bigquery.Client(credentials=credentials, project=project_id)
+            self.client = bigquery.Client(credentials=credentials, project=self.billing_project)
         else:
-            self.client = bigquery.Client(project=project_id)
+            self.client = bigquery.Client(project=self.billing_project)
 
         # Initialize schema service and load schema
         self.schema_service = None
@@ -1447,30 +1455,84 @@ class BigQueryService:
             group_parts.append(dim_id)
 
         if needs_reaggregation:
-            # Re-aggregate SUM/COUNT metrics
+            # Re-aggregate metrics when collapsing dimensions
             for metric_id in metrics:
-                metric = next(
+                # Check if it's a base metric
+                base_metric = next(
                     (m for m in self.schema_config.base_metrics if m.id == metric_id),
                     None
                 )
-                if metric and metric.aggregation in ("SUM", "COUNT"):
-                    select_parts.append(f"SUM({metric_id}) AS {metric_id}")
+                if base_metric:
+                    # Base metric - use its defined aggregation
+                    if base_metric.aggregation in ("SUM", "COUNT"):
+                        select_parts.append(f"SUM({metric_id}) AS {metric_id}")
+                    else:
+                        # Non-summable base metric (AVG, etc.)
+                        select_parts.append(metric_id)
                 else:
-                    # Non-aggregatable metric - just select (will cause issues)
-                    select_parts.append(metric_id)
+                    # Check if it's a calculated metric
+                    calc_metric = next(
+                        (m for m in self.schema_config.calculated_metrics if m.id == metric_id),
+                        None
+                    )
+                    if calc_metric:
+                        # Volume metrics (additive) -> SUM
+                        # Conversion/rate metrics -> cannot be summed, need recalculation
+                        if calc_metric.category == "volume":
+                            select_parts.append(f"SUM({metric_id}) AS {metric_id}")
+                        else:
+                            # For conversion metrics, we can't just sum them
+                            # They need to be recalculated from the summed volume metrics
+                            # Skip them here - they'll be recalculated in Python
+                            pass
+                    else:
+                        # Unknown metric - try to sum it
+                        select_parts.append(f"SUM({metric_id}) AS {metric_id}")
         else:
             # Direct select (exact match)
             select_parts.extend(metrics)
 
-        sort_metric = sort_by or (metrics[0] if metrics else None)
+        # Safeguard: ensure we have something to select
+        if not select_parts:
+            raise ValueError(
+                f"Cannot query rollup: no columns to select. "
+                f"Dimensions: {dimensions}, Metrics: {metrics}. "
+                f"This may indicate a rollup configuration mismatch."
+            )
+
+        # Determine sort metric - must be a column that exists in the rollup table
+        # (not a calculated metric which is computed in Python after query)
+        sort_metric = None
+        if sort_by:
+            # Check if sort_by is a calculated metric (not stored in rollup)
+            is_calculated = any(
+                m.id == sort_by for m in (self.schema_config.calculated_metrics if self.schema_config else [])
+            )
+            if is_calculated:
+                # Calculated metrics don't exist in rollup table - skip SQL ORDER BY
+                # The sort will be handled in Python after calculating the metric
+                sort_metric = None
+            else:
+                sort_metric = sort_by
+        elif metrics:
+            # Default to first metric if it's a base metric
+            first_metric = metrics[0]
+            is_calculated = any(
+                m.id == first_metric for m in (self.schema_config.calculated_metrics if self.schema_config else [])
+            )
+            if not is_calculated:
+                sort_metric = first_metric
+
         order_clause = f"ORDER BY {sort_metric} {sort_order}" if sort_metric else ""
 
         if needs_reaggregation:
+            # Only include GROUP BY if there are dimensions to group by
+            group_clause = f"GROUP BY {', '.join(group_parts)}" if group_parts else ""
             query = f"""
                 SELECT {', '.join(select_parts)}
                 FROM `{rollup_table_path}`
                 {where_clause}
-                GROUP BY {', '.join(group_parts)}
+                {group_clause}
                 {order_clause}
                 LIMIT {limit} OFFSET {offset}
             """
@@ -1533,6 +1595,71 @@ class BigQueryService:
             query_filters=filter_dims,
             require_rollup=require_rollup
         )
+
+    def query_rollup_aggregates(
+        self,
+        rollup_table_path: str,
+        metric_ids: List[str],
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        dimension_filters: Optional[Dict[str, List[str]]] = None,
+        date_range_type: Optional[str] = "absolute",
+        relative_date_preset: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Query aggregated totals from a rollup table by summing metrics.
+
+        Re-aggregates by summing all rows (collapsing all dimensions)
+        while respecting dimension filters. Used for significance testing.
+
+        Args:
+            rollup_table_path: Full BigQuery path to rollup table
+            metric_ids: List of metric column names to sum
+            start_date: Start date for date range filter
+            end_date: End date for date range filter
+            dimension_filters: Dimension filters to apply
+            date_range_type: 'absolute' or 'relative'
+            relative_date_preset: Relative date preset
+
+        Returns:
+            Dict mapping metric_id to summed value
+        """
+        # Build SELECT: SUM(metric) for each metric
+        select_parts = []
+        for metric_id in metric_ids:
+            select_parts.append(f"SUM({metric_id}) AS {metric_id}")
+
+        if not select_parts:
+            return {}
+
+        # Build WHERE clause from filters (reuse existing method)
+        where_clause = self.build_filter_clause(
+            start_date=start_date,
+            end_date=end_date,
+            dimension_filters=dimension_filters,
+            date_range_type=date_range_type,
+            relative_date_preset=relative_date_preset
+        )
+
+        query = f"""
+        SELECT {', '.join(select_parts)}
+        FROM `{rollup_table_path}`
+        {where_clause}
+        """
+
+        logger.info(f"Querying rollup aggregates from {rollup_table_path}")
+        logger.debug(f"Query: {query}")
+
+        job = self.client.query(query)
+        result = job.result()
+
+        # Get the single aggregated row
+        row = next(iter(result), None)
+        if not row:
+            # No data matching filters - return zeros
+            return {metric_id: 0 for metric_id in metric_ids}
+
+        return {metric_id: row[metric_id] or 0 for metric_id in metric_ids}
 
     def list_tables_in_dataset(self) -> List[Dict]:
         """
@@ -1604,12 +1731,13 @@ class BigQueryService:
 _bq_services: Dict[str, BigQueryService] = {}
 
 
-def get_bigquery_service(table_id: Optional[str] = None) -> Optional[BigQueryService]:
+def get_bigquery_service(table_id: Optional[str] = None, reload_schema: bool = True) -> Optional[BigQueryService]:
     """
     Get BigQuery service instance for a specific table.
 
     Args:
         table_id: Table ID to get service for. If None, returns None.
+        reload_schema: If True, always reload schema from disk to ensure freshness.
 
     Returns:
         BigQuery service instance or None
@@ -1617,7 +1745,13 @@ def get_bigquery_service(table_id: Optional[str] = None) -> Optional[BigQuerySer
     if table_id is None:
         return None
 
-    return _bq_services.get(table_id)
+    service = _bq_services.get(table_id)
+
+    # Always reload schema from disk to ensure we have the latest configuration
+    if service and reload_schema:
+        service._load_schema()
+
+    return service
 
 
 def clear_bigquery_service(table_id: Optional[str] = None) -> None:
@@ -1641,17 +1775,19 @@ def initialize_bigquery_service(
     dataset: str,
     table: str,
     credentials_path: Optional[str] = None,
-    table_id: Optional[str] = None
+    table_id: Optional[str] = None,
+    billing_project: Optional[str] = None
 ) -> BigQueryService:
     """
     Initialize BigQuery service for a specific table.
 
     Args:
-        project_id: GCP project ID
+        project_id: GCP project ID (where the data resides)
         dataset: BigQuery dataset name
         table: BigQuery table name
         credentials_path: Path to service account JSON (optional)
         table_id: Table ID to associate with this service
+        billing_project: GCP project ID for query billing (optional, defaults to project_id)
 
     Returns:
         BigQuery service instance
@@ -1661,7 +1797,10 @@ def initialize_bigquery_service(
     if table_id is None:
         raise ValueError("No table_id specified")
 
-    service = BigQueryService(project_id, dataset, table, credentials_path, table_id)
+    # Use global default billing project as fallback if not specified
+    effective_billing_project = billing_project or app_settings.get_default_billing_project()
+
+    service = BigQueryService(project_id, dataset, table, credentials_path, table_id, effective_billing_project)
     _bq_services[table_id] = service
     return service
 
@@ -1671,17 +1810,19 @@ def initialize_bigquery_with_json(
     dataset: str,
     table: str,
     credentials_json: str,
-    table_id: Optional[str] = None
+    table_id: Optional[str] = None,
+    billing_project: Optional[str] = None
 ) -> BigQueryService:
     """
     Initialize BigQuery service with credentials JSON string.
 
     Args:
-        project_id: GCP project ID
+        project_id: GCP project ID (where the data resides)
         dataset: BigQuery dataset name
         table: BigQuery table name
         credentials_json: Service account JSON as string
         table_id: Table ID to associate with this service
+        billing_project: GCP project ID for query billing (optional, defaults to project_id)
 
     Returns:
         BigQuery service instance
@@ -1691,13 +1832,16 @@ def initialize_bigquery_with_json(
     if table_id is None:
         raise ValueError("No table_id specified")
 
+    # Billing project: use specified billing_project, then global default, then fall back to project_id
+    effective_billing_project = billing_project or app_settings.get_default_billing_project() or project_id
+
     # Parse JSON and create credentials
     try:
         credentials_dict = json.loads(credentials_json)
         credentials = service_account.Credentials.from_service_account_info(credentials_dict)
 
-        # Create BigQuery client directly
-        client = bigquery.Client(credentials=credentials, project=project_id)
+        # Create BigQuery client directly with billing project
+        client = bigquery.Client(credentials=credentials, project=effective_billing_project)
 
         # Create service instance manually
         service = BigQueryService.__new__(BigQueryService)
@@ -1707,9 +1851,13 @@ def initialize_bigquery_with_json(
         service.table_path = f"{project_id}.{dataset}.{table}"
         service.client = client
         service.table_id = table_id
+        service.billing_project = effective_billing_project
         # Initialize date limit attributes
         service.allowed_min_date = None
         service.allowed_max_date = None
+        # Initialize caches
+        service._date_range_cache = {}
+        service._count_cache = {}
 
         # Initialize schema attributes and load schema
         service.schema_service = None
