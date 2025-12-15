@@ -129,7 +129,7 @@ def parse_dimension_filters(request: Request) -> Dict[str, List[str]]:
     reserved_params = {
         'start_date', 'end_date', 'dimensions', 'dimension_values',
         'limit', 'offset', 'sort_by', 'granularity', 'table_id', 'skip_count', 'metrics',
-        'date_range_type', 'relative_date_preset'
+        'date_range_type', 'relative_date_preset', 'require_rollup'
     }
 
     dimension_filters = {}
@@ -1357,11 +1357,8 @@ async def get_pivot_table(
         )
         return data_service.get_pivot_data(dimensions, filters, limit, offset, dimension_values, table_id, skip_count, metrics, require_rollup)
     except ValueError as e:
-        # ValueError is raised when no suitable rollup exists
-        error_msg = str(e)
-        if "No suitable rollup found" in error_msg:
-            raise HTTPException(status_code=400, detail=error_msg)
-        raise HTTPException(status_code=500, detail=error_msg)
+        # ValueError for other validation errors (not rollup - those are returned inline now)
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         import traceback
         traceback.print_exc()  # Print full traceback to console

@@ -79,6 +79,7 @@ interface UsePivotConfigReturn {
   setChartType: (type: 'bar' | 'line') => void
   // Manual fetch control
   triggerFetch: () => void
+  resetFetchRequested: () => void
   isStale: boolean
   fetchRequested: boolean
 }
@@ -456,6 +457,14 @@ export function usePivotConfig(): UsePivotConfigReturn {
     }))
   }, [configHash])
 
+  // Reset fetch requested to false (when config changes from top bar)
+  const resetFetchRequested = useCallback(() => {
+    setConfig((prev) => ({
+      ...prev,
+      fetchRequested: false,
+    }))
+  }, [])
+
   return {
     config,
     updateTable,
@@ -487,6 +496,7 @@ export function usePivotConfig(): UsePivotConfigReturn {
     setChartType,
     // Manual fetch control
     triggerFetch,
+    resetFetchRequested,
     isStale,
     fetchRequested: config.fetchRequested ?? false,
   }

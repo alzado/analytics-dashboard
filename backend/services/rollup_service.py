@@ -257,13 +257,11 @@ class RollupService:
         return None
 
     def create_rollup(self, data: RollupCreate, schema_config: SchemaConfig) -> List[RollupDef]:
-        """Create rollup definitions for ALL dimension combinations.
+        """Create rollup definitions for the requested dimensions plus a date-only baseline.
 
-        When given dimensions [A, B, C], creates 2^n rollups (8 total):
-        - {table_id}_rollup_baseline (no dimensions - pure totals)
-        - {table_id}_rollup_A, _B, _C
-        - {table_id}_rollup_A_B, _A_C, _B_C
-        - {table_id}_rollup_A_B_C
+        When given dimensions [A, B, C], creates exactly 2 rollups:
+        - {table_id}_rollup_date (baseline - date only for metric comparisons)
+        - {table_id}_rollup_A_B_C_date (the requested combination)
 
         Note: Metrics are auto-included from schema. Only dimensions need to be specified.
 
@@ -272,7 +270,7 @@ class RollupService:
             schema_config: Schema configuration for validation
 
         Returns:
-            List of created RollupDef objects (one for each combination)
+            List of created RollupDef objects (at most 2: baseline + requested)
         """
         config = self.load_config()
 
@@ -290,8 +288,15 @@ class RollupService:
         if 'date' not in dims_with_date:
             dims_with_date.insert(0, 'date')
 
-        # Generate all combinations (power set) - always includes date as baseline
-        dim_combinations = generate_dimension_combinations(dims_with_date)
+        # Only create 2 rollups: baseline (date-only) + the requested combination
+        # Sort non-date dimensions for consistent naming
+        other_dims = sorted([d for d in dims_with_date if d != 'date'])
+        requested_dims = ['date'] + other_dims if other_dims else ['date']
+
+        # Build the list of combinations to create
+        dim_combinations = [['date']]  # Always include baseline
+        if other_dims:  # Only add requested combo if it's different from baseline
+            dim_combinations.append(requested_dims)
 
         # Create a rollup for each combination
         for dims in dim_combinations:
@@ -413,12 +418,23 @@ class RollupService:
         # Drop BigQuery table if requested
         if drop_table and self.client and rollup:
             try:
+                # Use rollup's target project/dataset if set, otherwise fall back to defaults/source
+                target_project = rollup.target_project or config.default_target_project or source_project_id
                 target_dataset = rollup.target_dataset or config.default_target_dataset or source_dataset
-                table_path = f"{source_project_id}.{target_dataset}.{rollup.target_table_name}"
-                self.client.delete_table(table_path, not_found_ok=True)
+                table_name = rollup.target_table_name
+
+                if target_project and target_dataset and table_name:
+                    table_path = f"{target_project}.{target_dataset}.{table_name}"
+                    print(f"Dropping BigQuery table: {table_path}")
+                    self.client.delete_table(table_path, not_found_ok=True)
+                    print(f"Successfully dropped table: {table_path}")
+                else:
+                    print(f"Warning: Cannot drop table - missing target_project={target_project}, target_dataset={target_dataset}, table_name={table_name}")
             except Exception as e:
                 # Log but don't fail the delete
+                import traceback
                 print(f"Warning: Failed to drop table: {e}")
+                traceback.print_exc()
 
         # Remove from config
         config.rollups.pop(rollup_idx)

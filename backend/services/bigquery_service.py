@@ -805,6 +805,7 @@ class BigQueryService:
         dimension_filters: Optional[Dict[str, List[str]]] = None,
         date_range_type: Optional[str] = "absolute",
         relative_date_preset: Optional[str] = None,
+        use_dimension_ids: bool = False,
     ) -> str:
         """
         Build WHERE clause from filter parameters - fully dynamic.
@@ -816,6 +817,8 @@ class BigQueryService:
                               Example: {"country": ["USA", "Canada"], "channel": ["Web"]}
             date_range_type: 'absolute' or 'relative'
             relative_date_preset: Relative date preset (e.g., 'last_7_days')
+            use_dimension_ids: If True, use dimension IDs as column names (for rollup tables)
+                              If False, use column_name from schema (for source tables)
 
         Returns:
             WHERE clause string (includes "WHERE" keyword if non-empty)
@@ -910,8 +913,12 @@ class BigQueryService:
                 if self.schema_config:
                     dimension_def = next((d for d in self.schema_config.dimensions if d.id == dimension_id), None)
 
-                # Default to using dimension_id as column_name if not found in schema
-                column_name = dimension_def.column_name if dimension_def else dimension_id
+                # For rollup tables, use dimension ID as column name (rollups use dimension IDs as columns)
+                # For source tables, use column_name from schema (actual column name in BigQuery)
+                if use_dimension_ids:
+                    column_name = dimension_id
+                else:
+                    column_name = dimension_def.column_name if dimension_def else dimension_id
                 data_type = dimension_def.data_type if dimension_def else "STRING"
 
                 # Quote column name if it contains special characters
@@ -1438,12 +1445,14 @@ class BigQueryService:
         Returns:
             DataFrame with query results
         """
+        # For rollup tables, use dimension IDs as column names
         where_clause = self.build_filter_clause(
             start_date=filters.start_date,
             end_date=filters.end_date,
             dimension_filters=filters.dimension_filters,
             date_range_type=filters.date_range_type,
-            relative_date_preset=filters.relative_date_preset
+            relative_date_preset=filters.relative_date_preset,
+            use_dimension_ids=True  # Rollup tables use dimension IDs as column names
         )
 
         # Build SELECT parts
@@ -1501,26 +1510,35 @@ class BigQueryService:
             )
 
         # Determine sort metric - must be a column that exists in the rollup table
-        # (not a calculated metric which is computed in Python after query)
+        # Volume calculated metrics ARE stored in rollups, conversion metrics are NOT
         sort_metric = None
         if sort_by:
-            # Check if sort_by is a calculated metric (not stored in rollup)
-            is_calculated = any(
-                m.id == sort_by for m in (self.schema_config.calculated_metrics if self.schema_config else [])
+            # Check if sort_by is a calculated metric
+            calc_metric = next(
+                (m for m in (self.schema_config.calculated_metrics if self.schema_config else []) if m.id == sort_by),
+                None
             )
-            if is_calculated:
-                # Calculated metrics don't exist in rollup table - skip SQL ORDER BY
-                # The sort will be handled in Python after calculating the metric
-                sort_metric = None
+            if calc_metric:
+                # Volume calculated metrics ARE stored in rollups - can sort in SQL
+                # Conversion metrics are computed in Python after query - sort in Python
+                if calc_metric.category == "volume":
+                    sort_metric = sort_by
+                else:
+                    sort_metric = None
             else:
+                # Base metric - can sort in SQL
                 sort_metric = sort_by
         elif metrics:
-            # Default to first metric if it's a base metric
+            # Default to first metric if it's a base metric or volume calculated metric
             first_metric = metrics[0]
-            is_calculated = any(
-                m.id == first_metric for m in (self.schema_config.calculated_metrics if self.schema_config else [])
+            calc_metric = next(
+                (m for m in (self.schema_config.calculated_metrics if self.schema_config else []) if m.id == first_metric),
+                None
             )
-            if not is_calculated:
+            if calc_metric:
+                if calc_metric.category == "volume":
+                    sort_metric = first_metric
+            else:
                 sort_metric = first_metric
 
         order_clause = f"ORDER BY {sort_metric} {sort_order}" if sort_metric else ""
@@ -1633,12 +1651,14 @@ class BigQueryService:
             return {}
 
         # Build WHERE clause from filters (reuse existing method)
+        # For rollup tables, use dimension IDs as column names
         where_clause = self.build_filter_clause(
             start_date=start_date,
             end_date=end_date,
             dimension_filters=dimension_filters,
             date_range_type=date_range_type,
-            relative_date_preset=relative_date_preset
+            relative_date_preset=relative_date_preset,
+            use_dimension_ids=True  # Rollup tables use dimension IDs as column names
         )
 
         query = f"""

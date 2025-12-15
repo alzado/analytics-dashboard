@@ -4,7 +4,7 @@ import React, { useState, useMemo, useEffect, useCallback, useRef } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { fetchPivotData, fetchPivotChildren, fetchDimensionValues, fetchCustomDimensions, fetchTables, updateWidget } from '@/lib/api'
 import type { PivotRow, PivotChildRow, PivotResponse, CustomDimension, DateRangeType, RelativeDatePreset } from '@/lib/types'
-import { ChevronRight, ChevronDown, Settings2, ArrowUp, ArrowDown, Database, Save, GripVertical, Download } from 'lucide-react'
+import { ChevronRight, ChevronDown, Settings2, ArrowUp, ArrowDown, Database, Save, GripVertical, Download, Calendar, BarChart3 } from 'lucide-react'
 import { usePivotConfig } from '@/hooks/use-pivot-config'
 import { usePivotMetrics } from '@/hooks/use-pivot-metrics'
 import { useSchema } from '@/hooks/use-schema'
@@ -292,6 +292,7 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
     setSortConfig,
     setChartType,
     triggerFetch,
+    resetFetchRequested,
     isStale,
     fetchRequested,
   } = usePivotConfig()
@@ -310,6 +311,7 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
   const {
     filters: pivotFilters,
     updateDimensionFilter,
+    removeDimensionFilterValue,
     updateDateRange: updateFilterDateRange,
     clearDimensionFilters,
     toFilterParams,
@@ -566,7 +568,6 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
   const [currentPage, setCurrentPage] = useState<Record<string, number>>({})
   const [loadingRows, setLoadingRows] = useState<Set<string>>(new Set())
   const [cumulativePercentageCache, setCumulativePercentageCache] = useState<Record<string, number>>({}) // Tracks cumulative % at end of each page
-  const [mergeThreshold, setMergeThreshold] = useState(0) // 0 means disabled
   const [isDragOver, setIsDragOver] = useState(false)
   const [isDragOverHeader, setIsDragOverHeader] = useState(false)
   const [isDragOverFirstColumn, setIsDragOverFirstColumn] = useState(false)
@@ -778,12 +779,14 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
           // Return single row representing all data
           return {
             ...data,
-            rows: data.rows.length > 0 ? [{
-              ...data.total,
+            rows: data.rows.length > 0 && data.total ? [{
               dimension_value: 'All Data',
+              metrics: data.total.metrics || {},
+              percentage_of_total: 100,
+              search_term_count: data.total.search_term_count || 0,
               has_children: false, // No drilling down when no dimensions selected
             }] : []
-          }
+          } as PivotResponse
         })
       }
       // Pass all dimensions for combined row display
@@ -857,54 +860,8 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
       })
     }
 
-    // For merge threshold, check which data source we're using
-    const dataSource = (selectedTableDimensions.length > 0 && allColumnData && columnOrder.length > 0)
-      ? allColumnData[columnOrder[0]]
-      : pivotData
-
-    if (!dataSource || mergeThreshold <= 0) {
-      return rowsWithChildren
-    }
-
-    const mainRows: PivotRow[] = []
-    const otherRows: PivotRow[] = []
-    let cumulativePercentage = 0
-
-    // Iterate through rows in order, tracking cumulative percentage
-    rowsWithChildren.forEach(row => {
-      // Check if adding this row would exceed the threshold
-      if (cumulativePercentage < mergeThreshold) {
-        mainRows.push(row)
-        cumulativePercentage += row.percentage_of_total
-      } else {
-        // This row and all subsequent rows go into "Other"
-        otherRows.push(row)
-      }
-    })
-
-    // If there are rows to merge, create an "Other" row
-    if (otherRows.length > 0) {
-      // Sum up all metrics from other rows
-      const aggregatedMetrics: Record<string, number> = {}
-      otherRows.forEach(row => {
-        Object.entries(row.metrics || {}).forEach(([key, value]) => {
-          aggregatedMetrics[key] = (aggregatedMetrics[key] || 0) + (value || 0)
-        })
-      })
-
-      const otherRow: PivotRow = {
-        dimension_value: 'Other',
-        metrics: aggregatedMetrics,
-        percentage_of_total: otherRows.reduce((sum, r) => sum + r.percentage_of_total, 0),
-        search_term_count: otherRows.reduce((sum, r) => sum + r.search_term_count, 0),
-        has_children: false
-      }
-
-      return [...mainRows, otherRow]
-    }
-
-    return mainRows
-  }, [pivotData, mergeThreshold, selectedDimensions, dimensionSortOrder, selectedTableDimensions, allColumnData, columnOrder])
+    return rowsWithChildren
+  }, [pivotData, selectedDimensions, dimensionSortOrder, selectedTableDimensions, allColumnData, columnOrder])
 
   // Initialize column order when table combinations change
   React.useEffect(() => {
@@ -1027,12 +984,14 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
   const removeDataSource = () => {
     updateTable(null)
     setDataSourceDropped(false)
+    resetFetchRequested()
   }
 
   const removeDateRange = () => {
     updateStartDate(null)
     updateEndDate(null)
     setDateRangeDropped(false)
+    resetFetchRequested()
   }
 
   const toggleRow = async (dimensionPath: string, depth: number, grandTotal: number) => {
@@ -1742,220 +1701,56 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
     )
   }
 
-  // Show empty state if not configured
-  if (!isConfigured) {
-    return (
-      <div className="space-y-4">
-        <div className="flex justify-between items-center">
-          <div>
-            <h2 className="text-lg font-semibold text-gray-900">Pivot Table</h2>
-            <p className="text-sm text-gray-600 mt-1">Configure your data source to get started</p>
-          </div>
-          <button
-            onClick={() => setConfigOpen(!isConfigOpen)}
-            className={`flex items-center gap-2 px-4 py-2 rounded-lg transition-colors ${
-              isConfigOpen
-                ? 'bg-gray-200 text-gray-700'
-                : 'bg-blue-600 text-white hover:bg-blue-700'
-            }`}
-          >
-            <Settings2 className="h-4 w-4" />
-            {isConfigOpen ? 'Hide' : 'Configure'}
-          </button>
-        </div>
+  // Check for inline error from response (e.g., rollup required)
+  // This is shown within the table area, not as a full replacement
+  // Only show inline error if we actually tried to fetch data
+  // Check both single-table (pivotData) and multi-table (allColumnData) responses
+  // NOTE: These hooks MUST be before any early returns to satisfy React's rules of hooks
+  const multiTableError = useMemo(() => {
+    if (!fetchRequested || !allColumnData) return null
+    // Check if any column has an error
+    for (const colIndex of Object.keys(allColumnData)) {
+      const colData = allColumnData[Number(colIndex)]
+      if (colData?.error) return colData.error
+    }
+    return null
+  }, [fetchRequested, allColumnData])
 
-        <div className="flex gap-4">
-          <PivotConfigPanel
-            isOpen={isConfigOpen}
-            onClose={() => setConfigOpen(false)}
-            config={config}
-            updateTable={updateTable}
-            updateDateRange={updateDateRange}
-            updateStartDate={updateStartDate}
-            updateEndDate={updateEndDate}
-            setDataSourceDropped={setDataSourceDropped}
-            setDateRangeDropped={setDateRangeDropped}
-            addDimension={addDimension}
-            removeDimension={removeDimension}
-            addMetric={addMetric}
-            removeMetric={removeMetric}
-            addFilter={addFilter}
-            removeFilter={removeFilter}
-            resetToDefaults={resetToDefaults}
-            dimensionFilters={pivotFilters.dimension_filters}
-            onDimensionFilterChange={updateDimensionFilter}
-            onClearDimensionFilters={clearDimensionFilters}
-            currentFilters={filters}
-            dateRangeType={pivotFilters.date_range_type}
-            relativeDatePreset={pivotFilters.relative_date_preset}
-            onDateRangeChange={handleDateRangeChange}
-          />
-
-          <div
-            className={`flex-1 min-w-0 bg-white shadow overflow-hidden rounded-lg transition-all ${
-              isDragOver ? 'ring-4 ring-blue-400 bg-blue-50' : ''
-            }`}
-            onDrop={handleDrop}
-            onDragOver={handleDragOver}
-            onDragLeave={handleDragLeave}
-          >
-            <div className="flex flex-col items-center justify-center h-96 text-center p-8">
-              <div className={`mb-4 transition-colors ${isDragOver ? 'text-blue-600' : 'text-gray-400'}`}>
-                <Settings2 className="h-16 w-16 mx-auto" />
-              </div>
-              <h3 className="text-lg font-medium text-gray-900 mb-2">
-                {isDragOver ? 'Drop here to configure' : 'Drop to Configure Pivot Table'}
-              </h3>
-              <p className="text-sm text-gray-600 max-w-md mb-4">
-                {isDragOver
-                  ? 'Release to add this configuration'
-                  : 'Drag and drop data source, date range, dimensions, and metrics from the sidebar'}
-              </p>
-              <div className="text-xs text-gray-500 space-y-2">
-                <div className="flex items-center gap-2 justify-center">
-                  <span className={config.isDataSourceDropped ? 'text-green-600' : 'text-gray-400'}>
-                    {config.isDataSourceDropped ? '✓' : '○'}
-                  </span>
-                  <span>Data Source</span>
-                </div>
-                <div className="flex items-center gap-2 justify-center">
-                  <span className={config.isDateRangeDropped ? 'text-green-600' : 'text-gray-400'}>
-                    {config.isDateRangeDropped ? '✓' : '○'}
-                  </span>
-                  <span>Date Range</span>
-                </div>
-                <div className="flex items-center gap-2 justify-center">
-                  <span className={selectedDimensions.length > 0 ? 'text-green-600' : 'text-gray-400'}>
-                    {selectedDimensions.length > 0 ? '✓' : '○'}
-                  </span>
-                  <span>Dimensions ({selectedDimensions.length})</span>
-                </div>
-                <div className="flex items-center gap-2 justify-center">
-                  <span className={selectedMetrics.length > 0 ? 'text-green-600' : 'text-gray-400'}>
-                    {selectedMetrics.length > 0 ? '✓' : '○'}
-                  </span>
-                  <span>Metrics ({selectedMetrics.length})</span>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-    )
-  }
-
-  // Show "ready to fetch" state when configured but not yet fetched
-  if (!fetchRequested) {
-    return (
-      <div className="space-y-4">
-        <div className="flex justify-between items-center">
-          <div>
-            <h2 className="text-lg font-semibold text-gray-900">Pivot Table</h2>
-            <p className="text-sm text-gray-600 mt-1">Configure your options and click "Fetch Data" when ready</p>
-          </div>
-          <div className="flex items-center gap-3">
-            {/* Fetch BigQuery Data button */}
-            <button
-              onClick={triggerFetch}
-              className="flex items-center gap-2 px-4 py-2 rounded-lg bg-blue-600 text-white hover:bg-blue-700 transition-colors"
-              title="Fetch data from BigQuery"
-            >
-              <Database className="h-4 w-4" />
-              Fetch Data
-            </button>
-            <button
-              onClick={() => setConfigOpen(!isConfigOpen)}
-              className={`flex items-center gap-2 px-4 py-2 rounded-lg transition-colors ${
-                isConfigOpen
-                  ? 'bg-gray-200 text-gray-700'
-                  : 'bg-blue-600 text-white hover:bg-blue-700'
-              }`}
-            >
-              <Settings2 className="h-4 w-4" />
-              {isConfigOpen ? 'Hide' : 'Configure'}
-            </button>
-          </div>
-        </div>
-
-        <div className="flex gap-4">
-          <PivotConfigPanel
-            isOpen={isConfigOpen}
-            onClose={() => setConfigOpen(false)}
-            config={config}
-            updateTable={updateTable}
-            updateDateRange={updateDateRange}
-            updateStartDate={updateStartDate}
-            updateEndDate={updateEndDate}
-            setDataSourceDropped={setDataSourceDropped}
-            setDateRangeDropped={setDateRangeDropped}
-            addDimension={addDimension}
-            removeDimension={removeDimension}
-            addMetric={addMetric}
-            removeMetric={removeMetric}
-            addFilter={addFilter}
-            removeFilter={removeFilter}
-            resetToDefaults={resetToDefaults}
-            dimensionFilters={pivotFilters.dimension_filters}
-            onDimensionFilterChange={updateDimensionFilter}
-            onClearDimensionFilters={clearDimensionFilters}
-            currentFilters={filters}
-            dateRangeType={pivotFilters.date_range_type}
-            relativeDatePreset={pivotFilters.relative_date_preset}
-            onDateRangeChange={handleDateRangeChange}
-          />
-
-          <div className="flex-1 min-w-0 bg-white shadow overflow-hidden rounded-lg">
-            <div className="flex flex-col items-center justify-center h-96 text-center p-8">
-              <div className="mb-4 text-gray-400">
-                <Database className="h-16 w-16 mx-auto" />
-              </div>
-              <h3 className="text-lg font-medium text-gray-900 mb-2">
-                Ready to Fetch Data
-              </h3>
-              <p className="text-sm text-gray-600 max-w-md mb-4">
-                Your pivot table is configured. Click "Fetch Data" to query BigQuery.
-                You can modify dimensions, metrics, and filters before fetching.
-              </p>
-              <button
-                onClick={triggerFetch}
-                className="flex items-center gap-2 px-6 py-3 rounded-lg bg-blue-600 text-white hover:bg-blue-700 transition-colors text-lg"
-              >
-                <Database className="h-5 w-5" />
-                Fetch BigQuery Data
-              </button>
-            </div>
-          </div>
-        </div>
-      </div>
-    )
-  }
+  const multiTableErrorType = useMemo(() => {
+    if (!fetchRequested || !allColumnData) return null
+    for (const colIndex of Object.keys(allColumnData)) {
+      const colData = allColumnData[Number(colIndex)]
+      if (colData?.error_type) return colData.error_type
+    }
+    return null
+  }, [fetchRequested, allColumnData])
 
   if (isLoading) {
     return <div className="flex items-center justify-center h-64">Loading...</div>
   }
 
-  // Handle errors from both single-table (error) and multi-table (columnError) queries
-  const displayError = error || columnError
-  if (displayError) {
-    const errorMessage = displayError instanceof Error ? displayError.message : String(displayError)
-    const isRollupError = errorMessage.includes('No suitable rollup found') ||
-                          errorMessage.includes('Missing metrics') ||
-                          errorMessage.includes('Missing filter dimensions') ||
-                          errorMessage.includes('rollup')
+  // Handle HTTP/network errors from React Query (not inline errors from response)
+  // Note: Inline errors (pivotData?.error) are handled later in the table body
+  const httpError = error || columnError
+  if (httpError) {
+    const errorMessage = httpError instanceof Error ? httpError.message : String(httpError)
+    // Only show full-page error for actual HTTP/network errors, not rollup errors
+    // (rollup errors are now returned inline in the response)
     return (
       <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded">
-        <div className="font-medium">
-          {isRollupError ? 'Rollup Required' : 'Error loading pivot table'}
-        </div>
+        <div className="font-medium">Error loading pivot table</div>
         <div className="text-sm mt-1">{errorMessage}</div>
-        {isRollupError && (
-          <div className="text-sm mt-2 text-red-600">
-            Go to <strong>Tables → Rollups</strong> to create a rollup with the required dimensions and metrics.
-          </div>
-        )}
       </div>
     )
   }
+
+  // Use multi-table error if in multi-table mode, otherwise use single-table error
+  const inlineError = fetchRequested
+    ? (selectedTableDimensions.length > 0 ? multiTableError : pivotData?.error)
+    : null
+  const inlineErrorType = fetchRequested
+    ? (selectedTableDimensions.length > 0 ? multiTableErrorType : pivotData?.error_type)
+    : null
 
   // Show loading state while schema is being fetched
   if (isLoadingSchema) {
@@ -1964,10 +1759,6 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
         <div className="text-gray-500">Loading schema...</div>
       </div>
     )
-  }
-
-  if (!pivotData) {
-    return null
   }
 
   // Handler for "Save to Dashboard" button (creating new widget)
@@ -2087,7 +1878,6 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
       visible_metrics: widgetType === 'chart' && selection.type === 'chart' && 'metricId' in selection
         ? [selection.metricId]  // For charts, set the clicked metric as the default visible metric
         : config.selectedDisplayMetrics || null,
-      merge_threshold: mergeThreshold || null,
       dimension_sort_order: dimensionSortOrder || null,
       children_sort_config: childrenSortConfig || null,
       row_sort_config: sortConfig || null,
@@ -2978,7 +2768,6 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
       visible_metrics: widgetType === 'chart' && selectedWidgetType?.type === 'chart' && 'metricId' in selectedWidgetType
         ? [selectedWidgetType.metricId]  // For charts, set the clicked metric as the default visible metric
         : config.selectedDisplayMetrics || null,
-      merge_threshold: mergeThreshold || null,
       dimension_sort_order: dimensionSortOrder || null,
       children_sort_config: childrenSortConfig || null,
       row_sort_config: sortConfig || null,
@@ -3029,28 +2818,6 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
                 Config changed - click Fetch to update
               </span>
             )}
-            <div className="flex items-center gap-2">
-              <label className="text-sm text-gray-600">Show top:</label>
-              <input
-                type="number"
-                min="0"
-                max="100"
-                step="1"
-                value={mergeThreshold}
-                onChange={(e) => setMergeThreshold(parseFloat(e.target.value) || 0)}
-                className="w-20 px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                placeholder="100"
-              />
-              <span className="text-sm text-gray-600">%</span>
-              {mergeThreshold > 0 && mergeThreshold < 100 && (
-                <button
-                  onClick={() => setMergeThreshold(0)}
-                  className="text-sm text-blue-600 hover:text-blue-800"
-                >
-                  Clear
-                </button>
-              )}
-            </div>
             {isEditingWidget && (
               // Update Widget button (when editing an existing widget)
               <button
@@ -3172,12 +2939,12 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
         )}
 
         <div className="flex-1 min-w-0 space-y-4">
-          {/* Configuration Bar */}
-          {!widgetMode && isConfigured && (
+          {/* Configuration Bar - Always visible */}
+          {!widgetMode && (
             <div className="bg-white shadow rounded-lg p-4">
-              <div className="flex flex-wrap gap-2">
-                {/* Data Source Chip */}
-                {config.isDataSourceDropped && (
+              <div className="flex flex-wrap gap-2 items-center">
+                {/* Data Source Chip or Placeholder */}
+                {config.isDataSourceDropped ? (
                   <div className="flex items-center gap-1 px-3 py-1 bg-blue-100 text-blue-800 rounded-full text-sm">
                     <span>{config.selectedTable}</span>
                     <button
@@ -3189,10 +2956,15 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
                       </svg>
                     </button>
                   </div>
+                ) : (
+                  <div className="flex items-center gap-1 px-3 py-1 bg-gray-100 text-gray-500 rounded-full text-sm border-2 border-dashed border-gray-300">
+                    <Database className="w-3 h-3" />
+                    <span>Data Source</span>
+                  </div>
                 )}
 
-                {/* Date Range Chip */}
-                {config.isDateRangeDropped && config.startDate && config.endDate && (
+                {/* Date Range Chip or Placeholder */}
+                {config.isDateRangeDropped && config.startDate && config.endDate ? (
                   <div className="flex items-center gap-1 px-3 py-1 bg-purple-100 text-purple-800 rounded-full text-sm">
                     <span>{config.startDate} → {config.endDate}</span>
                     <button
@@ -3204,6 +2976,19 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
                       </svg>
                     </button>
                   </div>
+                ) : (
+                  <div className="flex items-center gap-1 px-3 py-1 bg-gray-100 text-gray-500 rounded-full text-sm border-2 border-dashed border-gray-300">
+                    <Calendar className="w-3 h-3" />
+                    <span>Date Range</span>
+                  </div>
+                )}
+
+                {/* Metrics Placeholder if none selected */}
+                {selectedMetrics.length === 0 && (
+                  <div className="flex items-center gap-1 px-3 py-1 bg-gray-100 text-gray-500 rounded-full text-sm border-2 border-dashed border-gray-300">
+                    <BarChart3 className="w-3 h-3" />
+                    <span>Metrics</span>
+                  </div>
                 )}
 
                 {/* Row Dimension Chips */}
@@ -3211,7 +2996,7 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
                   <div key={dim} className="flex items-center gap-1 px-3 py-1 bg-green-100 text-green-800 rounded-full text-sm">
                     <span>Row: {getDimensionLabel(dim)}</span>
                     <button
-                      onClick={() => removeDimension(dim)}
+                      onClick={() => { removeDimension(dim); resetFetchRequested() }}
                       className="ml-1 hover:bg-green-200 rounded-full p-0.5"
                     >
                       <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -3226,7 +3011,7 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
                   <div key={dim} className="flex items-center gap-1 px-3 py-1 bg-yellow-100 text-yellow-800 rounded-full text-sm">
                     <span>Table: {getDimensionLabel(dim)}</span>
                     <button
-                      onClick={() => removeTableDimension(dim)}
+                      onClick={() => { removeTableDimension(dim); resetFetchRequested() }}
                       className="ml-1 hover:bg-yellow-200 rounded-full p-0.5"
                     >
                       <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -3264,7 +3049,7 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
                       <GripVertical className="w-3 h-3 text-orange-400" />
                       <span>{metric?.label || metricId}</span>
                       <button
-                        onClick={() => removeMetric(metricId)}
+                        onClick={() => { removeMetric(metricId); resetFetchRequested() }}
                         className="ml-1 hover:bg-orange-300 rounded-full p-0.5"
                       >
                         <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -3286,9 +3071,9 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
                       <span>{dimensionLabel}: {value}</span>
                       <button
                         onClick={() => {
-                          // Remove this specific value from the dimension filter
-                          const newValues = values.filter(v => v !== value)
-                          updateDimensionFilter(dimensionId, newValues)
+                          // Remove this specific value from the dimension filter (removes key if no values left)
+                          removeDimensionFilterValue(dimensionId, value)
+                          resetFetchRequested()
                         }}
                         className="ml-1 hover:bg-pink-200 rounded-full p-0.5"
                       >
@@ -3304,7 +3089,7 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
           )}
 
           {/* Column Pivot Mode - dimension combinations as columns */}
-          {selectedTableDimensions.length > 0 && tableCombinations.length > 0 ? (
+          {selectedTableDimensions.length > 0 ? (
             <div
               className={`bg-white shadow rounded-lg transition-all ${
                 isDragOver ? 'ring-4 ring-blue-400 bg-blue-50' : ''
@@ -3357,60 +3142,69 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
                       <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider border-r-2 border-gray-300">
                         Metric
                       </th>
-                      {columnOrder.map((originalColIndex, orderIndex) => {
-                        const combination = tableCombinations[originalColIndex]
+                      {/* Show placeholder column if no table combinations yet */}
+                      {tableCombinations.length === 0 ? (
+                        <th className="px-6 py-3 text-center text-xs font-medium text-gray-400 uppercase tracking-wider border-r border-gray-200">
+                          <div className="flex items-center justify-center gap-2">
+                            {selectedTableDimensions.map(d => getDimensionLabel(d)).join(' | ')}
+                          </div>
+                        </th>
+                      ) : (
+                        columnOrder.map((originalColIndex, orderIndex) => {
+                          const combination = tableCombinations[originalColIndex]
 
-                        // Safety check: skip if combination doesn't exist
-                        if (!combination) return null
+                          // Safety check: skip if combination doesn't exist
+                          if (!combination) return null
 
-                        const headerParts = selectedTableDimensions.map((dim) => {
-                          const dimLabel = getDimensionLabel(dim)
-                          return `${dimLabel}: ${combination[dim]}`
+                          const headerParts = selectedTableDimensions.map((dim) => {
+                            const dimLabel = getDimensionLabel(dim)
+                            return `${dimLabel}: ${combination[dim]}`
+                          })
+                          const headerLabel = headerParts.join(' | ')
+
+                          return (
+                            <th
+                              key={`col-${originalColIndex}`}
+                              colSpan={orderIndex === 0 ? 1 : 3}
+                              draggable
+                              onDragStart={(e) => {
+                                setDraggedColumnIndex(orderIndex)
+                                e.dataTransfer.effectAllowed = 'move'
+                              }}
+                              onDragOver={(e) => {
+                                e.preventDefault()
+                                e.dataTransfer.dropEffect = 'move'
+                              }}
+                              onDrop={(e) => {
+                                e.preventDefault()
+                                if (draggedColumnIndex !== null && draggedColumnIndex !== orderIndex) {
+                                  // Reorder columns
+                                  const newOrder = [...columnOrder]
+                                  const [removed] = newOrder.splice(draggedColumnIndex, 1)
+                                  newOrder.splice(orderIndex, 0, removed)
+                                  setColumnOrder(newOrder)
+                                  isColumnOrderSetRef.current = true // Mark as manually set to prevent auto-sort
+                                  // Clear children cache to refetch for new first column
+                                  setChildrenCache({})
+                                  setExpandedRows([])
+                                }
+                                setDraggedColumnIndex(null)
+                              }}
+                              onDragEnd={() => setDraggedColumnIndex(null)}
+                              className={`px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider cursor-move transition-all duration-200 ${
+                                orderIndex === 0 ? 'border-r-2 border-gray-300' : 'border-r border-gray-200'
+                              } ${draggedColumnIndex === orderIndex ? 'bg-blue-300 opacity-50 scale-95' : 'hover:bg-gray-200'} ${orderIndex === 0 ? 'bg-green-50' : ''}`}
+                              title="Drag to reorder columns"
+                            >
+                              <div className="flex items-center justify-center gap-2">
+                                <GripVertical className="h-4 w-4 text-gray-400" />
+                                {orderIndex === 0 && <span className="text-green-600 text-sm">★</span>}
+                                <div>{headerLabel}</div>
+                              </div>
+                            </th>
+                          )
                         })
-                        const headerLabel = headerParts.join(' | ')
-
-                        return (
-                          <th
-                            key={`col-${originalColIndex}`}
-                            colSpan={orderIndex === 0 ? 1 : 3}
-                            draggable
-                            onDragStart={(e) => {
-                              setDraggedColumnIndex(orderIndex)
-                              e.dataTransfer.effectAllowed = 'move'
-                            }}
-                            onDragOver={(e) => {
-                              e.preventDefault()
-                              e.dataTransfer.dropEffect = 'move'
-                            }}
-                            onDrop={(e) => {
-                              e.preventDefault()
-                              if (draggedColumnIndex !== null && draggedColumnIndex !== orderIndex) {
-                                // Reorder columns
-                                const newOrder = [...columnOrder]
-                                const [removed] = newOrder.splice(draggedColumnIndex, 1)
-                                newOrder.splice(orderIndex, 0, removed)
-                                setColumnOrder(newOrder)
-                                isColumnOrderSetRef.current = true // Mark as manually set to prevent auto-sort
-                                // Clear children cache to refetch for new first column
-                                setChildrenCache({})
-                                setExpandedRows([])
-                              }
-                              setDraggedColumnIndex(null)
-                            }}
-                            onDragEnd={() => setDraggedColumnIndex(null)}
-                            className={`px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider cursor-move transition-all duration-200 ${
-                              orderIndex === 0 ? 'border-r-2 border-gray-300' : 'border-r border-gray-200'
-                            } ${draggedColumnIndex === orderIndex ? 'bg-blue-300 opacity-50 scale-95' : 'hover:bg-gray-200'} ${orderIndex === 0 ? 'bg-green-50' : ''}`}
-                            title="Drag to reorder columns"
-                          >
-                            <div className="flex items-center justify-center gap-2">
-                              <GripVertical className="h-4 w-4 text-gray-400" />
-                              {orderIndex === 0 && <span className="text-green-600 text-sm">★</span>}
-                              <div>{headerLabel}</div>
-                            </div>
-                          </th>
-                        )
-                      })}
+                      )}
                     </tr>
                     {/* Second header row - metric sub-columns */}
                     <tr className="bg-gray-100">
@@ -3430,83 +3224,171 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
                       </th>
                       <th className="px-4 py-2 text-left text-xs font-medium text-gray-600 uppercase tracking-wider border-r-2 border-gray-300">
                       </th>
-                      {columnOrder.map((originalColIndex, orderIndex) => {
-                        if (orderIndex === 0) {
-                          // First column - show sort dropdown
-                          const activeMetricForCol = sortConfig?.column === originalColIndex && sortConfig?.subColumn === 'value' ? sortConfig.metric : null
-                          return (
-                            <th
-                              key={`metric-${originalColIndex}`}
-                              className="px-6 py-2 text-right text-xs font-medium text-gray-600 uppercase tracking-wider border-r-2 border-gray-300"
-                            >
-                              <SortDropdown
-                                label="Sort"
-                                metrics={selectedMetrics}
-                                getMetricById={getMetricById}
-                                activeMetric={activeMetricForCol}
-                                activeDirection={sortConfig?.direction}
-                                onSort={(metricId) => handleSort(originalColIndex, 'value', metricId)}
-                                align="right"
-                                color="blue"
-                                showFullLabel={true}
-                              />
-                            </th>
-                          )
-                        } else {
-                          // Columns 2+ - Value, Diff, % Diff with sort dropdowns
-                          const activeValueMetric = sortConfig?.column === originalColIndex && sortConfig?.subColumn === 'value' ? sortConfig.metric : null
-                          const activeDiffMetric = sortConfig?.column === originalColIndex && sortConfig?.subColumn === 'diff' ? sortConfig.metric : null
-                          const activePctDiffMetric = sortConfig?.column === originalColIndex && sortConfig?.subColumn === 'pctDiff' ? sortConfig.metric : null
-                          return (
-                            <React.Fragment key={`metrics-${originalColIndex}`}>
-                              {/* Value column */}
-                              <th className="px-4 py-2 text-right text-xs font-medium text-gray-600 uppercase tracking-wider border-l border-gray-200">
+                      {/* Show placeholder sub-column if no table combinations yet */}
+                      {tableCombinations.length === 0 ? (
+                        <th className="px-6 py-2 text-right text-xs font-medium text-gray-400 uppercase tracking-wider border-r border-gray-200">
+                          -
+                        </th>
+                      ) : (
+                        columnOrder.map((originalColIndex, orderIndex) => {
+                          if (orderIndex === 0) {
+                            // First column - show sort dropdown
+                            const activeMetricForCol = sortConfig?.column === originalColIndex && sortConfig?.subColumn === 'value' ? sortConfig.metric : null
+                            return (
+                              <th
+                                key={`metric-${originalColIndex}`}
+                                className="px-6 py-2 text-right text-xs font-medium text-gray-600 uppercase tracking-wider border-r-2 border-gray-300"
+                              >
                                 <SortDropdown
-                                  label="Value"
+                                  label="Sort"
                                   metrics={selectedMetrics}
                                   getMetricById={getMetricById}
-                                  activeMetric={activeValueMetric}
+                                  activeMetric={activeMetricForCol}
                                   activeDirection={sortConfig?.direction}
                                   onSort={(metricId) => handleSort(originalColIndex, 'value', metricId)}
                                   align="right"
                                   color="blue"
+                                  showFullLabel={true}
                                 />
                               </th>
-                              {/* Diff column */}
-                              <th className="px-4 py-2 text-right text-xs font-medium text-gray-600 uppercase tracking-wider">
-                                <SortDropdown
-                                  label="Diff"
-                                  metrics={selectedMetrics}
-                                  getMetricById={getMetricById}
-                                  activeMetric={activeDiffMetric}
-                                  activeDirection={sortConfig?.direction}
-                                  onSort={(metricId) => handleSort(originalColIndex, 'diff', metricId)}
-                                  align="right"
-                                  color="blue"
-                                />
-                              </th>
-                              {/* % Diff column */}
-                              <th className="px-4 py-2 text-right text-xs font-medium text-gray-600 uppercase tracking-wider border-r border-gray-200">
-                                <SortDropdown
-                                  label="% Diff"
-                                  metrics={selectedMetrics}
-                                  getMetricById={getMetricById}
-                                  activeMetric={activePctDiffMetric}
-                                  activeDirection={sortConfig?.direction}
-                                  onSort={(metricId) => handleSort(originalColIndex, 'pctDiff', metricId)}
-                                  align="right"
-                                  color="blue"
-                                />
-                              </th>
-                            </React.Fragment>
-                          )
-                        }
-                      })}
+                            )
+                          } else {
+                            // Columns 2+ - Value, Diff, % Diff with sort dropdowns
+                            const activeValueMetric = sortConfig?.column === originalColIndex && sortConfig?.subColumn === 'value' ? sortConfig.metric : null
+                            const activeDiffMetric = sortConfig?.column === originalColIndex && sortConfig?.subColumn === 'diff' ? sortConfig.metric : null
+                            const activePctDiffMetric = sortConfig?.column === originalColIndex && sortConfig?.subColumn === 'pctDiff' ? sortConfig.metric : null
+                            return (
+                              <React.Fragment key={`metrics-${originalColIndex}`}>
+                                {/* Value column */}
+                                <th className="px-4 py-2 text-right text-xs font-medium text-gray-600 uppercase tracking-wider border-l border-gray-200">
+                                  <SortDropdown
+                                    label="Value"
+                                    metrics={selectedMetrics}
+                                    getMetricById={getMetricById}
+                                    activeMetric={activeValueMetric}
+                                    activeDirection={sortConfig?.direction}
+                                    onSort={(metricId) => handleSort(originalColIndex, 'value', metricId)}
+                                    align="right"
+                                    color="blue"
+                                  />
+                                </th>
+                                {/* Diff column */}
+                                <th className="px-4 py-2 text-right text-xs font-medium text-gray-600 uppercase tracking-wider">
+                                  <SortDropdown
+                                    label="Diff"
+                                    metrics={selectedMetrics}
+                                    getMetricById={getMetricById}
+                                    activeMetric={activeDiffMetric}
+                                    activeDirection={sortConfig?.direction}
+                                    onSort={(metricId) => handleSort(originalColIndex, 'diff', metricId)}
+                                    align="right"
+                                    color="blue"
+                                  />
+                                </th>
+                                {/* % Diff column */}
+                                <th className="px-4 py-2 text-right text-xs font-medium text-gray-600 uppercase tracking-wider border-r border-gray-200">
+                                  <SortDropdown
+                                    label="% Diff"
+                                    metrics={selectedMetrics}
+                                    getMetricById={getMetricById}
+                                    activeMetric={activePctDiffMetric}
+                                    activeDirection={sortConfig?.direction}
+                                    onSort={(metricId) => handleSort(originalColIndex, 'pctDiff', metricId)}
+                                    align="right"
+                                    color="blue"
+                                  />
+                                </th>
+                              </React.Fragment>
+                            )
+                          }
+                        })
+                      )}
                     </tr>
                   </thead>
                   <tbody className="bg-white divide-y divide-gray-200">
+                    {/* Inline error display (e.g., rollup required) - shows within table body */}
+                    {inlineError && (
+                      <tr>
+                        <td colSpan={100} className="px-6 py-8">
+                          <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded">
+                            <div className="font-medium">
+                              {inlineErrorType === 'rollup_required' ? 'Rollup Required' : 'Error loading data'}
+                            </div>
+                            <div className="text-sm mt-1">{inlineError}</div>
+                            {inlineErrorType === 'rollup_required' && (
+                              <div className="text-sm mt-2 text-red-600">
+                                Go to <strong>Tables → Rollups</strong> to create a rollup with the required dimensions and metrics.
+                              </div>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                    {/* Placeholder rows when not fetched yet - show metric names with "-" for values */}
+                    {!inlineError && !fetchRequested && (
+                      <>
+                        {/* Show placeholder rows for each metric */}
+                        {selectedMetrics.length > 0 ? (
+                          selectedMetrics.map((metricId, metricIdx) => {
+                            const metric = getMetricById(metricId)
+                            return (
+                              <tr key={`placeholder-metric-${metricId}`} className="hover:bg-gray-50">
+                                {/* Dimension column - only show on first metric row */}
+                                {metricIdx === 0 ? (
+                                  <td
+                                    rowSpan={selectedMetrics.length}
+                                    className="px-6 py-3 whitespace-nowrap text-sm text-gray-400 border-r border-gray-200 align-top"
+                                  >
+                                    -
+                                  </td>
+                                ) : null}
+                                {/* Metric name column */}
+                                <td className="px-3 py-3 whitespace-nowrap text-sm text-gray-600 border-r border-gray-200">
+                                  {metric?.label || metricId}
+                                </td>
+                                {/* Value columns */}
+                                {tableCombinations.length === 0 ? (
+                                  <td className="px-3 py-3 whitespace-nowrap text-sm text-gray-400 text-right border-r border-gray-100">
+                                    -
+                                  </td>
+                                ) : (
+                                  columnOrder.map((colIndex, colOrderIdx) => (
+                                    <React.Fragment key={`placeholder-${metricId}-col-${colIndex}`}>
+                                      <td className="px-3 py-3 whitespace-nowrap text-sm text-gray-400 text-right border-r border-gray-100">
+                                        -
+                                      </td>
+                                      {colOrderIdx > 0 && (
+                                        <>
+                                          <td className="px-3 py-3 whitespace-nowrap text-sm text-gray-400 text-right">-</td>
+                                          <td className="px-3 py-3 whitespace-nowrap text-sm text-gray-400 text-right border-r border-gray-100">-</td>
+                                        </>
+                                      )}
+                                    </React.Fragment>
+                                  ))
+                                )}
+                              </tr>
+                            )
+                          })
+                        ) : (
+                          /* No metrics selected - show simple placeholder */
+                          [1, 2, 3].map((i) => (
+                            <tr key={`placeholder-${i}`} className="hover:bg-gray-50">
+                              <td className="px-6 py-3 whitespace-nowrap text-sm text-gray-400 border-r border-gray-200">
+                                -
+                              </td>
+                              <td className="px-3 py-3 whitespace-nowrap text-sm text-gray-400 text-right border-r border-gray-200">
+                                -
+                              </td>
+                              <td className="px-3 py-3 whitespace-nowrap text-sm text-gray-400 text-right border-r border-gray-100">
+                                -
+                              </td>
+                            </tr>
+                          ))
+                        )}
+                      </>
+                    )}
                     {/* Render rows based on row dimensions or show single summary row */}
-                    {selectedDimensions.length === 0 ? (
+                    {!inlineError && fetchRequested && selectedDimensions.length === 0 ? (
                       <>
                         {/* No dimensions - show Total with sub-rows per metric */}
                         {(() => {
@@ -3592,7 +3474,7 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
                           )
                         })()}
                       </>
-                    ) : (
+                    ) : fetchRequested && !inlineError ? (
                       <>
                         {sortRows(processedRows).map((row, rowIndex) => {
                           const dimensionPath = row.dimension_value
@@ -3602,7 +3484,7 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
                           const currentPageNum = currentPage[rowKey] || 0
                           const pageKey = `${rowKey}:${currentPageNum}`
                           const children = childrenCache[pageKey] || []
-                          const grandTotal = pivotData?.total.metrics?.[primarySortMetric] || 0
+                          const grandTotal = pivotData?.total?.metrics?.[primarySortMetric] || 0
 
                           // Get data for all columns for this row
                           const firstColIndex = columnOrder[0]
@@ -3869,7 +3751,7 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
                           )
                         })}
                       </>
-                    )}
+                    ) : null}
                   </tbody>
                   <tfoot className="bg-gray-100 font-semibold sticky bottom-0 z-10">
                     {selectedDimensions.length > 0 && (
@@ -3952,12 +3834,8 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
                 </table>
               </div>
             </div>
-          ) : selectedTableDimensions.length > 0 && tableCombinations.length === 0 ? (
-            <div className="bg-yellow-50 border border-yellow-200 text-yellow-700 px-4 py-3 rounded">
-              Loading dimension combinations...
-            </div>
           ) : (
-            /* Single Table Mode */
+            /* Single Table Mode - also used for inline errors when no column dimensions */
             <div
               className={`bg-white shadow rounded-lg transition-all ${
                 isDragOver ? 'ring-4 ring-blue-400 bg-blue-50' : ''
@@ -4064,7 +3942,43 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
               </tr>
             </thead>
             <tbody className="bg-white divide-y divide-gray-200">
-              {(() => {
+              {/* Placeholder rows when not fetched yet */}
+              {!inlineError && !fetchRequested && (
+                <>
+                  {/* Show 3 placeholder rows with "-" for data */}
+                  {[1, 2, 3].map((i) => (
+                    <tr key={`placeholder-${i}`} className="hover:bg-gray-50">
+                      <td className="px-6 py-3 whitespace-nowrap text-sm text-gray-400">
+                        -
+                      </td>
+                      {selectedMetrics.map((metricId) => (
+                        <td key={`placeholder-${i}-${metricId}`} className="px-3 py-3 whitespace-nowrap text-sm text-gray-400 text-right">
+                          -
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                </>
+              )}
+              {/* Inline error display (e.g., rollup required) - shows within table body */}
+              {inlineError && (
+                <tr>
+                  <td colSpan={100} className="px-6 py-8">
+                    <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded">
+                      <div className="font-medium">
+                        {inlineErrorType === 'rollup_required' ? 'Rollup Required' : 'Error loading data'}
+                      </div>
+                      <div className="text-sm mt-1">{inlineError}</div>
+                      {inlineErrorType === 'rollup_required' && (
+                        <div className="text-sm mt-2 text-red-600">
+                          Go to <strong>Tables → Rollups</strong> to create a rollup with the required dimensions and metrics.
+                        </div>
+                      )}
+                    </div>
+                  </td>
+                </tr>
+              )}
+              {fetchRequested && !inlineError && (() => {
                 const sortedRows = sortRows(processedRows)
                 return sortedRows.map((row, index) => {
                   const rowKey = `depth0:${row.dimension_value}`
@@ -4075,7 +3989,7 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
                   const children = childrenCache[pageKey] || []
 
                   // Get grand total from the whole dataset using primary sort metric
-                  const grandTotal = pivotData.total.metrics?.[primarySortMetric] || 0
+                  const grandTotal = pivotData?.total?.metrics?.[primarySortMetric] || 0
 
                   // Calculate cumulative percentage based on sorted order (already in decimal 0-1 format)
                   const cumulativePercentage = sortedRows
@@ -4248,6 +4162,7 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
               })()}
             </tbody>
             <tfoot className="bg-gray-100 font-semibold sticky bottom-0 z-10">
+              {fetchRequested && !inlineError && pivotData?.total && (
               <tr>
                 <td
                   className={`px-6 py-4 whitespace-nowrap text-sm text-gray-900 transition-all ${
@@ -4272,9 +4187,9 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
                   if (metricId === 'percentage_of_total' || metricId === 'cumulative_percentage') {
                     value = 1.0 // 100%
                   } else if (metricId === 'cumulative_terms') {
-                    value = pivotData.total.search_term_count
+                    value = pivotData?.total?.search_term_count || 0
                   } else {
-                    value = getRowValue(pivotData.total, metricId)
+                    value = pivotData?.total ? getRowValue(pivotData.total, metricId) : 0
                   }
 
                   return (
@@ -4287,6 +4202,7 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
                   )
                 })}
               </tr>
+              )}
             </tfoot>
           </table>
         </div>

@@ -279,9 +279,12 @@ class QueryRouterService:
         if not scored_rollups:
             if has_distinct and require_rollup:
                 # User chose to error when no rollup for DISTINCT
+                # Include both query dimensions and filter dimensions (from table columns) in the message
+                all_required_dims = query_dims_set | filter_dims_set
+                filter_info = f" (includes table dimension filters: {filter_dims_set})" if filter_dims_set else ""
                 return RouteDecision(
                     use_rollup=False,
-                    reason=f"No suitable rollup for COUNT_DISTINCT metrics {distinct_metrics} with dimensions {query_dims_set}. "
+                    reason=f"No suitable rollup for COUNT_DISTINCT metrics {distinct_metrics} with dimensions {all_required_dims}{filter_info}. "
                            f"Create a rollup with exactly these dimensions to enable this query."
                 )
             return RouteDecision(

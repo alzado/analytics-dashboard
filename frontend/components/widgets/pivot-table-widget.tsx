@@ -146,7 +146,7 @@ export function PivotTableWidget({ widget }: PivotTableWidgetProps) {
               <td className="px-3 py-2 text-sm font-bold text-gray-900">Total</td>
               {displayMetrics.map((metric) => (
                 <td key={metric} className="px-3 py-2 text-sm font-bold text-gray-900 text-right">
-                  {formatValue(data.total.metrics[metric], metric)}
+                  {formatValue(data.total?.metrics[metric] ?? 0, metric)}
                 </td>
               ))}
             </tr>

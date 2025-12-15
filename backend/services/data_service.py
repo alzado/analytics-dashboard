@@ -56,7 +56,7 @@ def _add_percent_metrics(metrics: Dict, total_metrics: Dict, metrics_data: Dict)
         pct_key = f"{metric_id}_pct"
         row_value = metrics.get(metric_id, 0)
         total_value = total_metrics.get(metric_id, 0)
-        metrics[pct_key] = safe_float((row_value / total_value * 100)) if total_value > 0 else 0.0
+        metrics[pct_key] = round(safe_float((row_value / total_value * 100)), 2) if total_value > 0 else 0.0
 
     return metrics
 
@@ -453,20 +453,20 @@ def _get_baseline_totals(
     table_id: Optional[str] = None
 ) -> Dict[str, float]:
     """
-    Get totals from the baseline rollup (no dimensions) for metric comparison.
+    Get totals from a rollup, respecting dimension filters but ignoring row dimensions.
 
-    The baseline rollup contains pure totals without any dimensional grouping.
-    This is used to detect metric inflation when querying with dimensions.
+    This finds a rollup that contains the filter dimensions (e.g., experiment_group)
+    and queries it with those filters applied to get accurate per-column totals.
 
     Args:
         bq_service: BigQuery service instance
-        filters: Filter parameters (date range, etc.)
+        filters: Filter parameters (date range, dimension_filters, etc.)
         metrics_data: Dict containing base_metrics, calculated_metrics, schema_config
         table_id: Optional table ID for multi-table support
 
     Returns:
         Dict mapping metric_id to baseline total value.
-        Returns empty dict if no baseline rollup exists.
+        Returns empty dict if no suitable rollup exists.
     """
     from services.query_router_service import QueryRouterService
     from services.rollup_service import RollupService
@@ -478,7 +478,7 @@ def _get_baseline_totals(
     if not rollup_config or not rollup_config.rollups:
         return {}
 
-    # Create query router to find baseline rollup
+    # Create query router to find suitable rollup
     schema_config = metrics_data.get('schema_config')
     if not schema_config:
         return {}
@@ -490,18 +490,50 @@ def _get_baseline_totals(
         source_dataset=bq_service.dataset
     )
 
-    # Find the baseline rollup (no dimensions)
-    baseline_rollup = router.find_simplest_rollup()
-    if not baseline_rollup:
-        return {}
+    # Get the dimensions we need to filter by (from dimension_filters)
+    filter_dimensions = list(filters.dimension_filters.keys()) if filters.dimension_filters else []
 
-    baseline_table_path = router.get_baseline_rollup_path()
-    if not baseline_table_path:
+    # Track which dimensions exist in the chosen rollup (to only apply valid filters)
+    rollup_dimensions = set()
+
+    # Find a rollup that contains the filter dimensions
+    # We need a rollup with these dimensions so we can filter by them
+    if filter_dimensions:
+        # Find rollups that have the filter dimensions
+        suitable_rollups = router.find_suitable_rollups(
+            query_dimensions=[],  # No row dimensions needed
+            query_metrics=[],
+            query_filters=filters.dimension_filters
+        )
+        # Get the best rollup that can handle our filters
+        usable_rollups = [r for r in suitable_rollups if r.get('can_use', False)]
+        if usable_rollups:
+            best_rollup_id = usable_rollups[0]['rollup_id']
+            best_rollup = next((r for r in rollup_config.rollups if r.id == best_rollup_id), None)
+            if best_rollup:
+                # Build target table path using rollup config defaults
+                target_project = best_rollup.target_project or rollup_config.default_target_project or bq_service.project_id
+                target_dataset = best_rollup.target_dataset or rollup_config.default_target_dataset or bq_service.dataset
+                rollup_table_path = f"{target_project}.{target_dataset}.{best_rollup.target_table_name}"
+                rollup_dimensions = set(best_rollup.dimensions)
+            else:
+                rollup_table_path = router.get_baseline_rollup_path()
+                # Baseline rollup only has 'date' dimension
+                rollup_dimensions = {'date'}
+        else:
+            # No rollup with filter dimensions, fall back to baseline
+            rollup_table_path = router.get_baseline_rollup_path()
+            rollup_dimensions = {'date'}
+    else:
+        # No dimension filters, use baseline rollup
+        rollup_table_path = router.get_baseline_rollup_path()
+        rollup_dimensions = {'date'}
+
+    if not rollup_table_path:
         return {}
 
     try:
-        # Build query to get summed metrics from baseline rollup (date-only)
-        # We need to SUM across all dates to get the total
+        # Build query to get summed metrics
         base_metric_ids = [m.id for m in metrics_data.get('base_metrics', [])]
         volume_calc_ids = [m.id for m in metrics_data.get('calculated_metrics', []) if m.category == 'volume']
 
@@ -510,18 +542,62 @@ def _get_baseline_totals(
         sum_clauses = [f"SUM({metric_id}) as {metric_id}" for metric_id in all_metric_ids]
         select_clause = ', '.join(sum_clauses)
 
-        # Build date filter if provided
-        where_clause = ""
-        if filters.start_date or filters.end_date:
-            conditions = []
-            if filters.start_date:
-                conditions.append(f"date >= '{filters.start_date}'")
-            if filters.end_date:
-                conditions.append(f"date <= '{filters.end_date}'")
-            where_clause = "WHERE " + " AND ".join(conditions)
+        # Build WHERE clause with date and dimension filters
+        conditions = []
 
-        # Query baseline rollup with SUM aggregation
-        query = f"SELECT {select_clause} FROM `{baseline_table_path}` {where_clause}"
+        # Date filters
+        if filters.start_date:
+            conditions.append(f"date >= '{filters.start_date}'")
+        if filters.end_date:
+            conditions.append(f"date <= '{filters.end_date}'")
+
+        # Dimension filters (important for multi-table view where each column has different filters)
+        # Only apply filters for dimensions that exist in the chosen rollup
+        missing_filter_dims = []
+
+        # Build a lookup of dimension data types from schema
+        dim_data_types = {}
+        if schema_config and schema_config.dimensions:
+            for dim in schema_config.dimensions:
+                dim_data_types[dim.id] = dim.data_type
+
+        if filters.dimension_filters:
+            for dim_id, values in filters.dimension_filters.items():
+                if values:
+                    if dim_id in rollup_dimensions:
+                        # Get data type for this dimension (default to STRING)
+                        data_type = dim_data_types.get(dim_id, "STRING")
+                        is_numeric = data_type in ("INTEGER", "FLOAT", "BOOLEAN")
+
+                        # Handle single value or list of values
+                        if isinstance(values, list):
+                            if is_numeric:
+                                # Numeric types don't need quotes
+                                values_str = ", ".join([str(v) for v in values])
+                            else:
+                                escaped_values = [str(v).replace("'", "''") for v in values]
+                                values_str = ", ".join([f"'{v}'" for v in escaped_values])
+                            conditions.append(f"{dim_id} IN ({values_str})")
+                        else:
+                            if is_numeric:
+                                conditions.append(f"{dim_id} = {values}")
+                            else:
+                                escaped_value = str(values).replace("'", "''")
+                                conditions.append(f"{dim_id} = '{escaped_value}'")
+                    else:
+                        # Track filters we couldn't apply
+                        missing_filter_dims.append(dim_id)
+
+        # If we couldn't apply some filters, the totals would be incorrect
+        # Return empty to fall back to summing visible rows
+        if missing_filter_dims:
+            print(f"Warning: Baseline totals rollup missing filter dimensions: {missing_filter_dims}")
+            return {}
+
+        where_clause = "WHERE " + " AND ".join(conditions) if conditions else ""
+
+        # Query rollup with SUM aggregation
+        query = f"SELECT {select_clause} FROM `{rollup_table_path}` {where_clause}"
 
         df = bq_service.client.query(query).to_dataframe()
 
@@ -740,11 +816,21 @@ def _query_pivot_from_rollup(
             has_children=True
         ))
 
-    # Build totals from rollup metrics
-    total_metrics = dict(metric_totals)
-    # Recalculate conversion metrics and non-rollup metrics for totals
-    total_calculated = _compute_calculated_metrics(total_metrics, metrics_to_recalculate)
-    total_metrics.update(total_calculated)
+    # =========================================================================
+    # FETCH REAL TOTALS FROM BIGQUERY (baseline rollup with no dimensions)
+    # =========================================================================
+    # This ensures totals reflect ALL data, not just the paginated rows
+    baseline_totals = _get_baseline_totals(bq_service, filters, metrics_data)
+
+    # Use baseline totals if available, otherwise fall back to summing visible rows
+    if baseline_totals:
+        total_metrics = dict(baseline_totals)
+    else:
+        # Fallback: Build totals from visible rows (may be incomplete with pagination)
+        total_metrics = dict(metric_totals)
+        # Recalculate conversion metrics and non-rollup metrics for totals
+        total_calculated = _compute_calculated_metrics(total_metrics, metrics_to_recalculate)
+        total_metrics.update(total_calculated)
 
     if num_days and num_days > 0 and avg_per_day_metric in total_metrics:
         total_metrics[avg_per_day_key] = total_metrics[avg_per_day_metric] / num_days
@@ -763,6 +849,11 @@ def _query_pivot_from_rollup(
             row_sort_value = row.metrics.get(primary_sort, 0)
             row.percentage_of_total = round((row_sort_value / total_sort_value) * 100, 2)
 
+    # Sort rows by primary_sort metric in descending order
+    # This is needed when sorting by conversion metrics (not sorted in SQL)
+    # For volume metrics already sorted in SQL, this is a no-op (stable sort)
+    rows.sort(key=lambda r: r.metrics.get(primary_sort, 0), reverse=True)
+
     # Get total count if needed
     total_count = len(rows) if not skip_count else None
 
@@ -771,16 +862,13 @@ def _query_pivot_from_rollup(
     if metrics_data.get('schema_config') and metrics_data['schema_config'].dimensions:
         available_dims = [d.id for d in metrics_data['schema_config'].dimensions if d.is_groupable]
 
-    # =========================================================================
-    # BASELINE COMPARISON: Check for metric inflation
-    # =========================================================================
-    # Get baseline totals (from rollup with no dimensions) for comparison
-    baseline_totals = _get_baseline_totals(bq_service, filters, metrics_data)
-
-    # Compare current totals with baseline to detect inflated metrics
+    # Compare summed row totals with baseline to detect metric inflation
     metric_warnings = {}
     if baseline_totals:
-        metric_warnings = _compare_metrics_with_baseline(total_metrics, baseline_totals)
+        row_sum_totals = dict(metric_totals)
+        row_sum_calculated = _compute_calculated_metrics(row_sum_totals, metrics_to_recalculate)
+        row_sum_totals.update(row_sum_calculated)
+        metric_warnings = _compare_metrics_with_baseline(row_sum_totals, baseline_totals)
 
     return PivotResponse(
         rows=rows,
@@ -1354,12 +1442,23 @@ def get_pivot_data(dimensions: List[str], filters: FilterParams, limit: int = 50
             require_rollup=require_rollup
         )
 
-        # If require_rollup is True and no rollup found, raise error
+        # If require_rollup is True and no rollup found, return error response (not exception)
         if require_rollup and not route_decision.use_rollup:
-            raise ValueError(
-                f"No suitable rollup found for dimensions {query_dimensions}. "
+            # Include filter dimensions (from table columns) in the error message
+            filter_dimensions = list(filters.dimension_filters.keys()) if filters and filters.dimension_filters else []
+            all_required_dims = list(set(query_dimensions + filter_dimensions))
+            error_msg = (
+                f"No suitable rollup found for dimensions {all_required_dims}. "
                 f"Reason: {route_decision.reason}. "
                 f"Create a rollup with these dimensions to enable this query."
+            )
+            return PivotResponse(
+                rows=[],
+                total=None,
+                available_dimensions=[],
+                total_count=0,
+                error=error_msg,
+                error_type="rollup_required"
             )
 
         # If a suitable rollup exists, use it

@@ -88,12 +88,14 @@ class PivotChildRow(BaseModel):
 class PivotResponse(BaseModel):
     """Pivot table response"""
     rows: List[PivotRow]
-    total: PivotRow
-    available_dimensions: List[str]
+    total: Optional[PivotRow] = None  # Optional when error occurs
+    available_dimensions: List[str] = []  # Default to empty when error occurs
     dimension_metadata: Optional[dict] = None  # Metadata about the dimension used (e.g., custom dimension name)
     total_count: Optional[int] = None  # Total number of dimension values (for pagination)
     baseline_totals: Optional[Dict[str, float]] = None  # Totals from simplest rollup (no dimensions) for comparison
     metric_warnings: Optional[Dict[str, bool]] = None  # Metrics that are potentially inflated (current > baseline)
+    error: Optional[str] = None  # Error message when query cannot be executed
+    error_type: Optional[str] = None  # Error type: "rollup_required", "query_error", etc.
 
 
 class BigQueryInfo(BaseModel):
