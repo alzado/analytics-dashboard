@@ -2850,11 +2850,11 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
             </button>
             <button
               onClick={() => setIsExportModalOpen(true)}
-              disabled={!pivotData?.rows?.length}
+              disabled={!processedRows?.length}
               className={`flex items-center gap-2 px-4 py-2 rounded-lg transition-colors ${
-                pivotData?.rows?.length
-                  ? 'bg-blue-600 text-white hover:bg-blue-700'
-                  : 'bg-gray-300 text-gray-500 cursor-not-allowed'
+                processedRows?.length
+                  ? 'bg-gray-100 text-gray-700 hover:bg-gray-200 border border-gray-300'
+                  : 'bg-gray-100 text-gray-400 cursor-not-allowed border border-gray-200'
               }`}
               title="Export data as CSV or HTML"
             >
