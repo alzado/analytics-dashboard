@@ -424,14 +424,14 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
       // Then add from widget
       setTimeout(() => {
         // Load dimensions
-        editingWidget.dimensions.forEach(dim => addDimension(dim))
-        editingWidget.table_dimensions.forEach(dim => addTableDimension(dim))
+        ;(editingWidget.dimensions || []).forEach(dim => addDimension(dim))
+        ;(editingWidget.table_dimensions || []).forEach(dim => addTableDimension(dim))
 
         // Load metrics
-        editingWidget.metrics.forEach(metric => addMetric(metric))
+        ;(editingWidget.metrics || []).forEach(metric => addMetric(metric))
 
         // Load filters
-        Object.entries(editingWidget.filters).forEach(([dimensionId, values]) => {
+        Object.entries(editingWidget.filters || {}).forEach(([dimensionId, values]) => {
           // Ensure values is an array
           const valuesArray = Array.isArray(values) ? values : [values]
           updateDimensionFilter(dimensionId, valuesArray as string[])
@@ -593,13 +593,16 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
 
   // Fetch all dimension values in a single query
   // Uses fetchedConfig values for stable query keys (only refetches when user clicks "Fetch Data")
+  // Pass all pivot dimensions (row + table) for proper rollup routing
+  const allPivotDimensions = [...fetchedDimensions, ...fetchedTableDimensions]
   const { data: allDimensionValues } = useQuery({
-    queryKey: ['all-dimension-values', fetchedTableDimensions, fetchedFilters, fetchedTable],
+    queryKey: ['all-dimension-values', fetchedTableDimensions, fetchedFilters, fetchedTable, fetchedDimensions],
     queryFn: async () => {
       if (!fetchedFilters) return {}
       const results: Record<string, string[]> = {}
       for (const dimension of fetchedTableDimensions) {
-        results[dimension] = await fetchDimensionValues(dimension, fetchedFilters, fetchedTable || undefined)
+        // Pass all pivot dimensions for rollup routing
+        results[dimension] = await fetchDimensionValues(dimension, fetchedFilters, fetchedTable || undefined, allPivotDimensions)
       }
       return results
     },

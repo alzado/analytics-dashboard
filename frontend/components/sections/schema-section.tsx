@@ -113,6 +113,7 @@ export function SchemaSection({ tableId }: SchemaSectionProps) {
     isLoadingDimensions,
     detectSchema,
     resetSchema,
+    clearSchema,
     createCalculatedMetric,
     updateCalculatedMetric,
     deleteCalculatedMetric,
@@ -177,6 +178,18 @@ export function SchemaSection({ tableId }: SchemaSectionProps) {
     try {
       await resetSchema()
       setDetectionResult('Schema reset to defaults successfully!')
+    } catch (error) {
+      setDetectionResult(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`)
+    }
+  }
+
+  const handleClearSchema = async () => {
+    if (!confirm('Are you sure you want to clear ALL metrics and dimensions? This cannot be undone.')) {
+      return
+    }
+    try {
+      const result = await clearSchema()
+      setDetectionResult(result.message || 'Schema cleared successfully!')
     } catch (error) {
       setDetectionResult(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`)
     }
@@ -373,6 +386,12 @@ export function SchemaSection({ tableId }: SchemaSectionProps) {
               className="px-4 py-2 bg-gray-600 text-white rounded-md hover:bg-gray-700"
             >
               Reset to Defaults
+            </button>
+            <button
+              onClick={handleClearSchema}
+              className="px-4 py-2 bg-red-600 text-white rounded-md hover:bg-red-700"
+            >
+              Clear All
             </button>
           </div>
         </div>
@@ -666,7 +685,7 @@ function CalculatedMetricsTab({ metrics, isLoading, onEdit, onDelete, onCreate }
                 </td>
                 <td className="px-4 py-3 text-sm">
                   <div className="flex flex-wrap gap-1">
-                    {metric.depends_on.map((dep) => (
+                    {metric.depends_on?.map((dep) => (
                       <span key={dep} className="px-2 py-0.5 bg-purple-100 text-purple-800 rounded text-xs">
                         {dep}
                       </span>
@@ -1052,8 +1071,8 @@ function CreateCalculatedMetricModal({ onSave, onClose, calculatedMetrics, dimen
         availableCalculatedMetrics={
           // Filter out the current metric being edited to prevent circular dependencies
           editingMetricId
-            ? calculatedMetrics.filter(m => m.id !== editingMetricId)
-            : calculatedMetrics
+            ? (calculatedMetrics || []).filter(m => m.id !== editingMetricId)
+            : (calculatedMetrics || [])
         }
         availableDimensions={dimensions || []}
         onApply={handleFormulaApply}

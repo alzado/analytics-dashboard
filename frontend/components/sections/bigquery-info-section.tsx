@@ -132,8 +132,7 @@ export function BigQueryInfoSection({ tableId }: BigQueryInfoSectionProps) {
         name: tableName,
         project_id: formData.project_id,
         dataset: formData.dataset,
-        table: formData.table,
-        credentials_json: formData.use_adc ? '' : formData.credentials_json,
+        table_name: formData.table,
         billing_project: formData.billing_project || undefined,
         allowed_min_date: null,
         allowed_max_date: null
@@ -330,45 +329,6 @@ export function BigQueryInfoSection({ tableId }: BigQueryInfoSectionProps) {
               </p>
             </div>
 
-            {/* Authentication Method */}
-            <div className="border-t pt-4 mt-4">
-              <label className="flex items-center gap-2 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={formData.use_adc}
-                  onChange={(e) => setFormData(prev => ({ ...prev, use_adc: e.target.checked }))}
-                  className="w-4 h-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500"
-                />
-                <span className="text-sm font-medium text-gray-700">
-                  Use my Google Cloud credentials (gcloud auth)
-                </span>
-              </label>
-              <p className="text-xs text-gray-500 mt-1 ml-6">
-                Requires running: <code className="bg-gray-100 px-1 rounded">gcloud auth application-default login</code>
-              </p>
-            </div>
-
-            {/* Credentials JSON - only shown if not using ADC */}
-            {!formData.use_adc && (
-              <div>
-                <label htmlFor="credentials_json" className="block text-sm font-medium text-gray-700 mb-1">
-                  Service Account JSON
-                </label>
-                <textarea
-                  id="credentials_json"
-                  required={!formData.use_adc}
-                  value={formData.credentials_json}
-                  onChange={(e) => handleInputChange('credentials_json', e.target.value)}
-                  rows={10}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 font-mono text-sm"
-                  placeholder='{"type": "service_account", "project_id": "...", ...}'
-                />
-                <p className="text-xs text-gray-500 mt-1">
-                  Paste the entire contents of your service account JSON file here
-                </p>
-              </div>
-            )}
-
             <button
               type="submit"
               disabled={configureMutation.isPending || createTableMutation.isPending}
@@ -479,36 +439,47 @@ export function BigQueryInfoSection({ tableId }: BigQueryInfoSectionProps) {
       </div>
 
 
-      {/* Table Metadata */}
+      {/* Table Metadata & Schema Columns */}
       <div className="bg-white rounded-lg border border-gray-200 p-6">
         <div className="flex items-center gap-2 mb-4">
           <HardDrive className="text-blue-600" size={24} />
           <h2 className="text-lg font-semibold">Table Metadata</h2>
         </div>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
-          <div>
-            <p className="text-sm text-gray-600">Table Size</p>
-            <p className="text-lg font-medium">{info.table_size_mb.toLocaleString()} MB</p>
-          </div>
-          <div>
-            <p className="text-sm text-gray-600">Last Modified</p>
-            <p className="text-lg font-medium">{new Date(info.last_modified).toLocaleString()}</p>
-          </div>
+          {info.table_size_mb !== undefined && info.table_size_mb > 0 && (
+            <div>
+              <p className="text-sm text-gray-600">Table Size</p>
+              <p className="text-lg font-medium">{info.table_size_mb.toLocaleString()} MB</p>
+            </div>
+          )}
+          {info.last_modified && (
+            <div>
+              <p className="text-sm text-gray-600">Last Modified</p>
+              <p className="text-lg font-medium">{new Date(info.last_modified).toLocaleString()}</p>
+            </div>
+          )}
         </div>
 
         {/* Schema Columns */}
-        <div>
-          <p className="text-sm text-gray-600 mb-2">Schema Columns ({info.schema_columns.length})</p>
-          <div className="bg-gray-50 rounded-lg p-4 max-h-64 overflow-y-auto">
-            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-2">
-              {info.schema_columns.map((column) => (
-                <span key={column} className="font-mono text-xs text-gray-700 px-2 py-1 bg-white rounded border border-gray-200">
-                  {column}
-                </span>
-              ))}
+        {info.schema_columns && info.schema_columns.length > 0 ? (
+          <div>
+            <p className="text-sm text-gray-600 mb-2">Schema Columns ({info.schema_columns.length})</p>
+            <div className="bg-gray-50 rounded-lg p-4 max-h-64 overflow-y-auto">
+              <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-2">
+                {info.schema_columns.map((column) => (
+                  <span key={column} className="font-mono text-xs text-gray-700 px-2 py-1 bg-white rounded border border-gray-200">
+                    {column}
+                  </span>
+                ))}
+              </div>
             </div>
           </div>
-        </div>
+        ) : (
+          <div>
+            <p className="text-sm text-gray-600 mb-2">Schema Columns</p>
+            <p className="text-sm text-gray-500 italic">Loading schema columns...</p>
+          </div>
+        )}
       </div>
     </div>
   )

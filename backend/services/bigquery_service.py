@@ -62,7 +62,16 @@ class BigQueryService:
             credentials = service_account.Credentials.from_service_account_file(credentials_path)
             self.client = bigquery.Client(credentials=credentials, project=self.billing_project)
         else:
-            self.client = bigquery.Client(project=self.billing_project)
+            # For ADC (Application Default Credentials), we need to set the quota project
+            # to avoid the "quota exceeded" warning when using end-user credentials
+            import google.auth
+            credentials, default_project = google.auth.default()
+
+            # Set quota project on credentials to enable billing to the right project
+            if self.billing_project and hasattr(credentials, 'with_quota_project'):
+                credentials = credentials.with_quota_project(self.billing_project)
+
+            self.client = bigquery.Client(credentials=credentials, project=self.billing_project)
 
         # Initialize schema service and load schema
         self.schema_service = None

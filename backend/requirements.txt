@@ -8,3 +8,21 @@ pydantic>=2.0.0
 google-cloud-bigquery>=3.11.0
 db-dtypes>=1.1.1
 requests>=2.31.0
+
+# Database
+sqlalchemy[asyncio]>=2.0.0
+asyncpg>=0.29.0
+alembic>=1.13.0
+
+# Authentication
+python-jose[cryptography]>=3.3.0
+google-auth>=2.25.0
+google-auth-oauthlib>=1.2.0
+httpx>=0.26.0
+
+# Security
+cryptography>=41.0.0
+passlib>=1.7.4
+
+# CLI
+click>=8.1.0

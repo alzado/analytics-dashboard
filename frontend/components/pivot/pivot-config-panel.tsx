@@ -105,10 +105,15 @@ function DimensionFilterInline({
   const [isLoadingValues, setIsLoadingValues] = useState(false)
 
   // Load available values when dropdown opens
+  // Don't pass date filters - show ALL possible values regardless of current date range
   useEffect(() => {
     if (isOpen && availableValues.length === 0) {
       setIsLoadingValues(true)
-      fetchDimensionValues(dimension.id, currentFilters || {}, tableId)
+      // Pass only dimension_filters (not date filters) to show all possible values
+      const filtersWithoutDates = {
+        dimension_filters: currentFilters?.dimension_filters || {}
+      }
+      fetchDimensionValues(dimension.id, filtersWithoutDates, tableId)
         .then(values => {
           setAvailableValues(values)
         })
@@ -119,7 +124,7 @@ function DimensionFilterInline({
           setIsLoadingValues(false)
         })
     }
-  }, [isOpen, dimension.id, availableValues.length, currentFilters])
+  }, [isOpen, dimension.id, availableValues.length, currentFilters?.dimension_filters, tableId])
 
   const toggleValue = (value: string) => {
     if (selectedValues.includes(value)) {

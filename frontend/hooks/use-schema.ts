@@ -3,6 +3,7 @@ import {
   fetchSchema,
   detectSchema,
   resetSchema,
+  clearSchema,
   fetchCalculatedMetrics,
   fetchDimensions,
   createCalculatedMetric,
@@ -73,6 +74,17 @@ export function useSchema(tableId?: string) {
 
   const resetSchemaMutation = useMutation<SchemaConfig, Error>({
     mutationFn: () => resetSchema(tableId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['schema', tableId] })
+      queryClient.invalidateQueries({ queryKey: ['calculated-metrics', tableId] })
+      queryClient.invalidateQueries({ queryKey: ['dimensions', tableId] })
+      queryClient.invalidateQueries({ queryKey: ['filterable-dimensions', tableId] })
+      queryClient.invalidateQueries({ queryKey: ['groupable-dimensions', tableId] })
+    },
+  })
+
+  const clearSchemaMutation = useMutation<{ status: string; message: string }, Error>({
+    mutationFn: () => clearSchema(tableId),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['schema', tableId] })
       queryClient.invalidateQueries({ queryKey: ['calculated-metrics', tableId] })
@@ -187,6 +199,10 @@ export function useSchema(tableId?: string) {
     resetSchema: resetSchemaMutation.mutateAsync,
     isResettingSchema: resetSchemaMutation.isPending,
     resetSchemaError: resetSchemaMutation.error,
+
+    clearSchema: clearSchemaMutation.mutateAsync,
+    isClearingSchema: clearSchemaMutation.isPending,
+    clearSchemaError: clearSchemaMutation.error,
 
     // Calculated metric actions
     createCalculatedMetric: createCalculatedMetricMutation.mutateAsync,

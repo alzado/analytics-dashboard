@@ -102,7 +102,18 @@ from models.schemas import (
 )
 from services.statistical_service import StatisticalService
 
+# Try to import routes for user management (optional - fails gracefully if DB not configured)
+try:
+    from routes import register_routers
+    HAS_USER_MANAGEMENT = True
+except ImportError:
+    HAS_USER_MANAGEMENT = False
+
 app = FastAPI(title="Search Analytics API", version="1.0.0")
+
+# Register user management routes if available
+if HAS_USER_MANAGEMENT:
+    register_routers(app)
 
 # CORS middleware
 app.add_middleware(

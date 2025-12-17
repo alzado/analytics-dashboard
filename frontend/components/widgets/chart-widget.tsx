@@ -35,7 +35,7 @@ export function ChartWidget({ widget }: ChartWidgetProps) {
   const [selectedMetricForDisplay, setSelectedMetricForDisplay] = useState<string>(
     widget.visible_metrics && widget.visible_metrics.length > 0
       ? widget.visible_metrics[0]
-      : widget.metrics[0]
+      : (widget.metrics && widget.metrics.length > 0 ? widget.metrics[0] : '')
   )
 
   // Chart type selection state (user can override widget.chart_type)
@@ -45,10 +45,10 @@ export function ChartWidget({ widget }: ChartWidgetProps) {
   const [isConfigExpanded, setIsConfigExpanded] = useState<boolean>(true)
 
   // Check if widget has any dimensions (row or table dimensions)
-  const hasDimensions = widget.dimensions.length > 0 || widget.table_dimensions.length > 0
+  const hasDimensions = (widget.dimensions?.length || 0) > 0 || (widget.table_dimensions?.length || 0) > 0
 
   // Check if we're in multi-table mode
-  const isMultiTable = widget.table_dimensions.length > 0
+  const isMultiTable = (widget.table_dimensions?.length || 0) > 0
 
   // Visible metrics (for display) - only show the selected metric
   const visibleMetrics = [selectedMetricForDisplay]
@@ -90,7 +90,7 @@ export function ChartWidget({ widget }: ChartWidgetProps) {
       }
 
       // Multi-table mode: use two-step fetch
-      const dims = widget.dimensions.length > 0 ? [widget.dimensions[0]] : []
+      const dims = (widget.dimensions?.length || 0) > 0 ? [widget.dimensions[0]] : []
 
       // Helper to build filters for a combination
       const buildTableFilters = (combination: Record<string, string>) => {
@@ -176,12 +176,12 @@ export function ChartWidget({ widget }: ChartWidgetProps) {
 
       return { rows: combinedRows, total: allResults[0]?.total || {} }
     },
-    enabled: widget.metrics.length > 0 && hasDimensions && (!isMultiTable || tableCombinations.length > 0),
+    enabled: (widget.metrics?.length || 0) > 0 && hasDimensions && (!isMultiTable || tableCombinations.length > 0),
   })
 
   // Build tableCombinations for multi-table mode
   useEffect(() => {
-    if (!isMultiTable || widget.table_dimensions.length === 0) {
+    if (!isMultiTable || (widget.table_dimensions?.length || 0) === 0) {
       setTableCombinations([])
       setColumnOrder([])
       return
@@ -236,7 +236,7 @@ export function ChartWidget({ widget }: ChartWidgetProps) {
   // Helper: Match row to combination
   const matchRowToCombination = (row: any, combination: Record<string, string>): boolean => {
     const parts = row.dimension_value.split(' - ')
-    const tableParts = parts.slice(widget.dimensions.length)
+    const tableParts = parts.slice(widget.dimensions?.length || 0)
     const combinationValues = Object.values(combination)
 
     if (tableParts.length !== combinationValues.length) return false
@@ -258,7 +258,7 @@ export function ChartWidget({ widget }: ChartWidgetProps) {
       const dimensionValues = new Set<string>()
       data.rows.forEach(row => {
         const parts = row.dimension_value.split(' - ')
-        const baseDimValue = parts.slice(0, widget.dimensions.length).join(' - ')
+        const baseDimValue = parts.slice(0, widget.dimensions?.length || 0).join(' - ')
         dimensionValues.add(baseDimValue)
       })
 
@@ -276,12 +276,12 @@ export function ChartWidget({ widget }: ChartWidgetProps) {
           // Find the row that matches this dimension value + combination
           const matchingRow = data.rows.find(row => {
             const parts = row.dimension_value.split(' - ')
-            const rowBaseDim = parts.slice(0, widget.dimensions.length).join(' - ')
+            const rowBaseDim = parts.slice(0, widget.dimensions?.length || 0).join(' - ')
             return rowBaseDim === dimValue && matchRowToCombination(row, combination)
           })
 
           if (matchingRow) {
-            widget.metrics.forEach(metric => {
+            ;(widget.metrics || []).forEach(metric => {
               const seriesKey = `${combinationLabel}_${metric}`
               item[seriesKey] = matchingRow.metrics[metric] || 0
             })
@@ -346,7 +346,7 @@ export function ChartWidget({ widget }: ChartWidgetProps) {
         const item: any = {
           name: row.dimension_value,
         }
-        widget.metrics.forEach((metric) => {
+        ;(widget.metrics || []).forEach((metric) => {
           item[metric] = row.metrics[metric] || 0
         })
         return item
@@ -365,7 +365,7 @@ export function ChartWidget({ widget }: ChartWidgetProps) {
     }
 
     return []
-  }, [data, widget.metrics, widget.dimensions.length, sortConfig, isMultiTable, tableCombinations, columnOrder])
+  }, [data, widget.metrics, widget.dimensions?.length, sortConfig, isMultiTable, tableCombinations, columnOrder])
 
   // Extract ordered table dimension combination labels (for multi-table series)
   const orderedCombinationLabels = useMemo(() => {
@@ -377,7 +377,7 @@ export function ChartWidget({ widget }: ChartWidgetProps) {
     }).filter(label => label !== '')
   }, [isMultiTable, tableCombinations, columnOrder])
 
-  if (!widget.metrics.length || !hasDimensions) {
+  if (!(widget.metrics?.length) || !hasDimensions) {
     return (
       <div className="h-full flex items-center justify-center text-gray-400 text-sm">
         <div className="text-center">
@@ -587,11 +587,11 @@ export function ChartWidget({ widget }: ChartWidgetProps) {
               </div>
 
               {/* Metric selector - choose which metric to display */}
-              {widget.metrics.length > 1 && (
+              {(widget.metrics?.length || 0) > 1 && (
                 <div className="flex items-center gap-2">
                   <span className="text-xs text-gray-500 font-semibold">Display Metric:</span>
                   <div className="flex gap-1">
-                    {widget.metrics.map((metricId) => {
+                    {(widget.metrics || []).map((metricId) => {
                       const metricDef = getMetricById(metricId)
                       const isSelected = selectedMetricForDisplay === metricId
                       return (
@@ -648,7 +648,7 @@ export function ChartWidget({ widget }: ChartWidgetProps) {
                           <div className="text-xs font-semibold text-gray-700">{combinationLabel}</div>
                         </div>
                         <div className="flex gap-1">
-                          {widget.metrics.map((metricId) => {
+                          {(widget.metrics || []).map((metricId) => {
                             const metricDef = getMetricById(metricId)
                             const subColumns = colIdx === 0 ? ['value'] : ['value', 'diff', 'pctDiff']
                             return (
@@ -691,7 +691,7 @@ export function ChartWidget({ widget }: ChartWidgetProps) {
                 <ArrowUpDown size={14} className="text-gray-400" />
                 <span className="text-xs text-gray-500">Sort:</span>
                 <div className="flex flex-wrap gap-1">
-                  {widget.metrics.map((metricId) => {
+                  {(widget.metrics || []).map((metricId) => {
                     const metricDef = getMetricById(metricId)
                     const isActive = sortConfig && sortConfig.metric === metricId
                     return (

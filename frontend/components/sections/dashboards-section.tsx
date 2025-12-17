@@ -128,11 +128,12 @@ function DashboardCard({
   onOpen,
   onDelete,
 }: {
-  dashboard: Dashboard
+  dashboard: Dashboard & { widget_count?: number }
   onOpen: () => void
   onDelete: () => void
 }) {
-  const widgetCount = dashboard.widgets.length
+  // Support both widgets array (detail view) and widget_count (list view)
+  const widgetCount = dashboard.widgets?.length ?? (dashboard as any).widget_count ?? 0
   const lastUpdated = new Date(dashboard.updated_at).toLocaleDateString()
 
   return (

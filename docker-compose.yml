@@ -1,4 +1,20 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: analytics
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-devpassword123}
+      POSTGRES_DB: search_analytics
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U analytics"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
   frontend:
     build:
       context: ./frontend
@@ -8,38 +24,47 @@ services:
     environment:
       - NODE_ENV=development
       - NEXT_PUBLIC_API_URL=http://localhost:8000
+      - NEXT_PUBLIC_GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
     volumes:
       - ./frontend:/app
       - /app/node_modules
       - /app/.next
     depends_on:
-      - backend
+      - backend_django
     command: npm run dev
 
-  backend:
+  backend_django:
     build:
-      context: ./backend
+      context: ./backend_django
       dockerfile: Dockerfile
     ports:
       - "8000:8000"
     environment:
       - PYTHONUNBUFFERED=1
-      # BigQuery configuration (REQUIRED - update these values)
-      - BIGQUERY_PROJECT_ID=${BIGQUERY_PROJECT_ID}
-      - BIGQUERY_DATASET=${BIGQUERY_DATASET}
-      - BIGQUERY_TABLE=${BIGQUERY_TABLE}
-      - BIGQUERY_CREDENTIALS_PATH=${BIGQUERY_CREDENTIALS_PATH:-}
-      # Mount gcloud credentials for ADC
+      - DJANGO_SETTINGS_MODULE=search_analytics.settings.development
+      # Database configuration
+      - POSTGRES_DB=search_analytics
+      - POSTGRES_USER=analytics
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-devpassword123}
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      # Auth configuration
+      - DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY:-django-insecure-dev-secret-key}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-dev-jwt-secret-key-change-in-production}
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY:-}
+      # Google Cloud credentials (ADC)
       - GOOGLE_APPLICATION_CREDENTIALS=/root/.config/gcloud/application_default_credentials.json
     volumes:
-      - ./backend:/app
-      - bigquery_config:/app/config  # Persist BigQuery configuration
-      # Mount gcloud credentials from host machine for ADC
-      - ${HOME}/.config/gcloud:/root/.config/gcloud:ro
-      # Mount BigQuery credentials if using service account JSON
-      # Uncomment and update path as needed:
-      # - ./path/to/service-account.json:/app/credentials/service-account.json:ro
-    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+      - ./backend_django:/app
+      - ~/.config/gcloud:/root/.config/gcloud:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: >
+      sh -c "python manage.py migrate --noinput &&
+             gunicorn --bind 0.0.0.0:8000 --workers 2 --timeout 600 --reload search_analytics.wsgi:application"
 
 volumes:
-  bigquery_config:
+  postgres_data:

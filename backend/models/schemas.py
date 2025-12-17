@@ -1014,3 +1014,284 @@ class OptimizedSourcePreviewSql(BaseModel):
     target_table_path: str = Field(..., description="Target table path")
     composite_keys: List[str] = Field(default_factory=list, description="Key columns that would be created")
     clustering_columns: List[str] = Field(default_factory=list, description="Clustering columns")
+
+
+# ============================================================================
+# Authentication & User Management Models
+# ============================================================================
+
+class OrgRole(str, Enum):
+    """Organization membership roles."""
+    OWNER = "owner"
+    ADMIN = "admin"
+    MEMBER = "member"
+
+
+class DashboardRole(str, Enum):
+    """Dashboard collaboration roles."""
+    OWNER = "owner"
+    EDITOR = "editor"
+    VIEWER = "viewer"
+
+
+class Visibility(str, Enum):
+    """Resource visibility options."""
+    PRIVATE = "private"
+    ORGANIZATION = "organization"
+    PUBLIC = "public"
+
+
+class CredentialType(str, Enum):
+    """GCP credential types."""
+    SERVICE_ACCOUNT = "service_account"
+    OAUTH = "oauth"
+
+
+class LibraryItemType(str, Enum):
+    """Library item types."""
+    DASHBOARD = "dashboard"
+    SCHEMA = "schema"
+
+
+# --- Auth Request/Response Models ---
+
+class GoogleAuthRequest(BaseModel):
+    """Request to authenticate with Google ID token."""
+    id_token: str = Field(..., description="Google ID token from frontend")
+
+
+class AuthTokenResponse(BaseModel):
+    """Response with authentication tokens."""
+    access_token: str = Field(..., description="JWT access token")
+    refresh_token: str = Field(..., description="JWT refresh token")
+    token_type: str = Field(default="bearer")
+    expires_in: int = Field(default=86400, description="Token expiry in seconds")
+
+
+class RefreshTokenRequest(BaseModel):
+    """Request to refresh access token."""
+    refresh_token: str = Field(..., description="JWT refresh token")
+
+
+# --- User Models ---
+
+class UserResponse(BaseModel):
+    """User information response."""
+    id: str = Field(..., description="User UUID")
+    email: str
+    name: str
+    avatar_url: Optional[str] = None
+    is_active: bool = True
+    created_at: str
+    last_login_at: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class UserProfileUpdate(BaseModel):
+    """Request to update user profile."""
+    name: Optional[str] = Field(None, min_length=1, max_length=255)
+    avatar_url: Optional[str] = Field(None, max_length=500)
+
+
+# --- Organization Models ---
+
+class OrganizationCreate(BaseModel):
+    """Request to create an organization."""
+    name: str = Field(..., min_length=1, max_length=255)
+    slug: str = Field(..., min_length=1, max_length=100, pattern=r"^[a-z0-9-]+$")
+    description: Optional[str] = None
+
+
+class OrganizationUpdate(BaseModel):
+    """Request to update an organization."""
+    name: Optional[str] = Field(None, min_length=1, max_length=255)
+    description: Optional[str] = None
+    avatar_url: Optional[str] = Field(None, max_length=500)
+
+
+class OrganizationResponse(BaseModel):
+    """Organization information response."""
+    id: str
+    name: str
+    slug: str
+    description: Optional[str] = None
+    avatar_url: Optional[str] = None
+    created_at: str
+    member_count: int = 0
+    user_role: Optional[str] = None  # Role of the requesting user
+
+    class Config:
+        from_attributes = True
+
+
+class OrganizationListResponse(BaseModel):
+    """List of organizations response."""
+    organizations: List[OrganizationResponse]
+    total: int
+
+
+# --- Organization Membership Models ---
+
+class MembershipResponse(BaseModel):
+    """Organization membership information."""
+    user_id: str
+    organization_id: str
+    role: OrgRole
+    joined_at: str
+    user: Optional[UserResponse] = None
+
+    class Config:
+        from_attributes = True
+
+
+class InviteMemberRequest(BaseModel):
+    """Request to invite a user to an organization."""
+    email: str = Field(..., description="Email of user to invite")
+    role: OrgRole = Field(default=OrgRole.MEMBER)
+
+
+class UpdateMemberRoleRequest(BaseModel):
+    """Request to update a member's role."""
+    role: OrgRole
+
+
+# --- GCP Credential Models ---
+
+class GCPCredentialCreate(BaseModel):
+    """Request to create GCP credentials."""
+    name: str = Field(..., min_length=1, max_length=255)
+    credential_type: CredentialType
+    credentials_json: str = Field(..., description="Service account JSON or OAuth tokens")
+    organization_id: Optional[str] = Field(None, description="Organization to associate with (optional)")
+    is_default: bool = Field(default=False)
+
+
+class GCPCredentialResponse(BaseModel):
+    """GCP credential information (credentials excluded)."""
+    id: str
+    name: str
+    credential_type: CredentialType
+    project_id: str
+    is_default: bool
+    user_id: Optional[str] = None
+    organization_id: Optional[str] = None
+    created_at: str
+
+    class Config:
+        from_attributes = True
+
+
+class GCPCredentialListResponse(BaseModel):
+    """List of GCP credentials."""
+    credentials: List[GCPCredentialResponse]
+    total: int
+
+
+# --- Dashboard Collaboration Models ---
+
+class DashboardCollaboratorResponse(BaseModel):
+    """Dashboard collaborator information."""
+    user_id: str
+    dashboard_id: str
+    role: DashboardRole
+    granted_at: str
+    granted_by_id: Optional[str] = None
+    user: Optional[UserResponse] = None
+
+    class Config:
+        from_attributes = True
+
+
+class AddCollaboratorRequest(BaseModel):
+    """Request to add a dashboard collaborator."""
+    email: str = Field(..., description="Email of user to add")
+    role: DashboardRole = Field(default=DashboardRole.VIEWER)
+
+
+class UpdateCollaboratorRoleRequest(BaseModel):
+    """Request to update a collaborator's role."""
+    role: DashboardRole
+
+
+class UpdateVisibilityRequest(BaseModel):
+    """Request to update resource visibility."""
+    visibility: Visibility
+
+
+# --- Library Models ---
+
+class LibraryItemResponse(BaseModel):
+    """Library item information."""
+    id: str
+    item_type: str  # Using string for flexibility in API
+    source_id: Optional[str] = None
+    publisher_id: str
+    organization_id: Optional[str] = None
+    name: str
+    description: Optional[str] = None
+    tags: List[str] = []
+    visibility: str  # Using string for flexibility in API
+    use_count: int = 0
+    rating_count: int = 0
+    average_rating: Optional[float] = None
+    user_rating: Optional[int] = None  # Current user's rating
+    published_at: str
+    updated_at: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class LibraryItemListResponse(BaseModel):
+    """List of library items with pagination."""
+    items: List[LibraryItemResponse]
+    total: int
+    limit: int
+    offset: int
+
+
+class PublishToLibraryRequest(BaseModel):
+    """Request to publish an item to the library."""
+    source_id: str = Field(..., description="ID of dashboard/schema to publish")
+    name: str = Field(..., min_length=1, max_length=255)
+    description: Optional[str] = None
+    tags: Optional[List[str]] = None
+    visibility: Optional[str] = None  # Using string for flexibility
+    organization_id: Optional[str] = None  # For schema publishing
+
+
+class RateLibraryItemRequest(BaseModel):
+    """Request to rate a library item."""
+    rating: int = Field(..., ge=1, le=5, description="Rating from 1-5")
+
+
+class UseLibraryItemRequest(BaseModel):
+    """Request to use/copy a library item."""
+    target_name: Optional[str] = Field(None, description="Name for the copy (optional)")
+    organization_id: Optional[str] = Field(None, description="Organization to copy to (optional)")
+
+
+# --- Audit Log Models ---
+
+class AuditLogResponse(BaseModel):
+    """Audit log entry."""
+    id: str
+    user_id: Optional[str] = None
+    user_email: Optional[str] = None
+    action: str
+    resource_type: str
+    resource_id: Optional[str] = None
+    details: Optional[Dict[str, Any]] = None
+    ip_address: Optional[str] = None
+    created_at: str
+
+    class Config:
+        from_attributes = True
+
+
+class AuditLogListResponse(BaseModel):
+    """List of audit logs."""
+    logs: List[AuditLogResponse]
+    total: int

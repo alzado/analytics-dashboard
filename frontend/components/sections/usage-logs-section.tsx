@@ -184,10 +184,10 @@ export function UsageLogsSection() {
         <div className="bg-white rounded-lg shadow p-6">
           <div className="text-sm text-gray-600">Data Scanned</div>
           <div className="text-3xl font-bold text-gray-900 mt-2">
-            {stats?.total_gb_billed.toFixed(2) || 0} GB
+            {(stats?.total_gb_billed ?? 0).toFixed(2)} GB
           </div>
           <div className="text-xs text-gray-500 mt-1">
-            Processed: {stats?.total_gb_processed.toFixed(2) || 0} GB
+            Processed: {(stats?.total_gb_processed ?? 0).toFixed(2)} GB
           </div>
         </div>
 
@@ -195,7 +195,7 @@ export function UsageLogsSection() {
         <div className="bg-white rounded-lg shadow p-6">
           <div className="text-sm text-gray-600">Estimated Cost</div>
           <div className="text-3xl font-bold text-green-600 mt-2">
-            ${stats?.estimated_cost_usd.toFixed(4) || '0.0000'}
+            ${(stats?.estimated_cost_usd ?? 0).toFixed(4)}
           </div>
           <div className="text-xs text-gray-500 mt-1">
             $5 per TB billed
@@ -206,7 +206,7 @@ export function UsageLogsSection() {
         <div className="bg-white rounded-lg shadow p-6">
           <div className="text-sm text-gray-600">Avg Query Time</div>
           <div className="text-3xl font-bold text-gray-900 mt-2">
-            {stats?.avg_execution_time_ms.toFixed(0) || 0}ms
+            {(stats?.avg_execution_time_ms ?? 0).toFixed(0)}ms
           </div>
           <div className="text-xs text-gray-500 mt-1">
             Max: {stats?.max_execution_time_ms || 0}ms

@@ -1,0 +1,28 @@
+# Django
+django>=5.0,<6.0
+djangorestframework>=3.14,<4.0
+django-cors-headers>=4.3,<5.0
+django-filter>=24.0,<25.0
+
+# Database
+psycopg2-binary>=2.9,<3.0
+
+# BigQuery
+google-cloud-bigquery>=3.0,<4.0
+pandas>=2.0,<3.0
+db-dtypes>=1.0,<2.0
+
+# Authentication
+PyJWT>=2.8,<3.0
+google-auth>=2.0,<3.0
+
+# Encryption
+cryptography>=42.0,<43.0
+
+# Utils
+python-dotenv>=1.0,<2.0
+numpy>=1.26,<2.0
+scipy>=1.11,<2.0
+
+# Server
+gunicorn>=21.0,<22.0
