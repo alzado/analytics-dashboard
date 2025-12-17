@@ -6,6 +6,7 @@ from django.urls import path
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
+from apps.core.permissions import IsAuthenticatedOrAuthDisabled
 from rest_framework import status
 
 from .models import CustomDimension
@@ -14,7 +15,7 @@ from .serializers import CustomDimensionSerializer, CustomDimensionCreateSeriali
 
 class RootCustomDimensionListView(APIView):
     """List all custom dimensions for the current user's tables."""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedOrAuthDisabled]
 
     def get(self, request):
         """List all custom dimensions the user has access to."""
@@ -44,7 +45,7 @@ class RootCustomDimensionListView(APIView):
 
 class RootCustomDimensionDetailView(APIView):
     """Get/update/delete a custom dimension by ID."""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedOrAuthDisabled]
 
     def get_object(self, request, dimension_id):
         """Get custom dimension with permission check."""
@@ -104,7 +105,7 @@ class RootCustomDimensionDetailView(APIView):
 
 class RootCustomDimensionDuplicateView(APIView):
     """Duplicate a custom dimension."""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedOrAuthDisabled]
 
     def post(self, request, dimension_id):
         """Duplicate a custom dimension."""

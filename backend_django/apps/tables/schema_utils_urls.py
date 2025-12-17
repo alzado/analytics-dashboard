@@ -6,6 +6,7 @@ from django.urls import path
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
+from apps.core.permissions import IsAuthenticatedOrAuthDisabled
 from rest_framework import status
 
 from .models import BigQueryTable
@@ -14,7 +15,7 @@ from apps.schemas.models import SchemaConfig, CalculatedMetric, Dimension
 
 class SchemaCopyView(APIView):
     """Copy schema from one table to another."""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedOrAuthDisabled]
 
     def post(self, request):
         """Copy schema configuration between tables."""
@@ -123,7 +124,7 @@ class SchemaCopyView(APIView):
 
 class SchemaTemplateView(APIView):
     """Apply a predefined schema template to a table."""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedOrAuthDisabled]
 
     # Predefined templates
     TEMPLATES = {

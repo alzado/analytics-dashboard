@@ -4,7 +4,8 @@ User authentication views.
 from rest_framework import status
 from rest_framework.views import APIView
 from rest_framework.response import Response
-from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.permissions import AllowAny
+from apps.core.permissions import IsAuthenticatedOrAuthDisabled
 
 from .serializers import (
     GoogleAuthSerializer,
@@ -74,7 +75,7 @@ class RefreshTokenView(APIView):
 
 class CurrentUserView(APIView):
     """Current user profile endpoint."""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedOrAuthDisabled]
 
     def get(self, request):
         """
@@ -109,7 +110,7 @@ class CurrentUserView(APIView):
 
 class GCPAuthUrlView(APIView):
     """Get GCP OAuth authorization URL."""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedOrAuthDisabled]
 
     def get(self, request):
         """
@@ -132,7 +133,7 @@ class GCPAuthUrlView(APIView):
 
 class GCPAuthCallbackView(APIView):
     """Handle GCP OAuth callback."""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedOrAuthDisabled]
 
     def post(self, request):
         """
@@ -167,7 +168,7 @@ class GCPAuthCallbackView(APIView):
 
 class GCPAuthStatusView(APIView):
     """Get GCP OAuth status for current user."""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedOrAuthDisabled]
 
     def get(self, request):
         """
@@ -188,7 +189,7 @@ class GCPAuthStatusView(APIView):
 
 class GCPAuthRevokeView(APIView):
     """Revoke GCP OAuth access."""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedOrAuthDisabled]
 
     def post(self, request):
         """
@@ -208,7 +209,7 @@ class GCPAuthRevokeView(APIView):
 
 class GCPProjectsView(APIView):
     """List GCP projects accessible to user."""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedOrAuthDisabled]
 
     def get(self, request):
         """

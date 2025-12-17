@@ -6,6 +6,7 @@ from rest_framework import status
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
+from apps.core.permissions import IsAuthenticatedOrAuthDisabled
 
 from apps.tables.models import BigQueryTable, Visibility
 from apps.tables.serializers import BigQueryTableSerializer
@@ -13,7 +14,7 @@ from apps.tables.serializers import BigQueryTableSerializer
 
 class LibraryListView(APIView):
     """List public and shared tables available in the library."""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedOrAuthDisabled]
 
     def get(self, request):
         """
@@ -62,7 +63,7 @@ class LibraryListView(APIView):
 
 class LibrarySearchView(APIView):
     """Search tables in the library."""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedOrAuthDisabled]
 
     def get(self, request):
         """
@@ -117,7 +118,7 @@ class LibrarySearchView(APIView):
 
 class LibraryStatsView(APIView):
     """Get library statistics."""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedOrAuthDisabled]
 
     def get(self, request):
         """Get statistics about the table library."""

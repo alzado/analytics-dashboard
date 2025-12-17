@@ -6,6 +6,7 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
+from apps.core.permissions import IsAuthenticatedOrAuthDisabled
 
 from .models import Dashboard, Widget
 from .serializers import (
@@ -69,7 +70,7 @@ class DashboardViewSet(viewsets.ModelViewSet):
 
 class WidgetViewSet(viewsets.ModelViewSet):
     """ViewSet for widgets within a dashboard."""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedOrAuthDisabled]
     lookup_field = 'id'
 
     def get_queryset(self):
@@ -99,7 +100,7 @@ class WidgetViewSet(viewsets.ModelViewSet):
 
 class DashboardWidgetViewSet(viewsets.ViewSet):
     """Nested ViewSet for managing widgets within a specific dashboard."""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedOrAuthDisabled]
 
     def get_dashboard(self, dashboard_id):
         """Get dashboard with permission check."""
@@ -179,7 +180,7 @@ class DashboardWidgetViewSet(viewsets.ViewSet):
 
 class StandaloneWidgetViewSet(viewsets.ViewSet):
     """ViewSet for standalone widgets (not attached to a dashboard)."""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedOrAuthDisabled]
 
     def list(self, request):
         """List standalone widgets owned by the user."""

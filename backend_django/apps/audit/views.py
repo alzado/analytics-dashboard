@@ -9,6 +9,7 @@ from rest_framework import status
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
+from apps.core.permissions import IsAuthenticatedOrAuthDisabled
 
 from .models import QueryLog, CacheEntry
 from .serializers import (
@@ -24,7 +25,7 @@ from .serializers import (
 
 class QueryLogListView(APIView):
     """Get query logs with filtering and pagination."""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedOrAuthDisabled]
 
     def get(self, request):
         """
@@ -70,7 +71,7 @@ class QueryLogListView(APIView):
 
 class QueryLogClearView(APIView):
     """Clear query logs."""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedOrAuthDisabled]
 
     def post(self, request):
         """Clear all query logs."""
@@ -87,7 +88,7 @@ class QueryLogClearView(APIView):
 
 class UsageStatsView(APIView):
     """Get aggregated usage statistics."""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedOrAuthDisabled]
 
     def get(self, request):
         """
@@ -152,7 +153,7 @@ class UsageStatsView(APIView):
 
 class TodayUsageStatsView(APIView):
     """Get usage statistics for today."""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedOrAuthDisabled]
 
     def get(self, request):
         """Get today's usage stats."""
@@ -202,7 +203,7 @@ class TodayUsageStatsView(APIView):
 
 class UsageTimeSeriesView(APIView):
     """Get usage statistics over time."""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedOrAuthDisabled]
 
     def get(self, request):
         """
@@ -263,7 +264,7 @@ class UsageTimeSeriesView(APIView):
 
 class CacheStatsView(APIView):
     """Get cache statistics."""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedOrAuthDisabled]
 
     def get(self, request):
         """Get cache stats."""
@@ -294,7 +295,7 @@ class CacheStatsView(APIView):
 
 class CacheClearView(APIView):
     """Clear cache entries."""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedOrAuthDisabled]
 
     def post(self, request):
         """Clear all cache entries."""
@@ -311,7 +312,7 @@ class CacheClearView(APIView):
 
 class CacheClearByTableView(APIView):
     """Clear cache for a specific table."""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedOrAuthDisabled]
 
     def post(self, request, table_id):
         """Clear cache entries for a specific table."""
@@ -328,7 +329,7 @@ class CacheClearByTableView(APIView):
 
 class CacheClearByTypeView(APIView):
     """Clear cache by query type."""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedOrAuthDisabled]
 
     def post(self, request, query_type):
         """Clear cache entries for a specific query type."""

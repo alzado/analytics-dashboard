@@ -22,6 +22,9 @@ GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID', '')
 GOOGLE_CLIENT_SECRET = os.environ.get('GOOGLE_CLIENT_SECRET', '')
 GOOGLE_REDIRECT_URI = os.environ.get('GOOGLE_REDIRECT_URI', 'http://localhost:3000/auth/callback')
 
+# Authentication control - set to 'true' to disable auth (for development/testing)
+AUTH_DISABLED = os.environ.get('AUTH_DISABLED', 'false').lower() == 'true'
+
 # BigQuery OAuth scopes (requested when user authorizes BigQuery access)
 GCP_BIGQUERY_SCOPES = [
     'https://www.googleapis.com/auth/bigquery',
@@ -127,7 +130,7 @@ REST_FRAMEWORK = {
         'apps.users.authentication.JWTAuthentication',
     ],
     'DEFAULT_PERMISSION_CLASSES': [
-        'rest_framework.permissions.IsAuthenticated',
+        'apps.core.permissions.IsAuthenticatedOrAuthDisabled',
     ],
     'DEFAULT_PAGINATION_CLASS': 'apps.core.pagination.StandardPagination',
     'PAGE_SIZE': 50,

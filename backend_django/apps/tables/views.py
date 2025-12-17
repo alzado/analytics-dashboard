@@ -5,6 +5,7 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
+from apps.core.permissions import IsAuthenticatedOrAuthDisabled
 from django.db.models import Q
 from django.utils import timezone
 
@@ -21,12 +22,23 @@ from apps.credentials.models import GCPCredential
 
 class BigQueryTableViewSet(viewsets.ModelViewSet):
     """ViewSet for BigQuery tables."""
-    permission_classes = [IsAuthenticated, IsTableOwnerOrOrganizationMember]
+    permission_classes = [IsAuthenticatedOrAuthDisabled, IsTableOwnerOrOrganizationMember]
     lookup_field = 'id'
 
     def get_queryset(self):
         """Return tables the user has access to."""
+        from django.conf import settings
+
+        # When auth is disabled, return all tables
+        if getattr(settings, 'AUTH_DISABLED', False):
+            return BigQueryTable.objects.all().select_related('owner', 'organization')
+
         user = self.request.user
+        if not user.is_authenticated:
+            return BigQueryTable.objects.filter(
+                visibility=Visibility.PUBLIC
+            ).select_related('owner', 'organization')
+
         org_ids = user.memberships.values_list('organization_id', flat=True)
 
         return BigQueryTable.objects.filter(

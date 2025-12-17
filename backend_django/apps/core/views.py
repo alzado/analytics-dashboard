@@ -2,8 +2,9 @@
 Core views - health checks and application settings.
 """
 from rest_framework.decorators import api_view, permission_classes
-from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
+from apps.core.permissions import IsAuthenticatedOrAuthDisabled
 from rest_framework.views import APIView
 from rest_framework import status
 from django.conf import settings as django_settings
@@ -33,7 +34,7 @@ def health_check(request):
 
 class SettingsView(APIView):
     """Application settings endpoint."""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedOrAuthDisabled]
 
     def get(self, request):
         """Get application settings."""

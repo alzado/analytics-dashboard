@@ -7,6 +7,7 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
+from apps.core.permissions import IsAuthenticatedOrAuthDisabled
 from rest_framework.views import APIView
 from django.shortcuts import get_object_or_404
 
@@ -30,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 class RollupViewSet(viewsets.ModelViewSet):
     """ViewSet for rollup management."""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedOrAuthDisabled]
     lookup_field = 'id'
 
     def get_queryset(self):
@@ -283,7 +284,7 @@ GROUP BY {dim_columns}"""
 
 class RefreshAllRollupsView(APIView):
     """Refresh all rollups for a table."""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedOrAuthDisabled]
 
     def _get_bigquery_client(self, table: BigQueryTable) -> bigquery.Client:
         """Get a BigQuery client for the table's credentials."""
@@ -361,7 +362,7 @@ class RefreshAllRollupsView(APIView):
 
 class RollupConfigView(APIView):
     """Manage rollup configuration for a table."""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedOrAuthDisabled]
 
     def get(self, request):
         """Get rollup config for a table."""
@@ -399,7 +400,7 @@ class RollupConfigView(APIView):
 
 class DefaultProjectView(APIView):
     """Update default project for rollups."""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedOrAuthDisabled]
 
     def put(self, request):
         """Set default project for rollup tables."""
@@ -431,7 +432,7 @@ class DefaultProjectView(APIView):
 
 class DefaultDatasetView(APIView):
     """Update default dataset for rollups."""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedOrAuthDisabled]
 
     def put(self, request):
         """Set default dataset for rollup tables."""

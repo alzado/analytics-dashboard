@@ -54,6 +54,8 @@ services:
       - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
       - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
       - ENCRYPTION_KEY=${ENCRYPTION_KEY:-}
+      # Set to 'true' to disable authentication (for development)
+      - AUTH_DISABLED=${AUTH_DISABLED:-true}
       # Google Cloud credentials (ADC)
       - GOOGLE_APPLICATION_CREDENTIALS=/root/.config/gcloud/application_default_credentials.json
     volumes:
