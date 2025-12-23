@@ -61,9 +61,7 @@ export function RollupManagementSection({ tableId }: RollupManagementSectionProp
   const [refreshMode, setRefreshMode] = useState<'full' | 'incremental'>('incremental')
   const [rollupStatuses, setRollupStatuses] = useState<Record<string, RollupStatusResponse>>({})
 
-  // Form state for creating a rollup
-  const [formDisplayName, setFormDisplayName] = useState('')
-  const [formDescription, setFormDescription] = useState('')
+  // Form state for creating a rollup (only dimensions required, name auto-generated)
   const [formDimensions, setFormDimensions] = useState<string[]>(['date'])
   const [formTargetProject, setFormTargetProject] = useState('')
   const [formTargetDataset, setFormTargetDataset] = useState('')
@@ -186,22 +184,18 @@ export function RollupManagementSection({ tableId }: RollupManagementSectionProp
   })
 
   const resetForm = () => {
-    setFormDisplayName('')
-    setFormDescription('')
     setFormDimensions(['date'])
     setFormTargetProject('')
     setFormTargetDataset('')
   }
 
   const handleCreateRollup = () => {
-    if (!formDisplayName || formDimensions.length === 0) {
+    if (formDimensions.length === 0) {
       alert('Please fill in all required fields')
       return
     }
 
     const data: RollupCreate = {
-      display_name: formDisplayName,
-      description: formDescription || undefined,
       dimensions: formDimensions,
       target_project: formTargetProject || undefined,
       target_dataset: formTargetDataset || undefined,
@@ -784,30 +778,6 @@ export function RollupManagementSection({ tableId }: RollupManagementSectionProp
             <h3 className="text-lg font-semibold mb-4">Create New Rollup</h3>
 
             <div className="space-y-4">
-              {/* Display Name */}
-              <div>
-                <label className="block text-sm font-medium mb-1">Display Name *</label>
-                <input
-                  type="text"
-                  value={formDisplayName}
-                  onChange={(e) => setFormDisplayName(e.target.value)}
-                  placeholder="e.g., Daily by Channel"
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg"
-                />
-              </div>
-
-              {/* Description */}
-              <div>
-                <label className="block text-sm font-medium mb-1">Description</label>
-                <input
-                  type="text"
-                  value={formDescription}
-                  onChange={(e) => setFormDescription(e.target.value)}
-                  placeholder="Optional description"
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg"
-                />
-              </div>
-
               {/* Dimensions */}
               <div>
                 <label className="block text-sm font-medium mb-1">

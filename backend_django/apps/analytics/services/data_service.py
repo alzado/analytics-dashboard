@@ -7,7 +7,7 @@ Django port of the FastAPI data_service.py with rollup routing support.
 import math
 import re
 import logging
-from typing import List, Dict, Optional, Any, Tuple
+from typing import List, Dict, Optional, Any, Tuple, Union
 
 import pandas as pd
 
@@ -100,6 +100,7 @@ class DataService:
                 'total_count': 0,
                 'error': f"No suitable rollup found. Query dimensions: {dimensions or []}, Filter dimensions: {filter_dims}. Reason: {route_decision.reason}. Create a rollup with dimensions {all_required_dims} to enable this query.",
                 'error_type': 'rollup_required',
+                'required_dimensions': all_required_dims,
                 'available_rollups': available_rollups
             }
 
@@ -116,6 +117,9 @@ class DataService:
             table_path=table_path,
             dimension_values=dimension_values
         )
+
+        # Compute calculated metrics (conversion rates, etc.) from volume metrics
+        df = self._compute_calculated_metrics(df, metrics_data)
 
         # Calculate grand totals for percentage calculations
         grand_totals = self._calculate_totals(df, metrics_data)
@@ -142,64 +146,14 @@ class DataService:
             'total_count': total_count,
         }
 
-    def get_pivot_children(
-        self,
-        dimension: str,
-        value: str,
-        filters: Dict,
-        limit: int = 100,
-        offset: int = 0
-    ) -> List[Dict[str, Any]]:
-        """
-        Get child rows (search terms) for a specific dimension value.
-
-        Args:
-            dimension: Parent dimension name
-            value: Parent dimension value to filter by
-            filters: Filter parameters
-            limit: Max rows to return
-            offset: Rows to skip
-
-        Returns:
-            List of child row dicts with search_term and metrics
-        """
-        # Add parent dimension filter
-        child_filters = filters.copy()
-        if 'dimension_filters' not in child_filters:
-            child_filters['dimension_filters'] = {}
-
-        if dimension and value:
-            child_filters['dimension_filters'][dimension] = [value]
-
-        # Query with search_term as dimension
-        df = self.bq_service.query_pivot_data(
-            dimensions=['search_term'],
-            filters=child_filters,
-            limit=limit,
-            offset=offset
-        )
-
-        metrics_data = self._get_metrics_config()
-        totals = self._calculate_totals(df, metrics_data)
-
-        rows = []
-        for idx, row in df.iterrows():
-            row_data = {
-                'search_term': str(row.get('search_term', '')),
-                'metrics': self._extract_metrics(row, metrics_data, totals)
-            }
-            rows.append(row_data)
-
-        return rows
-
     def get_dimension_values(
         self,
         dimension: str,
         filters: Dict,
         limit: int = 1000,
-        require_rollup: bool = False,
+        require_rollup: bool = True,
         pivot_dimensions: Optional[List[str]] = None
-    ) -> List[str]:
+    ) -> Dict[str, Any]:
         """
         Get distinct values for a dimension.
 
@@ -208,11 +162,11 @@ class DataService:
             filters: Filter parameters
             limit: Max values to return
             require_rollup: If True, require rollup (error if not available).
-                           Defaults to False to allow fallback to raw table.
+                           Defaults to True - always use rollups.
             pivot_dimensions: List of dimensions in current pivot context
 
         Returns:
-            List of distinct string values
+            Dict with 'values' key containing list of strings, or 'error' key if rollup not found
         """
         # Build the full list of dimensions needed for routing:
         # - The dimension we're querying for distinct values
@@ -237,23 +191,38 @@ class DataService:
             f"reason={route_decision.reason}"
         )
 
-        # If require_rollup and no rollup found, raise error
+        # If require_rollup and no rollup found, return error response (like pivot does)
         if require_rollup and not route_decision.use_rollup:
-            raise ValueError(
-                f"No suitable rollup found for dimension '{dimension}' with pivot context {pivot_dims}. "
-                f"Required dimensions: {all_dimensions}. "
-                f"Reason: {route_decision.reason}"
-            )
+            # Get available rollups for debugging
+            available_rollups = []
+            router = self._get_query_router()
+            if router:
+                available_rollups = router.find_suitable_rollups(
+                    query_dimensions=all_dimensions,
+                    query_metrics=[],
+                    query_filters=filters.get('dimension_filters')
+                )
+
+            return {
+                'values': [],
+                'error': f"No suitable rollup found. Required dimensions: {all_dimensions}. "
+                         f"Create a rollup with these dimensions to enable this query.",
+                'error_type': 'rollup_required',
+                'required_dimensions': all_dimensions,
+                'available_rollups': available_rollups
+            }
 
         # Determine table path
         table_path = route_decision.rollup_table_path if route_decision.use_rollup else None
 
-        return self.bq_service.query_dimension_values(
+        values = self.bq_service.query_dimension_values(
             dimension=dimension,
             filters=filters,
             limit=limit,
             table_path=table_path
         )
+
+        return {'values': values}
 
     def _get_metrics_config(self) -> Dict[str, Any]:
         """Load metrics configuration from schema."""
@@ -558,8 +527,15 @@ class DataService:
             formula = metric.formula
             depends_on = metric.depends_on or []
 
+            # If depends_on is empty, parse dependencies from formula
+            # This handles cases where schema copy didn't preserve depends_on
+            if not depends_on and formula:
+                depends_on = re.findall(r'\{(\w+)\}', formula)
+
             # Check all dependencies are available
-            if not all(dep in df.columns for dep in depends_on):
+            missing_deps = [dep for dep in depends_on if dep not in df.columns]
+            if missing_deps:
+                logger.warning(f"Skipping metric '{metric_id}': missing dependencies {missing_deps}")
                 continue
 
             try:
@@ -570,7 +546,7 @@ class DataService:
                 )
                 df[metric_id] = result_values
             except Exception as e:
-                logger.warning(f"Failed to compute {metric_id}: {e}")
+                logger.warning(f"Failed to compute metric {metric_id}: {e}")
                 df[metric_id] = 0.0
 
         return df
@@ -705,36 +681,121 @@ class DataService:
 
         return result
 
-    def get_overview_metrics(self, filters: Dict) -> Dict[str, Any]:
+    def get_overview_metrics(
+        self,
+        filters: Dict,
+        require_rollup: bool = True
+    ) -> Dict[str, Any]:
         """
         Get overview KPI metrics.
 
         Args:
             filters: Filter parameters
+            require_rollup: If True, require rollup (error if not available)
 
         Returns:
-            Dict with KPI metric values
+            Dict with KPI metric values, or error dict if rollup required but not found
         """
-        return self.bq_service.query_kpi_metrics(filters)
+        # Load metrics configuration for routing
+        metrics_data = self._get_metrics_config()
+        metric_ids = metrics_data.get('all_metric_ids', [])
+        filter_dims = list(filters.get('dimension_filters', {}).keys()) if filters.get('dimension_filters') else []
+
+        # Route query - no dimensions for totals, but need filter dimensions
+        route_decision = self.route_query(
+            dimensions=[],  # No grouping dimensions for totals
+            metrics=metric_ids,
+            filters=filters.get('dimension_filters'),
+            require_rollup=require_rollup
+        )
+
+        logger.info(
+            f"Overview routing: filter_dims={filter_dims}, "
+            f"use_rollup={route_decision.use_rollup}, reason={route_decision.reason}"
+        )
+
+        # If require_rollup and no rollup found, return error response
+        if require_rollup and not route_decision.use_rollup:
+            available_rollups = []
+            router = self._get_query_router()
+            if router:
+                available_rollups = router.find_suitable_rollups(
+                    query_dimensions=[],
+                    query_metrics=metric_ids,
+                    query_filters=filters.get('dimension_filters')
+                )
+
+            return {
+                'error': f"No suitable rollup found for overview metrics. Filter dimensions: {filter_dims}. Reason: {route_decision.reason}",
+                'error_type': 'rollup_required',
+                'required_dimensions': filter_dims,
+                'available_rollups': available_rollups
+            }
+
+        # Determine table path
+        table_path = route_decision.rollup_table_path if route_decision.use_rollup else None
+
+        return self.bq_service.query_kpi_metrics(filters, table_path)
 
     def get_trends_data(
         self,
         filters: Dict,
-        granularity: str = 'daily'
-    ) -> List[Dict[str, Any]]:
+        granularity: str = 'daily',
+        require_rollup: bool = True
+    ) -> Any:
         """
         Get time-series trends data.
 
         Args:
             filters: Filter parameters
             granularity: 'daily', 'weekly', or 'monthly'
+            require_rollup: If True, require rollup (error if not available)
 
         Returns:
-            List of data points with date and metrics
+            List of data points with date and metrics, or error dict if rollup required but not found
         """
-        df = self.bq_service.query_timeseries(filters, granularity)
-
+        # Load metrics configuration for routing
         metrics_data = self._get_metrics_config()
+        metric_ids = metrics_data.get('all_metric_ids', [])
+        filter_dims = list(filters.get('dimension_filters', {}).keys()) if filters.get('dimension_filters') else []
+
+        # Route query - need 'date' dimension for timeseries
+        route_decision = self.route_query(
+            dimensions=['date'],  # Timeseries needs date dimension
+            metrics=metric_ids,
+            filters=filters.get('dimension_filters'),
+            require_rollup=require_rollup
+        )
+
+        logger.info(
+            f"Trends routing: filter_dims={filter_dims}, "
+            f"use_rollup={route_decision.use_rollup}, reason={route_decision.reason}"
+        )
+
+        # If require_rollup and no rollup found, return error response
+        if require_rollup and not route_decision.use_rollup:
+            available_rollups = []
+            router = self._get_query_router()
+            if router:
+                available_rollups = router.find_suitable_rollups(
+                    query_dimensions=['date'],
+                    query_metrics=metric_ids,
+                    query_filters=filters.get('dimension_filters')
+                )
+
+            all_required_dims = ['date'] + filter_dims
+            return {
+                'error': f"No suitable rollup found for trends data. Required dimensions: {all_required_dims}. Reason: {route_decision.reason}",
+                'error_type': 'rollup_required',
+                'required_dimensions': all_required_dims,
+                'available_rollups': available_rollups
+            }
+
+        # Determine table path
+        table_path = route_decision.rollup_table_path if route_decision.use_rollup else None
+
+        df = self.bq_service.query_timeseries(filters, granularity, table_path)
+
         df = self._compute_calculated_metrics(df, metrics_data)
 
         rows = []
@@ -761,8 +822,9 @@ class DataService:
         self,
         dimension: str,
         filters: Dict,
-        limit: int = 20
-    ) -> List[Dict[str, Any]]:
+        limit: int = 20,
+        require_rollup: bool = True
+    ) -> Any:
         """
         Get breakdown by dimension.
 
@@ -770,13 +832,53 @@ class DataService:
             dimension: Dimension to break down by
             filters: Filter parameters
             limit: Max rows to return
+            require_rollup: If True, require rollup (error if not available)
 
         Returns:
-            List of breakdown rows
+            List of breakdown rows, or error dict if rollup required but not found
         """
-        df = self.bq_service.query_dimension_breakdown(dimension, filters, limit)
-
+        # Load metrics configuration for routing
         metrics_data = self._get_metrics_config()
+        metric_ids = metrics_data.get('all_metric_ids', [])
+        filter_dims = list(filters.get('dimension_filters', {}).keys()) if filters.get('dimension_filters') else []
+
+        # Route query - need the breakdown dimension
+        route_decision = self.route_query(
+            dimensions=[dimension],
+            metrics=metric_ids,
+            filters=filters.get('dimension_filters'),
+            require_rollup=require_rollup
+        )
+
+        logger.info(
+            f"Breakdown routing: dimension={dimension}, filter_dims={filter_dims}, "
+            f"use_rollup={route_decision.use_rollup}, reason={route_decision.reason}"
+        )
+
+        # If require_rollup and no rollup found, return error response
+        if require_rollup and not route_decision.use_rollup:
+            all_required_dims = list(set([dimension] + filter_dims))
+            available_rollups = []
+            router = self._get_query_router()
+            if router:
+                available_rollups = router.find_suitable_rollups(
+                    query_dimensions=[dimension],
+                    query_metrics=metric_ids,
+                    query_filters=filters.get('dimension_filters')
+                )
+
+            return {
+                'error': f"No suitable rollup found for dimension breakdown. Required dimensions: {all_required_dims}. Reason: {route_decision.reason}",
+                'error_type': 'rollup_required',
+                'required_dimensions': all_required_dims,
+                'available_rollups': available_rollups
+            }
+
+        # Determine table path
+        table_path = route_decision.rollup_table_path if route_decision.use_rollup else None
+
+        df = self.bq_service.query_dimension_breakdown(dimension, filters, limit, table_path)
+
         df = self._compute_calculated_metrics(df, metrics_data)
 
         rows = []
@@ -803,8 +905,9 @@ class DataService:
         self,
         filters: Dict,
         limit: int = 100,
-        sort_by: str = 'queries'
-    ) -> List[Dict[str, Any]]:
+        sort_by: str = 'queries',
+        require_rollup: bool = True
+    ) -> Any:
         """
         Get search terms data.
 
@@ -812,13 +915,53 @@ class DataService:
             filters: Filter parameters
             limit: Max rows to return
             sort_by: Metric to sort by
+            require_rollup: If True, require rollup (error if not available)
 
         Returns:
-            List of search term rows
+            List of search term rows, or error dict if rollup required but not found
         """
-        df = self.bq_service.query_search_terms(filters, limit, sort_by)
-
+        # Load metrics configuration for routing
         metrics_data = self._get_metrics_config()
+        metric_ids = metrics_data.get('all_metric_ids', [])
+        filter_dims = list(filters.get('dimension_filters', {}).keys()) if filters.get('dimension_filters') else []
+
+        # Route query - need 'search_term' dimension
+        route_decision = self.route_query(
+            dimensions=['search_term'],
+            metrics=metric_ids,
+            filters=filters.get('dimension_filters'),
+            require_rollup=require_rollup
+        )
+
+        logger.info(
+            f"Search terms routing: filter_dims={filter_dims}, "
+            f"use_rollup={route_decision.use_rollup}, reason={route_decision.reason}"
+        )
+
+        # If require_rollup and no rollup found, return error response
+        if require_rollup and not route_decision.use_rollup:
+            all_required_dims = list(set(['search_term'] + filter_dims))
+            available_rollups = []
+            router = self._get_query_router()
+            if router:
+                available_rollups = router.find_suitable_rollups(
+                    query_dimensions=['search_term'],
+                    query_metrics=metric_ids,
+                    query_filters=filters.get('dimension_filters')
+                )
+
+            return {
+                'error': f"No suitable rollup found for search terms. Required dimensions: {all_required_dims}. Create a rollup with 'search_term' dimension to enable this query.",
+                'error_type': 'rollup_required',
+                'required_dimensions': all_required_dims,
+                'available_rollups': available_rollups
+            }
+
+        # Determine table path
+        table_path = route_decision.rollup_table_path if route_decision.use_rollup else None
+
+        df = self.bq_service.query_search_terms(filters, limit, sort_by, table_path)
+
         df = self._compute_calculated_metrics(df, metrics_data)
 
         rows = []

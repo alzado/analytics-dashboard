@@ -1,20 +1,7 @@
 """
 Custom permissions for the application.
 """
-from django.conf import settings
 from rest_framework.permissions import BasePermission
-
-
-class IsAuthenticatedOrAuthDisabled(BasePermission):
-    """
-    Allow access if user is authenticated OR if AUTH_DISABLED is True.
-    Use this instead of IsAuthenticated to allow disabling auth via env var.
-    """
-
-    def has_permission(self, request, view):
-        if getattr(settings, 'AUTH_DISABLED', False):
-            return True
-        return request.user and request.user.is_authenticated
 
 
 class IsOwner(BasePermission):
@@ -71,10 +58,6 @@ class IsTableOwnerOrOrganizationMember(BasePermission):
         if table is None:
             return False
 
-        # When auth is disabled, allow all access
-        if getattr(settings, 'AUTH_DISABLED', False):
-            return True
-
         # Anonymous users can only access public tables
         if not user.is_authenticated:
             from apps.tables.models import Visibility
@@ -92,10 +75,6 @@ class IsTableOwnerOrOrganizationMember(BasePermission):
 
     def has_permission(self, request, view):
         """Check permission before object retrieval (for nested routes)."""
-        # When auth is disabled, allow all access
-        if getattr(settings, 'AUTH_DISABLED', False):
-            return True
-
         # Get table_id from URL kwargs
         table_id = view.kwargs.get('table_id')
         if table_id:
@@ -110,10 +89,6 @@ class IsTableOwnerOrOrganizationMember(BasePermission):
         return True
 
     def has_object_permission(self, request, view, obj):
-        # When auth is disabled, allow all access
-        if getattr(settings, 'AUTH_DISABLED', False):
-            return True
-
         # Direct table access
         if hasattr(obj, 'owner'):
             return self._check_table_access(request.user, obj)

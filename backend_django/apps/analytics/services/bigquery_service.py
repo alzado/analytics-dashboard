@@ -472,13 +472,19 @@ class BigQueryService:
             group_by = f"GROUP BY {dim_columns}"
             select_dims = f"{dim_columns},"
         else:
+            dim_columns = ""
             group_by = ""
             select_dims = ""
 
         # Build ORDER BY (by first metric descending)
+        # For rollup queries, only use volume metrics since conversion metrics
+        # don't exist as columns in the rollup table
         order_by = ""
-        if self.schema_config and self.schema_config.calculated_metrics.exists():
-            first_metric = self.schema_config.calculated_metrics.first()
+        if self.schema_config:
+            if is_rollup_query:
+                first_metric = self.schema_config.calculated_metrics.filter(category='volume').first()
+            else:
+                first_metric = self.schema_config.calculated_metrics.first()
             if first_metric:
                 order_by = f"ORDER BY {first_metric.metric_id} DESC"
 
@@ -510,11 +516,29 @@ class BigQueryService:
 
                 filter_parts = []
 
+                # Determine data type from schema (default to STRING)
+                data_type = "STRING"
+                if self.schema_config:
+                    try:
+                        dim = self.schema_config.dimensions.get(dimension_id=dim_col)
+                        data_type = dim.data_type
+                    except Exception:
+                        pass  # Use default STRING type
+
+                # Numeric types don't need quotes
+                is_numeric = data_type in ("INTEGER", "INT64", "FLOAT", "FLOAT64", "NUMERIC", "BIGNUMERIC", "BOOLEAN", "BOOL")
+
                 # Format non-null values
                 if non_null_values:
-                    escaped_values = [v.replace("'", "''") for v in non_null_values]
-                    values_list = "', '".join(escaped_values)
-                    filter_parts.append(f"{dim_col} IN ('{values_list}')")
+                    if is_numeric:
+                        # For numeric types, don't quote values
+                        values_list = ", ".join(non_null_values)
+                        filter_parts.append(f"{dim_col} IN ({values_list})")
+                    else:
+                        # For string types, quote values
+                        escaped_values = [v.replace("'", "''") for v in non_null_values]
+                        values_list = "', '".join(escaped_values)
+                        filter_parts.append(f"{dim_col} IN ('{values_list}')")
 
                 # Add IS NULL condition if __NULL__ marker was present
                 if has_null:
@@ -531,6 +555,8 @@ class BigQueryService:
         if dimension_values and len(dimension_values) > 0:
             # When filtering by specific values, don't use LIMIT/OFFSET
             # Sort by dimension value for consistent ordering across columns
+            # Only add ORDER BY if we have dimensions to sort by
+            order_by_dims = f"ORDER BY {dim_columns}" if dim_columns else ""
             query = f"""
                 SELECT
                     {select_dims}
@@ -539,7 +565,7 @@ class BigQueryService:
                 {where_clause}
                 {dimension_values_filter}
                 {group_by}
-                ORDER BY {dim_columns}
+                {order_by_dims}
             """
         else:
             # Normal query with LIMIT/OFFSET
@@ -569,6 +595,9 @@ class BigQueryService:
         Rollup tables store pre-computed metrics as columns.
         We SUM these columns to re-aggregate across dimensions.
 
+        Only volume metrics are stored in rollup tables - conversion/rate
+        metrics are calculated in Python from the volume metrics.
+
         Returns:
             Comma-separated SELECT clause with SUM(metric_id) as metric_id
         """
@@ -577,8 +606,8 @@ class BigQueryService:
 
         select_parts = []
 
-        # For each calculated metric, SUM the pre-computed column
-        for metric in self.schema_config.calculated_metrics.all():
+        # Only SUM volume metrics - conversion metrics are calculated in Python
+        for metric in self.schema_config.calculated_metrics.filter(category='volume'):
             select_parts.append(f"SUM({metric.metric_id}) as {metric.metric_id}")
 
         return ",\n                ".join(select_parts)
@@ -588,7 +617,8 @@ class BigQueryService:
         dimension: str,
         filters: Dict,
         limit: int = 1000,
-        table_path: Optional[str] = None
+        table_path: Optional[str] = None,
+        sort_by_metric: Optional[str] = None
     ) -> List[str]:
         """
         Get distinct values for a dimension.
@@ -598,9 +628,11 @@ class BigQueryService:
             filters: Filter parameters
             limit: Max values to return
             table_path: Optional table path override (for rollup tables)
+            sort_by_metric: Optional metric to sort by (descending). If not provided,
+                           uses schema's primary_sort_metric if available.
 
         Returns:
-            List of distinct values
+            List of distinct values, sorted by metric if available
         """
         # Use provided table_path or default to base table
         query_table = table_path if table_path else self.table_path
@@ -616,14 +648,37 @@ class BigQueryService:
         # Build NOT NULL condition - use WHERE if no other filters, AND otherwise
         not_null_clause = f"WHERE {dimension} IS NOT NULL" if not where_clause else f"AND {dimension} IS NOT NULL"
 
-        query = f"""
-            SELECT DISTINCT {dimension} as value
-            FROM `{query_table}`
-            {where_clause}
-            {not_null_clause}
-            ORDER BY value
-            LIMIT {limit}
-        """
+        # Determine sort metric: use provided, or fall back to schema's primary_sort_metric
+        # Note: Metric sorting only works on rollup tables which have pre-aggregated metrics
+        is_rollup_query = table_path is not None
+        effective_sort_metric = None
+        if is_rollup_query:
+            effective_sort_metric = sort_by_metric
+            if not effective_sort_metric and self.schema_config:
+                effective_sort_metric = self.schema_config.primary_sort_metric
+
+        # Build query - with or without metric sorting
+        if effective_sort_metric and is_rollup_query:
+            # Sort by metric (descending) - shows highest-volume values first
+            query = f"""
+                SELECT {dimension} as value, SUM({effective_sort_metric}) as sort_metric
+                FROM `{query_table}`
+                {where_clause}
+                {not_null_clause}
+                GROUP BY {dimension}
+                ORDER BY sort_metric DESC
+                LIMIT {limit}
+            """
+        else:
+            # Fall back to alphabetical sort
+            query = f"""
+                SELECT DISTINCT {dimension} as value
+                FROM `{query_table}`
+                {where_clause}
+                {not_null_clause}
+                ORDER BY value
+                LIMIT {limit}
+            """
 
         df = self.execute_query(
             query=query,
@@ -907,17 +962,23 @@ class BigQueryService:
 
     def query_kpi_metrics(
         self,
-        filters: Dict
+        filters: Dict,
+        table_path: Optional[str] = None
     ) -> Dict:
         """
         Query aggregated KPI metrics dynamically from schema.
 
         Args:
             filters: Filter parameters dict
+            table_path: Override table path (for rollup queries). Defaults to base table.
 
         Returns:
             Dictionary with aggregated metrics
         """
+        # Use provided table_path or default to base table
+        query_table = table_path if table_path else self.table_path
+        is_rollup_query = table_path is not None
+
         where_clause = self.build_filter_clause(
             start_date=filters.get('start_date'),
             end_date=filters.get('end_date'),
@@ -926,12 +987,16 @@ class BigQueryService:
             relative_date_preset=filters.get('relative_date_preset')
         )
 
-        select_clause = self._build_metric_select_clause()
+        # For rollup queries, use SUM(metric) since metrics are pre-computed
+        if is_rollup_query:
+            select_clause = self._build_rollup_metric_select_clause()
+        else:
+            select_clause = self._build_metric_select_clause()
 
         query = f"""
             SELECT
                 {select_clause}
-            FROM `{self.table_path}`
+            FROM `{query_table}`
             {where_clause}
         """
 
@@ -964,7 +1029,8 @@ class BigQueryService:
     def query_timeseries(
         self,
         filters: Dict,
-        granularity: str = 'daily'
+        granularity: str = 'daily',
+        table_path: Optional[str] = None
     ) -> pd.DataFrame:
         """
         Query time-series data dynamically from schema.
@@ -972,10 +1038,15 @@ class BigQueryService:
         Args:
             filters: Filter parameters dict
             granularity: 'daily', 'weekly', or 'monthly'
+            table_path: Override table path (for rollup queries). Defaults to base table.
 
         Returns:
             DataFrame with time-series data
         """
+        # Use provided table_path or default to base table
+        query_table = table_path if table_path else self.table_path
+        is_rollup_query = table_path is not None
+
         where_clause = self.build_filter_clause(
             start_date=filters.get('start_date'),
             end_date=filters.get('end_date'),
@@ -991,13 +1062,17 @@ class BigQueryService:
         }
         date_trunc = date_trunc_map.get(granularity, 'DAY')
 
-        select_clause = self._build_metric_select_clause()
+        # For rollup queries, use SUM(metric) since metrics are pre-computed
+        if is_rollup_query:
+            select_clause = self._build_rollup_metric_select_clause()
+        else:
+            select_clause = self._build_metric_select_clause()
 
         query = f"""
             SELECT
                 DATE_TRUNC(date, {date_trunc}) as date,
                 {select_clause}
-            FROM `{self.table_path}`
+            FROM `{query_table}`
             {where_clause}
             GROUP BY date
             ORDER BY date
@@ -1014,7 +1089,8 @@ class BigQueryService:
         self,
         dimension: str,
         filters: Dict,
-        limit: int = 20
+        limit: int = 20,
+        table_path: Optional[str] = None
     ) -> pd.DataFrame:
         """
         Query breakdown by dimension dynamically from schema.
@@ -1023,10 +1099,15 @@ class BigQueryService:
             dimension: Column to group by
             filters: Filter parameters dict
             limit: Maximum number of rows to return
+            table_path: Override table path (for rollup queries). Defaults to base table.
 
         Returns:
             DataFrame with dimension breakdown
         """
+        # Use provided table_path or default to base table
+        query_table = table_path if table_path else self.table_path
+        is_rollup_query = table_path is not None
+
         where_clause = self.build_filter_clause(
             start_date=filters.get('start_date'),
             end_date=filters.get('end_date'),
@@ -1045,14 +1126,18 @@ class BigQueryService:
             except Exception:
                 group_col = dimension
 
-        select_clause = self._build_metric_select_clause()
+        # For rollup queries, use SUM(metric) since metrics are pre-computed
+        if is_rollup_query:
+            select_clause = self._build_rollup_metric_select_clause()
+        else:
+            select_clause = self._build_metric_select_clause()
         dimension_expr = f"COALESCE(CAST({group_col} AS STRING), '__NULL__')"
 
         query = f"""
             SELECT
                 {dimension_expr} as dimension_value,
                 {select_clause}
-            FROM `{self.table_path}`
+            FROM `{query_table}`
             {where_clause}
             GROUP BY dimension_value
             ORDER BY dimension_value
@@ -1070,7 +1155,8 @@ class BigQueryService:
         self,
         filters: Dict,
         limit: int = 100,
-        sort_by: str = 'queries'
+        sort_by: str = 'queries',
+        table_path: Optional[str] = None
     ) -> pd.DataFrame:
         """
         Query search terms data dynamically from schema.
@@ -1079,10 +1165,15 @@ class BigQueryService:
             filters: Filter parameters dict
             limit: Maximum number of rows to return
             sort_by: Metric ID to sort by
+            table_path: Override table path (for rollup queries). Defaults to base table.
 
         Returns:
             DataFrame with search terms and all base metrics
         """
+        # Use provided table_path or default to base table
+        query_table = table_path if table_path else self.table_path
+        is_rollup_query = table_path is not None
+
         where_clause = self.build_filter_clause(
             start_date=filters.get('start_date'),
             end_date=filters.get('end_date'),
@@ -1091,12 +1182,16 @@ class BigQueryService:
             relative_date_preset=filters.get('relative_date_preset')
         )
 
-        select_clause = self._build_metric_select_clause(include_search_term=True)
+        # For rollup queries, use SUM(metric) since metrics are pre-computed
+        if is_rollup_query:
+            select_clause = "search_term,\n                " + self._build_rollup_metric_select_clause()
+        else:
+            select_clause = self._build_metric_select_clause(include_search_term=True)
 
         query = f"""
             SELECT
                 {select_clause}
-            FROM `{self.table_path}`
+            FROM `{query_table}`
             {where_clause}
             GROUP BY search_term
             ORDER BY {sort_by} DESC

@@ -5,6 +5,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { fetchTables, fetchAppSettings, updateAppSettings } from '@/lib/api'
 import { BigQueryInfoSection } from './bigquery-info-section'
 import { SchemaSection } from './schema-section'
+import { CreateTableModal } from '@/components/modals/create-table-modal'
 import { Database, Plus, Settings, CheckCircle } from 'lucide-react'
 
 export function TablesSection() {
@@ -13,6 +14,7 @@ export function TablesSection() {
   const [subTab, setSubTab] = useState<'info' | 'schema'>('info')
   const [globalBillingProject, setGlobalBillingProject] = useState<string>('')
   const [showSettingsSuccess, setShowSettingsSuccess] = useState(false)
+  const [isCreateTableModalOpen, setIsCreateTableModalOpen] = useState(false)
 
   // Fetch available tables
   const { data: tablesData } = useQuery({
@@ -61,23 +63,35 @@ export function TablesSection() {
   // Show empty state if no tables
   if (tables.length === 0) {
     return (
-      <div className="bg-white rounded-lg border border-gray-200 p-12">
-        <div className="text-center max-w-md mx-auto">
-          <div className="inline-flex items-center justify-center w-16 h-16 bg-blue-100 rounded-full mb-4">
-            <Database className="w-8 h-8 text-blue-600" />
-          </div>
-          <h2 className="text-2xl font-bold text-gray-900 mb-2">No Tables Configured</h2>
-          <p className="text-gray-600 mb-6">
-            Get started by creating your first BigQuery table connection. Once configured, you'll be able to use the Editor to query and visualize your data.
-          </p>
-          <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 mb-6">
-            <p className="text-sm text-blue-800">
-              <strong>Note:</strong> The Editor and Dashboards will only work after you create at least one table connection.
+      <>
+        <div className="bg-white rounded-lg border border-gray-200 p-12">
+          <div className="text-center max-w-md mx-auto">
+            <div className="inline-flex items-center justify-center w-16 h-16 bg-blue-100 rounded-full mb-4">
+              <Database className="w-8 h-8 text-blue-600" />
+            </div>
+            <h2 className="text-2xl font-bold text-gray-900 mb-2">No Tables Configured</h2>
+            <p className="text-gray-600 mb-6">
+              Get started by creating your first BigQuery table connection. Once configured, you'll be able to use the Editor to query and visualize your data.
             </p>
+            <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 mb-6">
+              <p className="text-sm text-blue-800">
+                <strong>Note:</strong> The Editor and Dashboards will only work after you create at least one table connection.
+              </p>
+            </div>
+            <button
+              onClick={() => setIsCreateTableModalOpen(true)}
+              className="px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 flex items-center gap-2 mx-auto"
+            >
+              <Plus size={20} />
+              Add Your First Table
+            </button>
           </div>
-          <BigQueryInfoSection tableId={undefined} />
         </div>
-      </div>
+        <CreateTableModal
+          isOpen={isCreateTableModalOpen}
+          onClose={() => setIsCreateTableModalOpen(false)}
+        />
+      </>
     )
   }
 
@@ -124,7 +138,7 @@ export function TablesSection() {
 
       {/* Table Selector */}
       <div className="bg-white rounded-lg border border-gray-200 p-6">
-        <div className="flex items-center justify-between gap-4">
+        <div className="flex items-end gap-4">
           <div className="flex-1">
             <label className="block text-sm font-medium text-gray-700 mb-2">
               Select Table:
@@ -139,56 +153,60 @@ export function TablesSection() {
                   {table.name} ({table.project_id}.{table.dataset}.{table.table})
                 </option>
               ))}
-              <option value="__new__">+ Add New Table</option>
             </select>
           </div>
+          <button
+            onClick={() => setIsCreateTableModalOpen(true)}
+            className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 flex items-center gap-2"
+          >
+            <Plus size={18} />
+            Add Table
+          </button>
         </div>
       </div>
 
-      {/* Show configuration form when adding new table */}
-      {selectedTableId === '__new__' ? (
-        <div className="bg-white rounded-lg border border-gray-200 p-6">
-          <h2 className="text-xl font-bold mb-4">Add New Table</h2>
-          <BigQueryInfoSection tableId={undefined} />
+      {/* Sub-tabs for Info and Schema */}
+      <div className="bg-white rounded-lg border border-gray-200">
+        <div className="border-b border-gray-200">
+          <nav className="flex -mb-px">
+            <button
+              onClick={() => setSubTab('info')}
+              className={`
+                px-6 py-3 border-b-2 font-medium text-sm
+                ${subTab === 'info'
+                  ? 'border-blue-500 text-blue-600'
+                  : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
+                }
+              `}
+            >
+              Connection & Info
+            </button>
+            <button
+              onClick={() => setSubTab('schema')}
+              className={`
+                px-6 py-3 border-b-2 font-medium text-sm
+                ${subTab === 'schema'
+                  ? 'border-blue-500 text-blue-600'
+                  : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
+                }
+              `}
+            >
+              Schema Management
+            </button>
+          </nav>
         </div>
-      ) : (
-        /* Sub-tabs for Info and Schema */
-        <div className="bg-white rounded-lg border border-gray-200">
-          <div className="border-b border-gray-200">
-            <nav className="flex -mb-px">
-              <button
-                onClick={() => setSubTab('info')}
-                className={`
-                  px-6 py-3 border-b-2 font-medium text-sm
-                  ${subTab === 'info'
-                    ? 'border-blue-500 text-blue-600'
-                    : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
-                  }
-                `}
-              >
-                Connection & Info
-              </button>
-              <button
-                onClick={() => setSubTab('schema')}
-                className={`
-                  px-6 py-3 border-b-2 font-medium text-sm
-                  ${subTab === 'schema'
-                    ? 'border-blue-500 text-blue-600'
-                    : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
-                  }
-                `}
-              >
-                Schema Management
-              </button>
-            </nav>
-          </div>
 
-          <div className="p-6">
-            {subTab === 'info' && <BigQueryInfoSection tableId={selectedTableId} />}
-            {subTab === 'schema' && <SchemaSection tableId={selectedTableId} />}
-          </div>
+        <div className="p-6">
+          {subTab === 'info' && <BigQueryInfoSection tableId={selectedTableId} />}
+          {subTab === 'schema' && <SchemaSection tableId={selectedTableId} />}
         </div>
-      )}
+      </div>
+
+      {/* Create Table Modal */}
+      <CreateTableModal
+        isOpen={isCreateTableModalOpen}
+        onClose={() => setIsCreateTableModalOpen(false)}
+      />
     </div>
   )
 }

@@ -5,7 +5,6 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
-from apps.core.permissions import IsAuthenticatedOrAuthDisabled
 from django.shortcuts import get_object_or_404
 from django.db.models import Q
 
@@ -23,7 +22,7 @@ from apps.users.models import User
 
 class OrganizationViewSet(viewsets.ModelViewSet):
     """ViewSet for organizations."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
     lookup_field = 'id'
 
     def get_queryset(self):

@@ -184,6 +184,10 @@ class GCPOAuthService:
         Returns:
             google.oauth2.credentials.Credentials or None if user hasn't authorized
         """
+        # Check if user is authenticated (not AnonymousUser)
+        if not user or not getattr(user, 'is_authenticated', False):
+            return None
+
         if not user.has_bigquery_access():
             return None
 

@@ -137,6 +137,22 @@ class QueryRouterService:
             return self._get_rollup_table_path(baseline)
         return None
 
+    def _get_volume_metrics(self, metric_ids: Set[str]) -> Set[str]:
+        """
+        Filter metric IDs to only include volume metrics (stored in rollup).
+        Conversion/rate metrics are calculated in Python after fetching data.
+        """
+        volume_metrics = set()
+        for metric_id in metric_ids:
+            try:
+                calc_metric = self.schema_config.calculated_metrics.get(metric_id=metric_id)
+                if calc_metric.category == 'volume':
+                    volume_metrics.add(metric_id)
+            except Exception:
+                # If metric not found in calculated_metrics, skip it
+                pass
+        return volume_metrics
+
     def _score_rollup(
         self,
         rollup: Rollup,
@@ -151,7 +167,7 @@ class QueryRouterService:
         Matching rules:
         1. Rollup must have all query dimensions
         2. Rollup must have all filter dimensions
-        3. Rollup must have all required metrics
+        3. Rollup must have all required VOLUME metrics (conversion metrics are calculated in Python)
         4. SPECIAL CASE: When query has no dimensions (totals query), allow using
            a date-only rollup with re-aggregation (for non-DISTINCT metrics)
         5. For DISTINCT metrics, require exact dimension match (no re-aggregation)
@@ -177,10 +193,13 @@ class QueryRouterService:
             missing = filter_dimensions - rollup_dims
             return -1, False, f"Missing filter dimensions: {missing}"
 
-        # Check if rollup has all required metrics
-        if not query_metrics.issubset(rollup_metrics):
-            missing = query_metrics - rollup_metrics
-            return -1, False, f"Missing metrics: {missing}"
+        # Only check for VOLUME metrics - conversion/rate metrics are calculated in Python
+        required_volume_metrics = self._get_volume_metrics(query_metrics)
+        available_volume_metrics = self._get_volume_metrics(rollup_metrics)
+
+        if not required_volume_metrics.issubset(available_volume_metrics):
+            missing = required_volume_metrics - available_volume_metrics
+            return -1, False, f"Missing volume metrics: {missing}"
 
         # Check for extra dimensions in rollup
         extra_dims = rollup_dims - query_dimensions - filter_dimensions
@@ -254,6 +273,10 @@ class QueryRouterService:
                 distinct_metrics,
                 filter_dims_set
             )
+            # Debug logging for scoring
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(f"Scoring rollup '{rollup.name}' dims={rollup.dimensions}: score={score}, reason={reason}")
             if score >= 0:
                 scored_rollups.append((score, rollup, needs_reagg, reason))
 
@@ -262,17 +285,36 @@ class QueryRouterService:
 
         # No suitable rollup found
         if not scored_rollups:
-            if has_distinct and require_rollup:
-                all_required_dims = query_dims_set | filter_dims_set
-                filter_info = f" (includes table dimension filters: {filter_dims_set})" if filter_dims_set else ""
-                return RouteDecision(
-                    use_rollup=False,
-                    reason=f"No suitable rollup for COUNT_DISTINCT metrics {distinct_metrics} with dimensions {all_required_dims}{filter_info}. "
-                           f"Create a rollup with exactly these dimensions to enable this query."
-                )
+            all_required_dims = sorted(query_dims_set | filter_dims_set)
+            available_rollups = [r.dimensions for r in rollups if r.status == RollupStatus.READY]
+
+            if require_rollup:
+                filter_info = f" Filter dimensions: {sorted(filter_dims_set)}." if filter_dims_set else ""
+                query_info = f" Query dimensions: {sorted(query_dims_set)}." if query_dims_set else " No query dimensions (totals query)."
+
+                if has_distinct:
+                    return RouteDecision(
+                        use_rollup=False,
+                        reason=f"No suitable rollup found.{query_info}{filter_info} "
+                               f"Required dimensions: {all_required_dims}. "
+                               f"Available rollups: {available_rollups}. "
+                               f"Create a rollup with dimensions {all_required_dims} to enable this query.",
+                        metrics_unavailable=list(distinct_metrics)
+                    )
+                else:
+                    return RouteDecision(
+                        use_rollup=False,
+                        reason=f"No suitable rollup found.{query_info}{filter_info} "
+                               f"Required dimensions: {all_required_dims}. "
+                               f"Available rollups: {available_rollups}. "
+                               f"Create a rollup with dimensions {all_required_dims} to enable this query.",
+                        metrics_unavailable=list(query_metrics_set)
+                    )
+
             return RouteDecision(
                 use_rollup=False,
-                reason="No suitable rollup found; using raw table"
+                reason=f"No suitable rollup found. Required dimensions: {all_required_dims}. "
+                       f"Available rollups: {available_rollups}."
             )
 
         # Use best scoring rollup

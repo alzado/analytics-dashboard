@@ -2,7 +2,7 @@
 
 import React, { useState, useMemo, useEffect, useCallback, useRef } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { fetchPivotData, fetchPivotChildren, fetchDimensionValues, fetchCustomDimensions, fetchTables, updateWidget } from '@/lib/api'
+import { fetchPivotData, fetchPivotChildren, fetchDimensionValues, fetchCustomDimensions, fetchTables, updateWidget, createRollup, refreshRollup } from '@/lib/api'
 import type { PivotRow, PivotChildRow, PivotResponse, CustomDimension, DateRangeType, RelativeDatePreset } from '@/lib/types'
 import { ChevronRight, ChevronDown, Settings2, ArrowUp, ArrowDown, Database, Save, GripVertical, Download, Calendar, BarChart3 } from 'lucide-react'
 import { usePivotConfig } from '@/hooks/use-pivot-config'
@@ -1575,10 +1575,8 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
     const pageKey = `${rowKey}:${currentPageNum}`
     const children = childrenCache[pageKey] || []
 
-    // Check if this row can have children (more dimensions to drill into)
-    // depth 0 = first dimension, depth 1 = second dimension, etc.
-    // Can have children if there's another dimension level below this one
-    const canHaveChildren = depth < selectedDimensions.length - 1
+    // Row expansion is disabled - all data queries must use rollup tables
+    const canHaveChildren = false
     const bgColor = indentLevel % 2 === 1 ? 'bg-blue-50' : 'bg-blue-100'
 
     // Calculate cumulative percentage relative to grand total (all siblings up to and including this row)
@@ -1727,6 +1725,58 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
     }
     return null
   }, [fetchRequested, allColumnData])
+
+  // Extract required_dimensions from error response (for rollup_required errors)
+  const requiredDimensions = useMemo(() => {
+    if (!fetchRequested) return null
+    // Check multi-table mode first
+    if (selectedTableDimensions.length > 0 && allColumnData) {
+      for (const colIndex of Object.keys(allColumnData)) {
+        const colData = allColumnData[Number(colIndex)]
+        if (colData?.required_dimensions) return colData.required_dimensions
+      }
+    }
+    // Check single-table mode
+    return pivotData?.required_dimensions || null
+  }, [fetchRequested, selectedTableDimensions.length, allColumnData, pivotData?.required_dimensions])
+
+  // State for rollup creation
+  const [isCreatingRollup, setIsCreatingRollup] = useState(false)
+  const [rollupCreationStatus, setRollupCreationStatus] = useState<string | null>(null)
+
+  // Mutation for creating rollup from error state
+  const createRollupMutation = useMutation({
+    mutationFn: async (dimensions: string[]) => {
+      setIsCreatingRollup(true)
+      setRollupCreationStatus('Creating rollup...')
+
+      // Create the rollup with just dimensions (name auto-generated)
+      const rollup = await createRollup({ dimensions }, selectedTable || undefined)
+
+      setRollupCreationStatus('Building rollup data...')
+
+      // Trigger refresh to build the rollup (full refresh, not incremental)
+      await refreshRollup(rollup.id, false, false, selectedTable || undefined)
+
+      return rollup
+    },
+    onSuccess: () => {
+      setRollupCreationStatus('Rollup created! Refreshing data...')
+      // Invalidate queries to refetch data
+      queryClient.invalidateQueries({ queryKey: ['rollups', selectedTable] })
+      queryClient.invalidateQueries({ queryKey: ['pivot-data'] })
+      // Reset status after a delay
+      setTimeout(() => {
+        setIsCreatingRollup(false)
+        setRollupCreationStatus(null)
+      }, 2000)
+    },
+    onError: (error) => {
+      setIsCreatingRollup(false)
+      setRollupCreationStatus(`Error: ${error instanceof Error ? error.message : 'Failed to create rollup'}`)
+      setTimeout(() => setRollupCreationStatus(null), 5000)
+    }
+  })
 
   if (isLoading) {
     return <div className="flex items-center justify-center h-64">Loading...</div>
@@ -3313,15 +3363,43 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
                     {inlineError && (
                       <tr>
                         <td colSpan={100} className="px-6 py-8">
-                          <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded">
-                            <div className="font-medium">
+                          <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded max-w-2xl mx-auto">
+                            <div className="font-medium text-lg">
                               {inlineErrorType === 'rollup_required' ? 'Rollup Required' : 'Error loading data'}
                             </div>
-                            <div className="text-sm mt-1">{inlineError}</div>
-                            {inlineErrorType === 'rollup_required' && (
-                              <div className="text-sm mt-2 text-red-600">
-                                Go to <strong>Tables → Rollups</strong> to create a rollup with the required dimensions and metrics.
-                              </div>
+                            {inlineErrorType === 'rollup_required' ? (
+                              <>
+                                <div className="text-sm mt-2">
+                                  No rollup table matches the current query configuration.
+                                </div>
+                                {requiredDimensions && requiredDimensions.length > 0 ? (
+                                  <div className="mt-4">
+                                    {rollupCreationStatus ? (
+                                      <div className="text-sm text-blue-600 font-medium">
+                                        {rollupCreationStatus}
+                                      </div>
+                                    ) : (
+                                      <button
+                                        onClick={() => createRollupMutation.mutate(requiredDimensions)}
+                                        disabled={isCreatingRollup}
+                                        className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed text-sm font-medium"
+                                      >
+                                        Create Rollup ({requiredDimensions.join(', ')})
+                                      </button>
+                                    )}
+                                  </div>
+                                ) : (
+                                  <div className="text-sm mt-3 text-red-600">
+                                    <strong>Action needed:</strong> Go to <strong>Tables → Rollups</strong> to create a rollup with the required dimensions.
+                                  </div>
+                                )}
+                                <details className="mt-3 text-xs">
+                                  <summary className="cursor-pointer text-red-600 hover:text-red-800">Show technical details</summary>
+                                  <pre className="mt-2 p-2 bg-red-100 rounded overflow-x-auto whitespace-pre-wrap break-words">{inlineError}</pre>
+                                </details>
+                              </>
+                            ) : (
+                              <div className="text-sm mt-1 break-words">{inlineError}</div>
                             )}
                           </div>
                         </td>
@@ -3967,15 +4045,43 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
               {inlineError && (
                 <tr>
                   <td colSpan={100} className="px-6 py-8">
-                    <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded">
-                      <div className="font-medium">
+                    <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded max-w-2xl mx-auto">
+                      <div className="font-medium text-lg">
                         {inlineErrorType === 'rollup_required' ? 'Rollup Required' : 'Error loading data'}
                       </div>
-                      <div className="text-sm mt-1">{inlineError}</div>
-                      {inlineErrorType === 'rollup_required' && (
-                        <div className="text-sm mt-2 text-red-600">
-                          Go to <strong>Tables → Rollups</strong> to create a rollup with the required dimensions and metrics.
-                        </div>
+                      {inlineErrorType === 'rollup_required' ? (
+                        <>
+                          <div className="text-sm mt-2">
+                            No rollup table matches the current query configuration.
+                          </div>
+                          {requiredDimensions && requiredDimensions.length > 0 ? (
+                            <div className="mt-4">
+                              {rollupCreationStatus ? (
+                                <div className="text-sm text-blue-600 font-medium">
+                                  {rollupCreationStatus}
+                                </div>
+                              ) : (
+                                <button
+                                  onClick={() => createRollupMutation.mutate(requiredDimensions)}
+                                  disabled={isCreatingRollup}
+                                  className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed text-sm font-medium"
+                                >
+                                  Create Rollup ({requiredDimensions.join(', ')})
+                                </button>
+                              )}
+                            </div>
+                          ) : (
+                            <div className="text-sm mt-3 text-red-600">
+                              <strong>Action needed:</strong> Go to <strong>Tables → Rollups</strong> to create a rollup with the required dimensions.
+                            </div>
+                          )}
+                          <details className="mt-3 text-xs">
+                            <summary className="cursor-pointer text-red-600 hover:text-red-800">Show technical details</summary>
+                            <pre className="mt-2 p-2 bg-red-100 rounded overflow-x-auto whitespace-pre-wrap break-words">{inlineError}</pre>
+                          </details>
+                        </>
+                      ) : (
+                        <div className="text-sm mt-1 break-words">{inlineError}</div>
                       )}
                     </div>
                   </td>
@@ -4007,8 +4113,7 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
                 return (
                   <React.Fragment key={row.dimension_value}>
                     <tr
-                      className="hover:bg-gray-50 cursor-pointer"
-                      onClick={() => row.has_children && toggleRow(row.dimension_value, 0, grandTotal)}
+                      className="hover:bg-gray-50"
                     >
                       <td
                         className={`px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900 transition-all ${
@@ -4025,9 +4130,6 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
                         }}
                       >
                         <div className="flex items-center gap-2">
-                          {row.has_children && (
-                            isExpanded ? <ChevronDown size={16} /> : <ChevronRight size={16} />
-                          )}
                           <span>{row.dimension_value}</span>
                         </div>
                       </td>
@@ -4053,112 +4155,6 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
                         )
                       })}
                     </tr>
-                    {isExpanded && (
-                      <>
-                        {isLoading && children.length === 0 ? (
-                          <tr className="bg-blue-50">
-                            <td colSpan={selectedMetrics.length + 1} className="px-6 py-4 text-center text-sm text-gray-600">
-                              Loading...
-                            </td>
-                          </tr>
-                        ) : (
-                          <>
-                            {/* Drill-down header row for single-table mode */}
-                            <tr className="bg-blue-100 border-t-2 border-blue-300">
-                              <th
-                                className="px-6 py-2 text-left text-xs font-medium text-gray-700 uppercase tracking-wider cursor-pointer hover:bg-blue-200"
-                                onClick={() => handleChildrenSort('dimension')}
-                              >
-                                <div className="flex items-center gap-1 pl-8">
-                                  <span>{selectedDimensions.length > 1 ? getDimensionLabel(selectedDimensions[1]) : 'Search Term'}</span>
-                                  {childrenSortConfig?.column === 'dimension' && (
-                                    <span className="text-gray-500">
-                                      {childrenSortConfig.direction === 'asc' ? '↑' : '↓'}
-                                    </span>
-                                  )}
-                                </div>
-                              </th>
-                              {selectedMetrics.map((metricId) => {
-                                const metric = getMetricById(metricId)
-                                const isSorted = childrenSortConfig?.column === metricId
-                                return (
-                                  <th
-                                    key={`child-header-${metricId}`}
-                                    className="px-6 py-2 text-right text-xs font-medium text-gray-700 uppercase tracking-wider cursor-pointer hover:bg-blue-200"
-                                    onClick={() => handleChildrenSort(metricId)}
-                                  >
-                                    <div className="flex items-center justify-end gap-1">
-                                      {metric?.label || metricId}
-                                      {isSorted && (
-                                        <span className="text-gray-500">
-                                          {childrenSortConfig.direction === 'asc' ? '↑' : '↓'}
-                                        </span>
-                                      )}
-                                    </div>
-                                  </th>
-                                )
-                              })}
-                            </tr>
-                            {sortChildren(children).map((child, idx) => {
-                              // Get all children from previous pages
-                              let allPreviousPagesChildren: PivotChildRow[] = []
-                              if (currentPageNum > 0) {
-                                for (let p = 0; p < currentPageNum; p++) {
-                                  const prevPageKey = `${rowKey}:${p}`
-                                  const prevChildren = childrenCache[prevPageKey] || []
-                                  allPreviousPagesChildren = [...allPreviousPagesChildren, ...prevChildren]
-                                }
-                              }
-                              // Add children from current page up to this index
-                              const allChildrenUpToThis = [...allPreviousPagesChildren, ...children.slice(0, idx + 1)]
-                              return renderRow(child, row.dimension_value, 1, 1, children, idx, grandTotal, allChildrenUpToThis)
-                            })}
-                            {children.length > 0 && children.length === CHILDREN_PAGE_SIZE && (
-                              <tr className="bg-blue-50">
-                                <td colSpan={selectedMetrics.length + 1} className="px-6 py-4">
-                                  {isLoading ? (
-                                    <div className="flex items-center justify-center gap-2 text-sm text-gray-600">
-                                      <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-gray-700"></div>
-                                      Loading...
-                                    </div>
-                                  ) : (
-                                    <div className="flex items-center justify-center gap-4">
-                                      <button
-                                        onClick={(e) => {
-                                          e.stopPropagation()
-                                          const currentPageNum = currentPage[rowKey] || 0
-                                          if (currentPageNum > 0) {
-                                            goToPage(row.dimension_value, 0, currentPageNum - 1)
-                                          }
-                                        }}
-                                        disabled={!currentPage[rowKey] || currentPage[rowKey] === 0}
-                                        className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-md hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
-                                      >
-                                        Previous
-                                      </button>
-                                      <span className="text-sm text-gray-600">
-                                        Page {(currentPage[rowKey] || 0) + 1}
-                                      </span>
-                                      <button
-                                        onClick={(e) => {
-                                          e.stopPropagation()
-                                          const currentPageNum = currentPage[rowKey] || 0
-                                          goToPage(row.dimension_value, 0, currentPageNum + 1)
-                                        }}
-                                        disabled={children.length < CHILDREN_PAGE_SIZE}
-                                        className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-md hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
-                                      >
-                                        Next
-                                      </button>
-                                    </div>
-                                  )}
-                                </td>
-                              </tr>
-                            )}
-                          </>
-                        )}
-                      </>
-                    )}
                   </React.Fragment>
                 )
                 })

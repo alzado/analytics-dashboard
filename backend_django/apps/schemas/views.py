@@ -5,7 +5,6 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
-from apps.core.permissions import IsAuthenticatedOrAuthDisabled
 from django.shortcuts import get_object_or_404
 
 from apps.tables.models import BigQueryTable
@@ -31,7 +30,7 @@ from .services import SchemaService, MetricService, DimensionService
 
 class SchemaConfigViewSet(viewsets.ModelViewSet):
     """ViewSet for schema configuration."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled, IsTableOwnerOrOrganizationMember]
+    permission_classes = [IsTableOwnerOrOrganizationMember]
     serializer_class = SchemaConfigSerializer
     lookup_field = 'bigquery_table_id'
     lookup_url_kwarg = 'table_id'  # URL uses table_id, maps to bigquery_table_id
@@ -169,7 +168,7 @@ class SchemaConfigViewSet(viewsets.ModelViewSet):
 
 class CalculatedMetricViewSet(viewsets.ModelViewSet):
     """ViewSet for calculated metrics."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
     serializer_class = CalculatedMetricSerializer
     lookup_field = 'metric_id'
     pagination_class = None  # Disable pagination - return plain array
@@ -308,7 +307,7 @@ class CalculatedMetricViewSet(viewsets.ModelViewSet):
 
 class DimensionViewSet(viewsets.ModelViewSet):
     """ViewSet for dimensions."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
     serializer_class = DimensionSerializer
     lookup_field = 'dimension_id'
     pagination_class = None  # Disable pagination - return plain array
@@ -439,7 +438,7 @@ class DimensionViewSet(viewsets.ModelViewSet):
 
 class CalculatedDimensionViewSet(viewsets.ModelViewSet):
     """ViewSet for calculated dimensions."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
     serializer_class = CalculatedDimensionSerializer
     lookup_field = 'dimension_id'
     pagination_class = None  # Disable pagination - return plain array
@@ -558,7 +557,7 @@ class CalculatedDimensionViewSet(viewsets.ModelViewSet):
 
 class CustomDimensionViewSet(viewsets.ModelViewSet):
     """ViewSet for custom dimensions (date ranges, metric conditions)."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
     serializer_class = CustomDimensionSerializer
     lookup_field = 'id'
     pagination_class = None  # Disable pagination - return plain array

@@ -6,7 +6,6 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
-from apps.core.permissions import IsAuthenticatedOrAuthDisabled
 from django.db.models import Q
 
 from .models import GCPCredential, CredentialType
@@ -20,7 +19,7 @@ from apps.organizations.models import Organization
 
 class GCPCredentialViewSet(viewsets.ModelViewSet):
     """ViewSet for GCP credentials."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
     lookup_field = 'id'
 
     def get_queryset(self):

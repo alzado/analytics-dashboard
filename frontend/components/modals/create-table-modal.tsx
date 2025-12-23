@@ -16,7 +16,7 @@ export function CreateTableModal({ isOpen, onClose }: CreateTableModalProps) {
     name: '',
     project_id: '',
     dataset: '',
-    table: '',
+    table_name: '',
     credentials_json: '',
     allowed_min_date: null,
     allowed_max_date: null,
@@ -33,7 +33,7 @@ export function CreateTableModal({ isOpen, onClose }: CreateTableModalProps) {
         name: '',
         project_id: '',
         dataset: '',
-        table: '',
+        table_name: '',
         credentials_json: '',
         allowed_min_date: null,
         allowed_max_date: null,
@@ -123,15 +123,15 @@ export function CreateTableModal({ isOpen, onClose }: CreateTableModalProps) {
                 </div>
 
                 <div>
-                  <label htmlFor="table" className="block text-sm font-medium text-gray-700 mb-1">
+                  <label htmlFor="table_name" className="block text-sm font-medium text-gray-700 mb-1">
                     Table *
                   </label>
                   <input
                     type="text"
-                    id="table"
+                    id="table_name"
                     required
-                    value={formData.table}
-                    onChange={(e) => setFormData(prev => ({ ...prev, table: e.target.value }))}
+                    value={formData.table_name}
+                    onChange={(e) => setFormData(prev => ({ ...prev, table_name: e.target.value }))}
                     className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
                     placeholder="search_data"
                   />

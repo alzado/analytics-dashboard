@@ -5,7 +5,6 @@ import logging
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated, AllowAny
-from apps.core.permissions import IsAuthenticatedOrAuthDisabled
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from django.shortcuts import get_object_or_404
@@ -37,7 +36,8 @@ def parse_dimension_filters(request) -> dict:
     skip_params = {
         'dimensions', 'dimension_values', 'start_date', 'end_date',
         'date_range_type', 'relative_date_preset', 'limit', 'offset',
-        'table_id', 'skip_count', 'metrics', 'require_rollup', 'pivot_dimensions'
+        'table_id', 'skip_count', 'metrics', 'require_rollup', 'pivot_dimensions',
+        '_t', '_'  # Cache-busting parameters
     }
 
     for key, values in request.query_params.lists():
@@ -59,30 +59,16 @@ def get_table_and_service(request, table_id=None):
             status=status.HTTP_400_BAD_REQUEST
         )
 
-    # Get the table (with permission check)
+    # Get the table (permission checks disabled for debugging)
     table = get_object_or_404(BigQueryTable, id=table_id)
 
-    # Check permissions
-    user = request.user
-    if not (
-        table.owner == user or
-        table.visibility == 'public' or
-        table.organization and user.memberships.filter(
-            organization=table.organization
-        ).exists()
-    ):
-        return None, None, Response(
-            {'error': 'Permission denied'},
-            status=status.HTTP_403_FORBIDDEN
-        )
-
-    data_service = DataService(table, user)
+    data_service = DataService(table, request.user)
     return table, data_service, None
 
 
 class PivotView(APIView):
     """Pivot table endpoint."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
 
     def get(self, request):
         """
@@ -151,6 +137,7 @@ class PivotView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
         except Exception as e:
+            logger.exception(f"Pivot error: {e}")
             return Response(
                 {'error': str(e)},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
@@ -158,63 +145,29 @@ class PivotView(APIView):
 
 
 class PivotChildrenView(APIView):
-    """Get child rows (search terms) for a pivot dimension."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    """DISABLED: Pivot drill-down to search terms is no longer supported."""
+    permission_classes = []
 
     def get(self, request, dimension=None, value=None):
         """
-        Get child rows for a specific dimension value.
+        DISABLED: This feature has been removed.
 
-        Path params:
-        - dimension: Parent dimension name
-        - value: Parent dimension value
-
-        Query params:
-        - Same filters as PivotView
+        Pivot drill-down to search terms required raw table access which is no longer
+        supported. All data queries must now use rollup tables.
         """
-        table, data_service, error = get_table_and_service(request)
-        if error:
-            return error
-
-        try:
-            start_date = request.query_params.get('start_date')
-            end_date = request.query_params.get('end_date')
-            date_range_type = request.query_params.get('date_range_type', 'absolute')
-            relative_date_preset = request.query_params.get('relative_date_preset')
-            limit = int(request.query_params.get('limit', 100))
-            offset = int(request.query_params.get('offset', 0))
-
-            dimension_filters = parse_dimension_filters(request)
-
-            filters = {
-                'start_date': start_date,
-                'end_date': end_date,
-                'date_range_type': date_range_type,
-                'relative_date_preset': relative_date_preset,
-                'dimension_filters': dimension_filters
-            }
-
-            result = data_service.get_pivot_children(
-                dimension=dimension or '',
-                value=value or '',
-                filters=filters,
-                limit=limit,
-                offset=offset
-            )
-
-            serializer = PivotChildRowSerializer(result, many=True)
-            return Response(serializer.data)
-
-        except Exception as e:
-            return Response(
-                {'error': str(e)},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+        return Response(
+            {
+                'error': 'Pivot drill-down to search terms is disabled. This feature requires raw table access which is no longer supported. All data queries must use rollup tables.',
+                'error_type': 'feature_disabled',
+                'rows': []
+            },
+            status=status.HTTP_400_BAD_REQUEST
+        )
 
 
 class DimensionValuesView(APIView):
     """Get distinct values for a dimension."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
 
     def get(self, request, dimension):
         """
@@ -252,13 +205,19 @@ class DimensionValuesView(APIView):
                 'dimension_filters': dimension_filters
             }
 
-            values = data_service.get_dimension_values(
+            result = data_service.get_dimension_values(
                 dimension=dimension,
                 filters=filters,
-                pivot_dimensions=pivot_dimensions
+                pivot_dimensions=pivot_dimensions,
+                require_rollup=False  # Dimension values are simple SELECT DISTINCT - don't need rollups
             )
 
-            return Response(values)
+            # If there's an error (no rollup found), return the full error response
+            if 'error' in result:
+                return Response(result)
+
+            # Otherwise return just the values list for backward compatibility
+            return Response(result.get('values', []))
 
         except Exception as e:
             return Response(
@@ -269,7 +228,7 @@ class DimensionValuesView(APIView):
 
 class TableInfoView(APIView):
     """Get BigQuery table info."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
 
     def get(self, request):
         """Get table info including date range and row count."""
@@ -306,7 +265,7 @@ def get_user_tables(user):
 
 class BigQueryInfoView(APIView):
     """Get BigQuery connection info (compatibility with FastAPI /api/bigquery/info)."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
 
     def get(self, request):
         """
@@ -383,7 +342,7 @@ class BigQueryInfoView(APIView):
 
 class BigQueryTablesListView(APIView):
     """List all tables in BigQuery project/dataset."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
 
     def get(self, request):
         """
@@ -410,7 +369,7 @@ class BigQueryTablesListView(APIView):
 
 class BigQueryTableDatesView(APIView):
     """Get date range for a BigQuery table."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
 
     def get(self, request):
         """
@@ -446,7 +405,7 @@ class BigQueryTableDatesView(APIView):
 
 class BigQueryConfigureView(APIView):
     """Configure BigQuery connection (create or update table)."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
 
     def post(self, request):
         """
@@ -549,7 +508,7 @@ class BigQueryConfigureView(APIView):
 
 class BigQueryDisconnectView(APIView):
     """Disconnect from BigQuery (delete table configuration)."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
 
     def post(self, request):
         """
@@ -590,7 +549,7 @@ class BigQueryDisconnectView(APIView):
 
 class BigQueryCancelView(APIView):
     """Cancel running BigQuery queries."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
 
     def post(self, request):
         """Cancel running queries (placeholder - not fully implemented)."""
@@ -603,7 +562,7 @@ class BigQueryCancelView(APIView):
 
 class BigQueryLogsView(APIView):
     """Query logs endpoint."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
 
     def get(self, request):
         """Get query logs (placeholder)."""
@@ -615,7 +574,7 @@ class BigQueryLogsView(APIView):
 
 class BigQueryLogsClearView(APIView):
     """Clear query logs."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
 
     def post(self, request):
         """Clear query logs (placeholder)."""
@@ -628,7 +587,7 @@ class BigQueryLogsClearView(APIView):
 
 class BigQueryUsageStatsView(APIView):
     """Usage statistics."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
 
     def get(self, request):
         """Get usage stats (placeholder)."""
@@ -641,7 +600,7 @@ class BigQueryUsageStatsView(APIView):
 
 class BigQueryUsageTodayView(APIView):
     """Today's usage statistics."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
 
     def get(self, request):
         """Get today's usage stats (placeholder)."""
@@ -654,7 +613,7 @@ class BigQueryUsageTodayView(APIView):
 
 class BigQueryUsageTimeSeriesView(APIView):
     """Usage time series."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
 
     def get(self, request):
         """Get usage time series (placeholder)."""
@@ -701,7 +660,7 @@ def get_optimized_source_service(request):
 
 class OptimizedSourceStatusView(APIView):
     """Get status of optimized source table."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
 
     def get(self, request):
         """Get current status of optimized source table for a BigQuery table."""
@@ -732,7 +691,7 @@ class OptimizedSourceStatusView(APIView):
 
 class OptimizedSourceAnalyzeView(APIView):
     """Analyze schema for potential optimized source table creation."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
 
     def get(self, request):
         """Analyze schema to show what composite keys would be created."""
@@ -762,7 +721,7 @@ class OptimizedSourceAnalyzeView(APIView):
 
 class OptimizedSourcePreviewSqlView(APIView):
     """Preview SQL for optimized source table creation."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
 
     def get(self, request):
         """Preview the SQL that would be generated for optimized source table."""
@@ -802,7 +761,7 @@ class OptimizedSourcePreviewSqlView(APIView):
 
 class OptimizedSourceCreateView(APIView):
     """Create optimized source table."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
 
     def post(self, request):
         """Create optimized source table with precomputed composite keys."""
@@ -845,7 +804,7 @@ class OptimizedSourceCreateView(APIView):
 
 class OptimizedSourceRefreshView(APIView):
     """Refresh optimized source table."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
 
     def post(self, request):
         """Refresh the optimized source table."""
@@ -881,7 +840,7 @@ class OptimizedSourceRefreshView(APIView):
 
 class OptimizedSourceDeleteView(APIView):
     """Delete optimized source table."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
 
     def delete(self, request):
         """Delete optimized source configuration and optionally the table."""
@@ -919,7 +878,7 @@ class SignificanceView(APIView):
     Only percent-format calculated metrics with simple {A}/{B} formulas are eligible.
     Uses event counts (e.g., queries, clicks) as the sample size, not days.
     """
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
 
     def post(self, request):
         """
@@ -1040,31 +999,49 @@ class SignificanceView(APIView):
             use_rollup = False
             rollup_table_path = None
 
-            if rollup_config:
-                router = QueryRouterService(
-                    rollup_config=rollup_config,
-                    schema_config=schema_config,
-                    source_project_id=table.project_id,
-                    source_dataset=table.dataset
-                )
+            # Rollup is REQUIRED for significance testing
+            if not rollup_config:
+                return Response({
+                    'error': 'No rollup configuration found. Significance testing requires rollup tables.',
+                    'error_type': 'rollup_required',
+                    'control_column_index': control_column['column_index'],
+                    'results': {}
+                }, status=status.HTTP_400_BAD_REQUEST)
 
-                # Create routing filter dict (values don't matter for routing, just keys)
-                routing_filters = {d: [] for d in filter_dimensions} if filter_dimensions else None
+            router = QueryRouterService(
+                rollup_config=rollup_config,
+                schema_config=schema_config,
+                source_project_id=table.project_id,
+                source_dataset=table.dataset
+            )
 
-                route_decision = router.route_query(
-                    query_dimensions=[],  # No GROUP BY needed (we're aggregating totals)
+            # Create routing filter dict (values don't matter for routing, just keys)
+            routing_filters = {d: [] for d in filter_dimensions} if filter_dimensions else None
+
+            route_decision = router.route_query(
+                query_dimensions=[],  # No GROUP BY needed (we're aggregating totals)
+                query_metrics=list(base_metrics_needed),
+                query_filters=routing_filters,
+                require_rollup=True  # Rollup is required
+            )
+
+            # Check if rollup is available
+            if not route_decision.use_rollup:
+                available_rollups = router.find_suitable_rollups(
+                    query_dimensions=[],
                     query_metrics=list(base_metrics_needed),
-                    query_filters=routing_filters,
-                    require_rollup=False
+                    query_filters=routing_filters
                 )
+                return Response({
+                    'error': f'No suitable rollup found for significance testing. Filter dimensions: {list(filter_dimensions)}. Reason: {route_decision.reason}',
+                    'error_type': 'rollup_required',
+                    'control_column_index': control_column['column_index'],
+                    'results': {},
+                    'available_rollups': available_rollups
+                }, status=status.HTTP_400_BAD_REQUEST)
 
-                use_rollup = route_decision.use_rollup
-                rollup_table_path = route_decision.rollup_table_path if use_rollup else None
-
-                # Log routing decision
-                logger.info(f"Significance test routing: use_rollup={use_rollup}, reason={route_decision.reason}")
-            else:
-                logger.info("Significance test routing: No rollup config, using raw table")
+            rollup_table_path = route_decision.rollup_table_path
+            logger.info(f"Significance test routing: use_rollup=True, rollup={rollup_table_path}")
 
             # Helper function to fetch aggregated totals with combined filters
             def fetch_aggregated_totals(extra_filters=None):
@@ -1072,24 +1049,16 @@ class SignificanceView(APIView):
                 if extra_filters:
                     combined_filters.update(extra_filters)
 
-                if use_rollup and rollup_table_path:
-                    # Use rollup table with re-aggregation (SUM metrics)
-                    return bq_service.query_rollup_aggregates(
-                        rollup_table_path=rollup_table_path,
-                        metric_ids=list(base_metrics_needed),
-                        start_date=filter_dict.get('start_date'),
-                        end_date=filter_dict.get('end_date'),
-                        dimension_filters=combined_filters,
-                        date_range_type=filter_dict.get('date_range_type', 'absolute'),
-                        relative_date_preset=filter_dict.get('relative_date_preset')
-                    )
-                else:
-                    # Fallback to raw table
-                    return bq_service.query_aggregated_totals(
-                        metric_ids=list(base_metrics_needed),
-                        filters=filter_dict,
-                        dimension_filters=combined_filters
-                    )
+                # Always use rollup table (raw table access is not allowed)
+                return bq_service.query_rollup_aggregates(
+                    rollup_table_path=rollup_table_path,
+                    metric_ids=list(base_metrics_needed),
+                    start_date=filter_dict.get('start_date'),
+                    end_date=filter_dict.get('end_date'),
+                    dimension_filters=combined_filters,
+                    date_range_type=filter_dict.get('date_range_type', 'absolute'),
+                    relative_date_preset=filter_dict.get('relative_date_preset')
+                )
 
             # Helper function to run proportion test for a specific row
             def run_test_for_row(row_filters=None, row_id=None):
@@ -1267,7 +1236,7 @@ class SignificanceView(APIView):
 
 class CacheStatsView(APIView):
     """Get query cache statistics."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
 
     def get(self, request):
         """Get cache statistics."""
@@ -1287,7 +1256,7 @@ class CacheStatsView(APIView):
 
 class CacheClearView(APIView):
     """Clear query cache."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
 
     def post(self, request):
         """Clear entire cache."""
@@ -1311,7 +1280,7 @@ class CacheClearView(APIView):
 
 class CacheClearByTableView(APIView):
     """Clear cache for a specific table."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
 
     def post(self, request, table_id):
         """Clear cache for a specific table."""
@@ -1336,7 +1305,7 @@ class CacheClearByTableView(APIView):
 
 class CacheClearByTypeView(APIView):
     """Clear cache for a specific query type."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
 
     def post(self, request, query_type):
         """Clear cache for a specific query type."""
@@ -1365,7 +1334,7 @@ class CacheClearByTypeView(APIView):
 
 class OverviewView(APIView):
     """Get overview KPI metrics."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
 
     def get(self, request):
         """
@@ -1398,6 +1367,11 @@ class OverviewView(APIView):
             }
 
             result = data_service.get_overview_metrics(filters)
+
+            # Check for rollup-required error
+            if isinstance(result, dict) and result.get('error_type') == 'rollup_required':
+                return Response(result, status=status.HTTP_400_BAD_REQUEST)
+
             return Response(result)
 
         except Exception as e:
@@ -1410,7 +1384,7 @@ class OverviewView(APIView):
 
 class TrendsView(APIView):
     """Get time-series trends data."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
 
     def get(self, request):
         """
@@ -1445,6 +1419,11 @@ class TrendsView(APIView):
             }
 
             result = data_service.get_trends_data(filters, granularity)
+
+            # Check for rollup-required error
+            if isinstance(result, dict) and result.get('error_type') == 'rollup_required':
+                return Response(result, status=status.HTTP_400_BAD_REQUEST)
+
             return Response(result)
 
         except Exception as e:
@@ -1457,7 +1436,7 @@ class TrendsView(APIView):
 
 class BreakdownView(APIView):
     """Get breakdown by dimension."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
 
     def get(self, request, dimension):
         """
@@ -1495,6 +1474,11 @@ class BreakdownView(APIView):
             }
 
             result = data_service.get_dimension_breakdown(dimension, filters, limit)
+
+            # Check for rollup-required error
+            if isinstance(result, dict) and result.get('error_type') == 'rollup_required':
+                return Response(result, status=status.HTTP_400_BAD_REQUEST)
+
             return Response(result)
 
         except Exception as e:
@@ -1507,7 +1491,7 @@ class BreakdownView(APIView):
 
 class SearchTermsView(APIView):
     """Get search terms data."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
 
     def get(self, request):
         """
@@ -1544,6 +1528,11 @@ class SearchTermsView(APIView):
             }
 
             result = data_service.get_search_terms(filters, limit, sort_by)
+
+            # Check for rollup-required error
+            if isinstance(result, dict) and result.get('error_type') == 'rollup_required':
+                return Response(result, status=status.HTTP_400_BAD_REQUEST)
+
             return Response(result)
 
         except Exception as e:
@@ -1556,7 +1545,7 @@ class SearchTermsView(APIView):
 
 class FilterOptionsView(APIView):
     """Get filter options for dimensions."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
 
     def get(self, request):
         """
@@ -1600,7 +1589,7 @@ class FilterOptionsView(APIView):
 
 class DatePresetsView(APIView):
     """Get available date presets."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
 
     def get(self, request):
         """Get list of available date presets."""

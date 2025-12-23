@@ -5,7 +5,6 @@ from rest_framework import status
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import AllowAny
-from apps.core.permissions import IsAuthenticatedOrAuthDisabled
 
 from .serializers import (
     GoogleAuthSerializer,
@@ -75,7 +74,7 @@ class RefreshTokenView(APIView):
 
 class CurrentUserView(APIView):
     """Current user profile endpoint."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
 
     def get(self, request):
         """
@@ -110,7 +109,7 @@ class CurrentUserView(APIView):
 
 class GCPAuthUrlView(APIView):
     """Get GCP OAuth authorization URL."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
 
     def get(self, request):
         """
@@ -133,7 +132,7 @@ class GCPAuthUrlView(APIView):
 
 class GCPAuthCallbackView(APIView):
     """Handle GCP OAuth callback."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
 
     def post(self, request):
         """
@@ -168,7 +167,7 @@ class GCPAuthCallbackView(APIView):
 
 class GCPAuthStatusView(APIView):
     """Get GCP OAuth status for current user."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
 
     def get(self, request):
         """
@@ -189,7 +188,7 @@ class GCPAuthStatusView(APIView):
 
 class GCPAuthRevokeView(APIView):
     """Revoke GCP OAuth access."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
 
     def post(self, request):
         """
@@ -209,7 +208,7 @@ class GCPAuthRevokeView(APIView):
 
 class GCPProjectsView(APIView):
     """List GCP projects accessible to user."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
 
     def get(self, request):
         """

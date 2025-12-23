@@ -29,7 +29,7 @@ class RollupSerializer(serializers.ModelSerializer):
 class RollupCreateSerializer(serializers.ModelSerializer):
     """Serializer for creating rollups."""
     # Accept frontend field names and map to model fields
-    display_name = serializers.CharField(source='name', required=True)
+    display_name = serializers.CharField(source='name', required=False, allow_blank=True)
     # description is accepted but ignored (model doesn't have it)
     description = serializers.CharField(required=False, allow_blank=True, allow_null=True, write_only=True)
     target_project = serializers.CharField(source='rollup_project', required=False, allow_blank=True, allow_null=True)

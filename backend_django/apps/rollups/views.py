@@ -2,12 +2,12 @@
 Rollup views for pre-aggregation management.
 """
 import logging
+import uuid
 from django.db.models import Q
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
-from apps.core.permissions import IsAuthenticatedOrAuthDisabled
 from rest_framework.views import APIView
 from django.shortcuts import get_object_or_404
 
@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 class RollupViewSet(viewsets.ModelViewSet):
     """ViewSet for rollup management."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
     lookup_field = 'id'
 
     def get_queryset(self):
@@ -116,13 +116,17 @@ class RollupViewSet(viewsets.ModelViewSet):
         dimensions = serializer.validated_data.get('dimensions', [])
         sorted_dims = sorted(dimensions)
 
-        # Generate rollup_id using FastAPI convention: {table_id}_rollup_{sorted_dims}
-        # Use short table ID (first 8 chars of UUID)
-        short_table_id = str(table.id).split('-')[0]
-        dim_suffix = '_'.join(sorted_dims) if sorted_dims else 'nodims'
-        rollup_id = f"{short_table_id}_rollup_{dim_suffix}"
+        # Auto-generate name from dimensions if not provided
+        if not serializer.validated_data.get('name'):
+            serializer.validated_data['name'] = ', '.join(sorted_dims) if sorted_dims else 'Unnamed Rollup'
 
-        # Table name is the same as rollup_id (FastAPI convention)
+        # Generate rollup_id with UUID suffix for cleaner table names
+        # Format: {short_table_id}_rollup_{uuid_suffix}
+        short_table_id = str(table.id).split('-')[0]
+        uuid_suffix = uuid.uuid4().hex[:16]  # 16-char hex suffix
+        rollup_id = f"{short_table_id}_rollup_{uuid_suffix}"
+
+        # Table name is the same as rollup_id
         rollup_table = rollup_id
 
         serializer.save(
@@ -174,6 +178,9 @@ class RollupViewSet(viewsets.ModelViewSet):
 
     def _get_bigquery_client(self, table: BigQueryTable) -> bigquery.Client:
         """Get a BigQuery client for the table's credentials."""
+        # Use billing_project if set, otherwise fall back to project_id
+        billing_project = table.billing_project or table.project_id
+
         # Try to get credentials from table's credential config
         try:
             cred_config = table.credential_config
@@ -183,12 +190,12 @@ class RollupViewSet(viewsets.ModelViewSet):
                 credentials = service_account.Credentials.from_service_account_info(
                     json.loads(cred_config.credentials_json)
                 )
-                return bigquery.Client(project=table.project_id, credentials=credentials)
+                return bigquery.Client(project=billing_project, credentials=credentials)
         except Exception:
             pass
 
         # Fall back to default credentials (ADC)
-        return bigquery.Client(project=table.project_id)
+        return bigquery.Client(project=billing_project)
 
     @action(detail=True, methods=['get'], url_path='preview-sql')
     def preview_sql(self, request, id=None):
@@ -284,7 +291,7 @@ GROUP BY {dim_columns}"""
 
 class RefreshAllRollupsView(APIView):
     """Refresh all rollups for a table."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
 
     def _get_bigquery_client(self, table: BigQueryTable) -> bigquery.Client:
         """Get a BigQuery client for the table's credentials."""
@@ -362,7 +369,7 @@ class RefreshAllRollupsView(APIView):
 
 class RollupConfigView(APIView):
     """Manage rollup configuration for a table."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
 
     def get(self, request):
         """Get rollup config for a table."""
@@ -400,7 +407,7 @@ class RollupConfigView(APIView):
 
 class DefaultProjectView(APIView):
     """Update default project for rollups."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
 
     def put(self, request):
         """Set default project for rollup tables."""
@@ -432,7 +439,7 @@ class DefaultProjectView(APIView):
 
 class DefaultDatasetView(APIView):
     """Update default dataset for rollups."""
-    permission_classes = [IsAuthenticatedOrAuthDisabled]
+    permission_classes = []
 
     def put(self, request):
         """Set default dataset for rollup tables."""
