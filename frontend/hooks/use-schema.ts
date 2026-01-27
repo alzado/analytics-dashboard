@@ -16,6 +16,10 @@ import {
   fetchFilterableDimensions,
   fetchGroupableDimensions,
   updatePivotConfig,
+  fetchJoinedDimensionSources,
+  createJoinedDimensionSource,
+  deleteJoinedDimensionSource,
+  reuploadJoinedDimensionSource,
 } from '@/lib/api'
 import type {
   SchemaConfig,
@@ -27,6 +31,7 @@ import type {
   DimensionUpdate,
   SchemaDetectionResult,
   FormulaValidationResult,
+  JoinedDimensionSource,
 } from '@/lib/types'
 
 export function useSchema(tableId?: string) {
@@ -35,31 +40,31 @@ export function useSchema(tableId?: string) {
   const schemaQuery = useQuery<SchemaConfig>({
     queryKey: ['schema', tableId],
     queryFn: () => fetchSchema(tableId),
-    staleTime: 5 * 60 * 1000, // 5 minutes
   })
 
   const calculatedMetricsQuery = useQuery<CalculatedMetric[]>({
     queryKey: ['calculated-metrics', tableId],
     queryFn: () => fetchCalculatedMetrics(tableId),
-    staleTime: 5 * 60 * 1000,
   })
 
   const dimensionsQuery = useQuery<DimensionDef[]>({
     queryKey: ['dimensions', tableId],
     queryFn: () => fetchDimensions(tableId),
-    staleTime: 5 * 60 * 1000,
   })
 
   const filterableDimensionsQuery = useQuery<DimensionDef[]>({
     queryKey: ['filterable-dimensions', tableId],
     queryFn: () => fetchFilterableDimensions(tableId),
-    staleTime: 5 * 60 * 1000,
   })
 
   const groupableDimensionsQuery = useQuery<DimensionDef[]>({
     queryKey: ['groupable-dimensions', tableId],
     queryFn: () => fetchGroupableDimensions(tableId),
-    staleTime: 5 * 60 * 1000,
+  })
+
+  const joinedDimensionSourcesQuery = useQuery<JoinedDimensionSource[]>({
+    queryKey: ['joined-dimension-sources', tableId],
+    queryFn: () => fetchJoinedDimensionSources(tableId),
   })
 
   // Schema-level mutations
@@ -156,7 +161,7 @@ export function useSchema(tableId?: string) {
 
   // Formula validation mutation
   const validateFormulaMutation = useMutation<FormulaValidationResult, Error, string>({
-    mutationFn: validateFormula,
+    mutationFn: (formula) => validateFormula(formula, tableId),
   })
 
   // Pivot config mutation
@@ -168,6 +173,32 @@ export function useSchema(tableId?: string) {
     mutationFn: (config) => updatePivotConfig(config, tableId),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['schema', tableId] })
+    },
+  })
+
+  // Joined dimension source mutations
+  const createJoinedDimensionSourceMutation = useMutation<JoinedDimensionSource, Error, FormData>({
+    mutationFn: (formData) => createJoinedDimensionSource(formData, tableId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['joined-dimension-sources', tableId] })
+    },
+  })
+
+  const deleteJoinedDimensionSourceMutation = useMutation<{ success: boolean; message: string }, Error, string>({
+    mutationFn: (sourceId) => deleteJoinedDimensionSource(sourceId, tableId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['joined-dimension-sources', tableId] })
+    },
+  })
+
+  const reuploadJoinedDimensionSourceMutation = useMutation<
+    JoinedDimensionSource,
+    Error,
+    { sourceId: string; file: File }
+  >({
+    mutationFn: ({ sourceId, file }) => reuploadJoinedDimensionSource(sourceId, file, tableId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['joined-dimension-sources', tableId] })
     },
   })
 
@@ -239,5 +270,22 @@ export function useSchema(tableId?: string) {
     updatePivotConfig: updatePivotConfigMutation.mutateAsync,
     isUpdatingPivotConfig: updatePivotConfigMutation.isPending,
     updatePivotConfigError: updatePivotConfigMutation.error,
+
+    // Joined dimension sources
+    joinedDimensionSources: joinedDimensionSourcesQuery.data ?? [],
+    isLoadingJoinedDimensionSources: joinedDimensionSourcesQuery.isLoading,
+    joinedDimensionSourcesError: joinedDimensionSourcesQuery.error,
+
+    createJoinedDimensionSource: createJoinedDimensionSourceMutation.mutateAsync,
+    isCreatingJoinedDimensionSource: createJoinedDimensionSourceMutation.isPending,
+    createJoinedDimensionSourceError: createJoinedDimensionSourceMutation.error,
+
+    deleteJoinedDimensionSource: deleteJoinedDimensionSourceMutation.mutateAsync,
+    isDeletingJoinedDimensionSource: deleteJoinedDimensionSourceMutation.isPending,
+    deleteJoinedDimensionSourceError: deleteJoinedDimensionSourceMutation.error,
+
+    reuploadJoinedDimensionSource: reuploadJoinedDimensionSourceMutation.mutateAsync,
+    isReuploadingJoinedDimensionSource: reuploadJoinedDimensionSourceMutation.isPending,
+    reuploadJoinedDimensionSourceError: reuploadJoinedDimensionSourceMutation.error,
   }
 }

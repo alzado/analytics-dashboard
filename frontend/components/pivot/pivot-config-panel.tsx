@@ -1,7 +1,7 @@
 'use client'
 
 import { useState, useEffect, useMemo, useRef } from 'react'
-import { X, GripVertical, Settings, Database, Calendar, ChevronDown, ChevronRight, Plus, Edit, Copy, Trash2 } from 'lucide-react'
+import { X, GripVertical, Settings, Database, Calendar, ChevronDown, ChevronRight, Plus, Edit, Copy, Trash2, Search, Loader2 } from 'lucide-react'
 import { SearchInput } from '@/components/ui/search-input'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
@@ -13,14 +13,26 @@ import {
   deleteCustomDimension,
   duplicateCustomDimension,
   fetchDimensionValues,
-  fetchTables
+  fetchTables,
+  fetchCustomMetrics,
+  createCustomMetric,
+  updateCustomMetric,
+  deleteCustomMetric,
 } from '@/lib/api'
 import type { PivotConfig } from '@/hooks/use-pivot-config'
-import type { CustomDimension, CustomDimensionCreate, CustomDimensionUpdate, DateRangeType, RelativeDatePreset } from '@/lib/types'
+import type { CustomDimension, CustomDimensionCreate, CustomDimensionUpdate, CustomMetric, CustomMetricCreate, CustomMetricUpdate, DateRangeType, RelativeDatePreset } from '@/lib/types'
 import { usePivotMetrics, type MetricDefinition } from '@/hooks/use-pivot-metrics'
 import { useSchema } from '@/hooks/use-schema'
 import CustomDimensionModal from '@/components/modals/custom-dimension-modal'
+import CustomMetricModal from '@/components/modals/custom-metric-modal'
 import { DateRangeSelector } from '@/components/ui/date-range-selector'
+
+// Helper function to format dimension value markers for display
+function formatDimensionValue(value: string): string {
+  if (value === '__NULL__') return '(null)'
+  if (value === '') return '(empty)'
+  return value
+}
 
 interface PivotConfigPanelProps {
   isOpen: boolean
@@ -102,7 +114,22 @@ function DimensionFilterInline({
 }: DimensionFilterInlineProps) {
   const [isOpen, setIsOpen] = useState(false)
   const [availableValues, setAvailableValues] = useState<string[]>([])
+  const [searchResults, setSearchResults] = useState<string[] | null>(null)
   const [isLoadingValues, setIsLoadingValues] = useState(false)
+  const [isSearching, setIsSearching] = useState(false)
+  const [searchTerm, setSearchTerm] = useState('')
+  const searchTimeoutRef = useRef<NodeJS.Timeout | null>(null)
+
+  // Values to display: search results if searching, otherwise all available values
+  const displayedValues = searchResults !== null ? searchResults : availableValues
+
+  // Clear search when dropdown closes
+  useEffect(() => {
+    if (!isOpen) {
+      setSearchTerm('')
+      setSearchResults(null)
+    }
+  }, [isOpen])
 
   // Load available values when dropdown opens
   // Don't pass date filters - show ALL possible values regardless of current date range
@@ -126,6 +153,47 @@ function DimensionFilterInline({
     }
   }, [isOpen, dimension.id, availableValues.length, currentFilters?.dimension_filters, tableId])
 
+  // Debounced search - fetch from API when search term changes
+  useEffect(() => {
+    // Clear any pending search
+    if (searchTimeoutRef.current) {
+      clearTimeout(searchTimeoutRef.current)
+    }
+
+    // If search is empty, clear search results and show all values
+    if (!searchTerm.trim()) {
+      setSearchResults(null)
+      setIsSearching(false)
+      return
+    }
+
+    // Debounce the search API call (300ms)
+    setIsSearching(true)
+    searchTimeoutRef.current = setTimeout(() => {
+      const filtersWithoutDates = {
+        dimension_filters: currentFilters?.dimension_filters || {}
+      }
+      fetchDimensionValues(dimension.id, filtersWithoutDates, tableId, undefined, searchTerm.trim())
+        .then(values => {
+          setSearchResults(values)
+        })
+        .catch(err => {
+          console.error(`Failed to search values for ${dimension.id}:`, err)
+          setSearchResults([])
+        })
+        .finally(() => {
+          setIsSearching(false)
+        })
+    }, 300)
+
+    // Cleanup
+    return () => {
+      if (searchTimeoutRef.current) {
+        clearTimeout(searchTimeoutRef.current)
+      }
+    }
+  }, [searchTerm, dimension.id, currentFilters?.dimension_filters, tableId])
+
   const toggleValue = (value: string) => {
     if (selectedValues.includes(value)) {
       onFilterChange(selectedValues.filter(v => v !== value))
@@ -135,7 +203,13 @@ function DimensionFilterInline({
   }
 
   const selectAll = () => {
-    onFilterChange(availableValues)
+    // When searching, only select displayed values (add to existing selection)
+    if (searchTerm.trim()) {
+      const newValues = [...new Set([...selectedValues, ...displayedValues])]
+      onFilterChange(newValues)
+    } else {
+      onFilterChange(availableValues)
+    }
   }
 
   const clearSelection = () => {
@@ -174,33 +248,63 @@ function DimensionFilterInline({
           />
 
           {/* Dropdown content */}
-          <div className="absolute z-20 mt-1 w-full bg-white border border-gray-300 rounded shadow-lg max-h-48 overflow-auto">
+          <div className="absolute z-20 mt-1 w-full bg-white border border-gray-300 rounded shadow-lg max-h-64 overflow-auto">
             {isLoadingValues ? (
               <div className="p-3 text-center text-xs text-gray-500">
                 Loading...
               </div>
             ) : (
               <>
-                {/* Select all / Clear all buttons */}
-                <div className="sticky top-0 bg-gray-50 border-b border-gray-200 px-2 py-1 flex gap-2">
-                  <button
-                    onClick={selectAll}
-                    className="text-xs text-blue-600 hover:text-blue-800"
-                  >
-                    Select all
-                  </button>
-                  <span className="text-gray-300">|</span>
-                  <button
-                    onClick={clearSelection}
-                    className="text-xs text-gray-600 hover:text-gray-800"
-                  >
-                    Clear
-                  </button>
+                {/* Search input and Select all / Clear all buttons */}
+                <div className="sticky top-0 bg-gray-50 border-b border-gray-200">
+                  {/* Search input */}
+                  <div className="px-2 py-1.5 border-b border-gray-200">
+                    <div className="relative">
+                      {isSearching ? (
+                        <Loader2 className="absolute left-2 top-1/2 -translate-y-1/2 h-3 w-3 text-blue-500 animate-spin" />
+                      ) : (
+                        <Search className="absolute left-2 top-1/2 -translate-y-1/2 h-3 w-3 text-gray-400" />
+                      )}
+                      <input
+                        type="text"
+                        placeholder="Search..."
+                        value={searchTerm}
+                        onChange={(e) => setSearchTerm(e.target.value)}
+                        className="w-full pl-7 pr-2 py-1 text-xs border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500"
+                        onClick={(e) => e.stopPropagation()}
+                      />
+                    </div>
+                  </div>
+                  {/* Select all / Clear all buttons */}
+                  <div className="px-2 py-1 flex gap-2">
+                    <button
+                      onClick={selectAll}
+                      className="text-xs text-blue-600 hover:text-blue-800"
+                      disabled={isSearching}
+                    >
+                      Select all{searchTerm.trim() ? ' results' : ''}
+                    </button>
+                    <span className="text-gray-300">|</span>
+                    <button
+                      onClick={clearSelection}
+                      className="text-xs text-gray-600 hover:text-gray-800"
+                    >
+                      Clear
+                    </button>
+                    {searchTerm.trim() && !isSearching && (
+                      <>
+                        <span className="text-gray-300">|</span>
+                        <span className="text-xs text-gray-500">
+                          {displayedValues.length}
+                        </span>
+                      </>
+                    )}
+                  </div>
                 </div>
 
                 {/* Value checkboxes */}
                 <div className="py-1">
-                  {availableValues.map(value => (
+                  {displayedValues.map(value => (
                     <label
                       key={value}
                       className="flex items-center gap-2 px-2 py-1 hover:bg-gray-50 cursor-pointer"
@@ -212,14 +316,16 @@ function DimensionFilterInline({
                         className="h-3 w-3 text-blue-600 border-gray-300 rounded focus:ring-blue-500"
                       />
                       <span className="text-xs text-gray-700 truncate flex-1">
-                        {value}
+                        {formatDimensionValue(value)}
                       </span>
                     </label>
                   ))}
 
-                  {availableValues.length === 0 && (
+                  {displayedValues.length === 0 && !isSearching && (
                     <div className="p-3 text-center text-xs text-gray-500">
-                      No values available
+                      {searchTerm.trim()
+                        ? `No values match "${searchTerm}"`
+                        : 'No values available'}
                     </div>
                   )}
                 </div>
@@ -279,6 +385,11 @@ export function PivotConfigPanel({
   const [isModalOpen, setIsModalOpen] = useState(false)
   const [modalMode, setModalMode] = useState<'create' | 'edit'>('create')
   const [editingDimension, setEditingDimension] = useState<CustomDimension | null>(null)
+
+  // Custom Metric Modal State
+  const [isMetricModalOpen, setIsMetricModalOpen] = useState(false)
+  const [metricModalMode, setMetricModalMode] = useState<'create' | 'edit'>('create')
+  const [editingMetric, setEditingMetric] = useState<CustomMetric | null>(null)
 
   // Pending filter changes (not yet applied)
   const [pendingFilters, setPendingFilters] = useState<Record<string, string[]>>(dimensionFilters || {})
@@ -358,6 +469,40 @@ export function PivotConfigPanel({
     },
   })
 
+  // Fetch custom metrics
+  const { data: customMetrics = [], isLoading: customMetricsLoading } = useQuery({
+    queryKey: ['custom-metrics'],
+    queryFn: fetchCustomMetrics,
+  })
+
+  // Create custom metric mutation
+  const createMetricMutation = useMutation({
+    mutationFn: (data: CustomMetricCreate) => createCustomMetric(data),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['custom-metrics'] })
+      setIsMetricModalOpen(false)
+    },
+  })
+
+  // Update custom metric mutation
+  const updateMetricMutation = useMutation({
+    mutationFn: ({ id, data }: { id: string; data: CustomMetricUpdate }) =>
+      updateCustomMetric(id, data),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['custom-metrics'] })
+      setIsMetricModalOpen(false)
+      setEditingMetric(null)
+    },
+  })
+
+  // Delete custom metric mutation
+  const deleteMetricMutation = useMutation({
+    mutationFn: (id: string) => deleteCustomMetric(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['custom-metrics'] })
+    },
+  })
+
   // Modal handlers
   const handleCreateNewDimension = () => {
     setModalMode('create')
@@ -387,6 +532,33 @@ export function PivotConfigPanel({
 
   const handleDuplicateDimension = (id: string) => {
     duplicateMutation.mutate(id)
+  }
+
+  // Custom Metric Modal handlers
+  const handleCreateNewMetric = () => {
+    setMetricModalMode('create')
+    setEditingMetric(null)
+    setIsMetricModalOpen(true)
+  }
+
+  const handleEditMetric = (metric: CustomMetric) => {
+    setMetricModalMode('edit')
+    setEditingMetric(metric)
+    setIsMetricModalOpen(true)
+  }
+
+  const handleMetricModalSave = (data: CustomMetricCreate | { id: string; data: CustomMetricUpdate }) => {
+    if (metricModalMode === 'create') {
+      createMetricMutation.mutate(data as CustomMetricCreate)
+    } else {
+      updateMetricMutation.mutate(data as { id: string; data: CustomMetricUpdate })
+    }
+  }
+
+  const handleDeleteMetric = (id: string) => {
+    if (confirm('Are you sure you want to delete this custom metric?')) {
+      deleteMetricMutation.mutate(id)
+    }
   }
 
   // Filter handlers
@@ -474,9 +646,11 @@ export function PivotConfigPanel({
   }, [dateRangeInfo?.min_date, dateRangeInfo?.max_date, config.selectedTable, config.startDate, config.endDate])
 
   // Filter out metrics that are already selected
+  // Also filter out custom metrics from AVAILABLE_METRICS (they're shown separately)
   const selectedMetrics = config.selectedMetrics || []
+  const customMetricIds = new Set((customMetrics || []).map(cm => cm.metric_id))
   const availableMetricsToAdd = AVAILABLE_METRICS.filter(
-    (m) => !selectedMetrics.includes(m.id)
+    (m) => !selectedMetrics.includes(m.id) && !customMetricIds.has(m.id)
   )
 
   // Filter metrics by search term and sort alphabetically
@@ -1020,21 +1194,101 @@ export function PivotConfigPanel({
                 onChange={setMetricSearch}
               />
 
-              {availableMetricsToAdd.length === 0 ? (
+              {/* Create Custom Metric Button */}
+              <button
+                onClick={handleCreateNewMetric}
+                className="w-full p-2 bg-orange-50 border-2 border-dashed border-orange-300 rounded hover:bg-orange-100 transition-colors flex items-center justify-center gap-2 text-orange-600"
+              >
+                <Plus className="h-3 w-3" />
+                <span className="text-xs font-medium">Create Custom Metric</span>
+              </button>
+
+              {/* Custom Metrics */}
+              {customMetrics.length > 0 && (
+                <div className="space-y-2">
+                  <h6 className="text-xs font-medium text-gray-600">Custom Metrics (Re-aggregation)</h6>
+                  {customMetrics
+                    .filter((m) => {
+                      if (!metricSearch) return true
+                      const term = metricSearch.toLowerCase()
+                      return (
+                        m.name.toLowerCase().includes(term) ||
+                        m.metric_id.toLowerCase().includes(term) ||
+                        m.source_metric.toLowerCase().includes(term)
+                      )
+                    })
+                    .sort((a, b) => a.name.localeCompare(b.name))
+                    .map((metric) => {
+                      const isSelected = selectedMetrics.includes(metric.metric_id)
+                      return (
+                        <div
+                          key={metric.id}
+                          draggable={!isSelected}
+                          onDragStart={(e) => {
+                            if (!isSelected) {
+                              e.dataTransfer.setData('type', 'metric')
+                              e.dataTransfer.setData('id', metric.metric_id)
+                              e.dataTransfer.setData('label', metric.name)
+                            }
+                          }}
+                          className={`p-2 bg-orange-50 border-2 rounded group transition-colors ${
+                            isSelected
+                              ? 'border-gray-400 opacity-50 cursor-not-allowed'
+                              : 'border-orange-300 cursor-move hover:bg-orange-100'
+                          }`}
+                        >
+                          <div className="flex items-center gap-2">
+                            <GripVertical className="h-3 w-3 text-orange-600" />
+                            <div className="flex-1">
+                              <div className="text-xs font-medium text-gray-900">
+                                {metric.name}
+                              </div>
+                              <div className="text-xs text-orange-600">
+                                {metric.aggregation_type.toUpperCase()}({metric.source_metric}) • {isSelected ? 'In use' : 'Drag to table'}
+                              </div>
+                            </div>
+                            {!isSelected && (
+                              <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                                <button
+                                  onClick={() => handleEditMetric(metric)}
+                                  className="p-1 hover:bg-orange-200 rounded transition-colors"
+                                  title="Edit"
+                                >
+                                  <Edit className="h-3 w-3 text-orange-700" />
+                                </button>
+                                <button
+                                  onClick={() => handleDeleteMetric(metric.id)}
+                                  className="p-1 hover:bg-red-200 rounded transition-colors"
+                                  title="Delete"
+                                >
+                                  <Trash2 className="h-3 w-3 text-red-600" />
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      )
+                    })}
+                </div>
+              )}
+
+              {/* Built-in Metrics */}
+              {availableMetricsToAdd.length === 0 && customMetrics.length === 0 ? (
                 <div className="p-4 text-center bg-white border border-gray-200 rounded">
                   <p className="text-xs text-gray-500">All metrics added</p>
                   <p className="text-xs text-gray-400 mt-1">Remove metrics from table to add more</p>
                 </div>
-              ) : filteredMetrics.length === 0 ? (
+              ) : filteredMetrics.length === 0 && customMetrics.length === 0 ? (
                 <div className="p-4 text-center bg-white border border-gray-200 rounded">
                   <p className="text-xs text-gray-500">No metrics match your search</p>
                   <p className="text-xs text-gray-400 mt-1">Try a different search term</p>
                 </div>
-              ) : (
+              ) : filteredMetrics.length > 0 ? (
                 <>
+                  <h6 className="text-xs font-medium text-gray-600">Built-in Metrics</h6>
                   {Object.entries(metricsByCategory).map(([category, metrics]) => (
                     <div key={category}>
-                      <h6 className="text-xs font-medium text-gray-600 mb-1">
+                      <h6 className="text-xs font-medium text-gray-500 mb-1">
                         {category}
                       </h6>
                       <div className="space-y-1">
@@ -1050,7 +1304,7 @@ export function PivotConfigPanel({
                     </div>
                   ))}
                 </>
-              )}
+              ) : null}
             </div>
           )}
         </div>
@@ -1077,6 +1331,19 @@ export function PivotConfigPanel({
         onSave={handleModalSave}
         editingDimension={editingDimension}
         mode={modalMode}
+        tableId={config.selectedTable || undefined}
+      />
+
+      {/* Custom Metric Modal */}
+      <CustomMetricModal
+        isOpen={isMetricModalOpen}
+        onClose={() => {
+          setIsMetricModalOpen(false)
+          setEditingMetric(null)
+        }}
+        onSave={handleMetricModalSave}
+        editingMetric={editingMetric}
+        mode={metricModalMode}
         tableId={config.selectedTable || undefined}
       />
     </div>

@@ -264,6 +264,7 @@ export default function CustomDimensionModal({
       const createData: CustomDimensionCreate = {
         name: dimensionName.trim(),
         type: dimensionType,
+        table_id: tableId,
         ...(dimensionType === 'date_range' ? {
           values: values.map(v => ({
             label: v.label.trim(),

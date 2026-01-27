@@ -1,11 +1,18 @@
 'use client'
 
-import { useState, useEffect } from 'react'
-import { X, Filter, ChevronDown, Check } from 'lucide-react'
+import { useState, useEffect, useRef } from 'react'
+import { X, Filter, ChevronDown, Check, Search, Loader2 } from 'lucide-react'
 import { useSchema } from '@/hooks/use-schema'
 import { fetchDimensionValues } from '@/lib/api'
 import { DateRangeSelector } from '@/components/ui/date-range-selector'
 import type { DimensionDef, FilterParams, DateRangeType, RelativeDatePreset } from '@/lib/types'
+
+// Helper function to format dimension value markers for display
+function formatDimensionValue(value: string): string {
+  if (value === '__NULL__') return '(null)'
+  if (value === '') return '(empty)'
+  return value
+}
 
 interface PivotFilterPanelProps {
   filters: Record<string, string[]>
@@ -140,9 +147,24 @@ function DimensionFilter({
 }: DimensionFilterProps) {
   const [isOpen, setIsOpen] = useState(false)
   const [availableValues, setAvailableValues] = useState<string[]>([])
+  const [searchResults, setSearchResults] = useState<string[] | null>(null)
   const [isLoadingValues, setIsLoadingValues] = useState(false)
+  const [isSearching, setIsSearching] = useState(false)
+  const [searchTerm, setSearchTerm] = useState('')
+  const searchTimeoutRef = useRef<NodeJS.Timeout | null>(null)
 
-  // Load available values when dropdown opens
+  // Values to display: search results if searching, otherwise all available values
+  const displayedValues = searchResults !== null ? searchResults : availableValues
+
+  // Clear search when dropdown closes
+  useEffect(() => {
+    if (!isOpen) {
+      setSearchTerm('')
+      setSearchResults(null)
+    }
+  }, [isOpen])
+
+  // Load available values when dropdown opens (initial load)
   // Don't pass date filters - show ALL possible values regardless of current date range
   // This makes filters more user-friendly since users can see all available options
   useEffect(() => {
@@ -165,6 +187,47 @@ function DimensionFilter({
     }
   }, [isOpen, dimension.id, availableValues.length, currentFilters?.dimension_filters, tableId])
 
+  // Debounced search - fetch from API when search term changes
+  useEffect(() => {
+    // Clear any pending search
+    if (searchTimeoutRef.current) {
+      clearTimeout(searchTimeoutRef.current)
+    }
+
+    // If search is empty, clear search results and show all values
+    if (!searchTerm.trim()) {
+      setSearchResults(null)
+      setIsSearching(false)
+      return
+    }
+
+    // Debounce the search API call (300ms)
+    setIsSearching(true)
+    searchTimeoutRef.current = setTimeout(() => {
+      const filtersWithoutDates = {
+        dimension_filters: currentFilters?.dimension_filters || {}
+      }
+      fetchDimensionValues(dimension.id, filtersWithoutDates, tableId, undefined, searchTerm.trim())
+        .then(values => {
+          setSearchResults(values)
+        })
+        .catch(err => {
+          console.error(`Failed to search values for ${dimension.id}:`, err)
+          setSearchResults([])
+        })
+        .finally(() => {
+          setIsSearching(false)
+        })
+    }, 300)
+
+    // Cleanup
+    return () => {
+      if (searchTimeoutRef.current) {
+        clearTimeout(searchTimeoutRef.current)
+      }
+    }
+  }, [searchTerm, dimension.id, currentFilters?.dimension_filters, tableId])
+
   const toggleValue = (value: string) => {
     if (selectedValues.includes(value)) {
       onFilterChange(selectedValues.filter(v => v !== value))
@@ -174,7 +237,13 @@ function DimensionFilter({
   }
 
   const selectAll = () => {
-    onFilterChange(availableValues)
+    // When searching, only select displayed values (add to existing selection)
+    if (searchTerm.trim()) {
+      const newValues = [...new Set([...selectedValues, ...displayedValues])]
+      onFilterChange(newValues)
+    } else {
+      onFilterChange(availableValues)
+    }
   }
 
   const clearSelection = () => {
@@ -220,26 +289,56 @@ function DimensionFilter({
               </div>
             ) : (
               <>
-                {/* Select all / Clear all buttons */}
-                <div className="sticky top-0 bg-gray-50 border-b border-gray-200 px-3 py-2 flex gap-2">
-                  <button
-                    onClick={selectAll}
-                    className="text-xs text-blue-600 hover:text-blue-800"
-                  >
-                    Select all
-                  </button>
-                  <span className="text-gray-300">|</span>
-                  <button
-                    onClick={clearSelection}
-                    className="text-xs text-gray-600 hover:text-gray-800"
-                  >
-                    Clear
-                  </button>
+                {/* Search input and Select all / Clear all buttons */}
+                <div className="sticky top-0 bg-gray-50 border-b border-gray-200">
+                  {/* Search input */}
+                  <div className="px-3 py-2 border-b border-gray-200">
+                    <div className="relative">
+                      {isSearching ? (
+                        <Loader2 className="absolute left-2 top-1/2 -translate-y-1/2 h-4 w-4 text-blue-500 animate-spin" />
+                      ) : (
+                        <Search className="absolute left-2 top-1/2 -translate-y-1/2 h-4 w-4 text-gray-400" />
+                      )}
+                      <input
+                        type="text"
+                        placeholder="Search values..."
+                        value={searchTerm}
+                        onChange={(e) => setSearchTerm(e.target.value)}
+                        className="w-full pl-8 pr-3 py-1.5 text-sm border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500"
+                        onClick={(e) => e.stopPropagation()}
+                      />
+                    </div>
+                  </div>
+                  {/* Select all / Clear all buttons */}
+                  <div className="px-3 py-2 flex gap-2">
+                    <button
+                      onClick={selectAll}
+                      className="text-xs text-blue-600 hover:text-blue-800"
+                      disabled={isSearching}
+                    >
+                      Select all{searchTerm.trim() ? ' results' : ''}
+                    </button>
+                    <span className="text-gray-300">|</span>
+                    <button
+                      onClick={clearSelection}
+                      className="text-xs text-gray-600 hover:text-gray-800"
+                    >
+                      Clear
+                    </button>
+                    {searchTerm.trim() && !isSearching && (
+                      <>
+                        <span className="text-gray-300">|</span>
+                        <span className="text-xs text-gray-500">
+                          {displayedValues.length} result{displayedValues.length !== 1 ? 's' : ''}
+                        </span>
+                      </>
+                    )}
+                  </div>
                 </div>
 
                 {/* Value checkboxes */}
                 <div className="py-1">
-                  {availableValues.map(value => (
+                  {displayedValues.map(value => (
                     <label
                       key={value}
                       className="flex items-center gap-2 px-3 py-2 hover:bg-gray-50 cursor-pointer"
@@ -256,14 +355,16 @@ function DimensionFilter({
                         )}
                       </div>
                       <span className="text-sm text-gray-700 truncate flex-1">
-                        {value}
+                        {formatDimensionValue(value)}
                       </span>
                     </label>
                   ))}
 
-                  {availableValues.length === 0 && (
+                  {displayedValues.length === 0 && !isSearching && (
                     <div className="p-4 text-center text-sm text-gray-500">
-                      No values available
+                      {searchTerm.trim()
+                        ? `No values match "${searchTerm}"`
+                        : 'No values available'}
                     </div>
                   )}
                 </div>

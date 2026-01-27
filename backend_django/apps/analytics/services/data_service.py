@@ -14,6 +14,7 @@ import pandas as pd
 from apps.tables.models import BigQueryTable
 from .bigquery_service import BigQueryService
 from .query_router_service import QueryRouterService, RouteDecision
+from .post_processing_service import PostProcessingService
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +42,9 @@ class DataService:
         dimension_values: Optional[List[str]] = None,
         skip_count: bool = False,
         metrics: Optional[List[str]] = None,
-        require_rollup: bool = True
+        require_rollup: bool = True,
+        custom_dimension_id: Optional[str] = None,
+        custom_metric_ids: Optional[List[str]] = None
     ) -> Dict[str, Any]:
         """
         Get pivot table data grouped by dimensions.
@@ -55,6 +58,8 @@ class DataService:
             skip_count: If True, skip the count query
             metrics: Optional list of metric IDs to calculate
             require_rollup: If True, require rollup (error if not available)
+            custom_dimension_id: Optional ID of a custom dimension to apply bucketing
+            custom_metric_ids: Optional list of custom metric IDs to apply re-aggregation
 
         Returns:
             Dict with rows, total, available_dimensions matching frontend expectations
@@ -64,13 +69,29 @@ class DataService:
         metric_ids = metrics_data.get('all_metric_ids', [])
 
         # =================================================================
+        # EXTRACT CUSTOM DIMENSIONS: Parse custom_<uuid> from dimensions array
+        # =================================================================
+        # If custom_dimension_id not explicitly provided, extract from dimensions
+        if not custom_dimension_id:
+            custom_dims_in_request = [d for d in (dimensions or []) if d.startswith('custom_')]
+            if custom_dims_in_request:
+                # Extract UUID from first custom dimension (format: custom_<uuid>)
+                custom_dimension_id = custom_dims_in_request[0].replace('custom_', '', 1)
+                logger.info(f"Extracted custom dimension ID from dimensions: {custom_dimension_id}")
+
+        # =================================================================
         # ROLLUP ROUTING: Check if a suitable rollup exists for this query
         # =================================================================
+        # Filter out custom dimensions from routing - they are virtual/computed
+        # dimensions applied post-fetch and don't exist in rollups
+        routable_dimensions = [d for d in (dimensions or []) if not d.startswith('custom_')]
         filter_dims = list(filters.get('dimension_filters', {}).keys()) if filters.get('dimension_filters') else []
+        # Also filter custom dimensions from filter dims
+        routable_filter_dims = {k: v for k, v in (filters.get('dimension_filters') or {}).items() if not k.startswith('custom_')}
         route_decision = self.route_query(
-            dimensions=dimensions,
+            dimensions=routable_dimensions,
             metrics=metric_ids,
-            filters=filters.get('dimension_filters'),
+            filters=routable_filter_dims if routable_filter_dims else None,
             require_rollup=require_rollup
         )
 
@@ -81,16 +102,18 @@ class DataService:
 
         # If require_rollup and no rollup found, return error response
         if require_rollup and not route_decision.use_rollup:
-            all_required_dims = list(set((dimensions or []) + filter_dims))
+            # Use routable dimensions (excluding custom_*) for error message
+            routable_filter_dims_list = [k for k in filter_dims if not k.startswith('custom_')]
+            all_required_dims = list(set(routable_dimensions + routable_filter_dims_list))
 
             # Get available rollups sorted by closeness to the requested configuration
             available_rollups = []
             router = self._get_query_router()
             if router:
                 available_rollups = router.find_suitable_rollups(
-                    query_dimensions=dimensions or [],
+                    query_dimensions=routable_dimensions,
                     query_metrics=metric_ids,
-                    query_filters=filters.get('dimension_filters')
+                    query_filters=routable_filter_dims if routable_filter_dims else None
                 )
 
             return {
@@ -98,7 +121,7 @@ class DataService:
                 'total': None,
                 'available_dimensions': self._get_available_dimensions(),
                 'total_count': 0,
-                'error': f"No suitable rollup found. Query dimensions: {dimensions or []}, Filter dimensions: {filter_dims}. Reason: {route_decision.reason}. Create a rollup with dimensions {all_required_dims} to enable this query.",
+                'error': f"No suitable rollup found. Query dimensions: {routable_dimensions}, Filter dimensions: {routable_filter_dims_list}. Reason: {route_decision.reason}. Create a rollup with dimensions {all_required_dims} to enable this query.",
                 'error_type': 'rollup_required',
                 'required_dimensions': all_required_dims,
                 'available_rollups': available_rollups
@@ -107,31 +130,120 @@ class DataService:
         # Determine table path (use rollup if available, otherwise base table)
         table_path = route_decision.rollup_table_path if route_decision.use_rollup else None
 
-        # Query pivot data
+        # =================================================================
+        # CUSTOM DIMENSION HANDLING
+        # =================================================================
+        # Look up custom dimension info for BigQuery-based bucketing
+        custom_dimension_info = None
+        custom_dim_type = None
+        custom_dim_metric = None  # Track metric referenced by custom dimension
+        if custom_dimension_id:
+            schema_config = metrics_data.get('schema_config')
+            if schema_config:
+                try:
+                    from apps.schemas.models import CustomDimension
+                    custom_dim = schema_config.custom_dimensions.get(id=custom_dimension_id)
+                    custom_dim_type = custom_dim.dimension_type
+
+                    # For metric_condition type, prepare info for BigQuery SQL
+                    if custom_dim_type == 'metric_condition':
+                        custom_dim_metric = custom_dim.get_source_metric()
+                        custom_dimension_info = {
+                            'id': str(custom_dim.id),
+                            'metric': custom_dim_metric,
+                            'conditions': custom_dim.values_json or []
+                        }
+                        logger.info(f"Using BigQuery bucketing for custom dimension '{custom_dim.name}'")
+                except Exception as e:
+                    logger.error(f"Error loading custom dimension {custom_dimension_id}: {e}")
+
+        # =================================================================
+        # CUSTOM METRICS HANDLING
+        # =================================================================
+        # Load custom metrics info for BigQuery-based computation
+        # Include any custom metrics referenced by custom dimensions
+        custom_metrics_info = None
+        schema_config = metrics_data.get('schema_config')
+        if schema_config:
+            try:
+                from apps.schemas.models import CustomMetric
+
+                # Build list of custom metric IDs to compute
+                cm_ids_to_load = set(custom_metric_ids or [])
+
+                # If custom dimension references a custom metric, include it
+                if custom_dim_metric:
+                    # Check if it's a custom metric (not a base metric)
+                    cm_by_metric_id = schema_config.custom_metrics.filter(
+                        metric_id=custom_dim_metric
+                    ).first()
+                    if cm_by_metric_id:
+                        cm_ids_to_load.add(custom_dim_metric)
+                        logger.info(f"Auto-including custom metric '{custom_dim_metric}' for custom dimension")
+
+                # Load custom metrics
+                if cm_ids_to_load:
+                    custom_metrics = list(schema_config.custom_metrics.filter(
+                        metric_id__in=cm_ids_to_load
+                    ))
+                    if custom_metrics:
+                        custom_metrics_info = [
+                            {
+                                'metric_id': cm.metric_id,
+                                'source_metric': cm.source_metric,
+                                'aggregation_type': cm.aggregation_type
+                            }
+                            for cm in custom_metrics
+                        ]
+                        logger.info(f"Using BigQuery computation for custom metrics: {[cm.metric_id for cm in custom_metrics]}")
+            except Exception as e:
+                logger.error(f"Error loading custom metrics: {e}")
+
+        # Query pivot data - use routable_dimensions (excluding custom_*) for BigQuery
+        # metric_condition custom dimensions are handled in BigQuery SQL
+        # Custom metrics are computed in BigQuery as well
         df = self.bq_service.query_pivot_data(
-            dimensions=dimensions,
+            dimensions=routable_dimensions,
             filters=filters,
             limit=limit,
             offset=offset,
             metrics=metrics,
             table_path=table_path,
-            dimension_values=dimension_values
+            dimension_values=dimension_values,
+            custom_dimension=custom_dimension_info,
+            custom_metrics=custom_metrics_info
         )
+
+        # =================================================================
+        # POST-PROCESSING: Apply custom dimensions (date_range only)
+        # =================================================================
+        # Skip post-processing for metric_condition (already handled in BigQuery)
+        # Custom metrics are now computed in BigQuery, no post-processing needed
+        custom_dim_col = f"custom_{custom_dimension_id}" if custom_dimension_id else None
+        if custom_dimension_id and custom_dim_type != 'metric_condition':
+            # Only do post-processing for non-metric_condition types (date_range, metric_bucket)
+            df, custom_dim_col = self._apply_post_processing(
+                df=df,
+                metrics_data=metrics_data,
+                dimensions=dimensions,
+                custom_dimension_id=custom_dimension_id,
+                custom_metric_ids=None  # Custom metrics handled by BigQuery
+            )
 
         # Compute calculated metrics (conversion rates, etc.) from volume metrics
         df = self._compute_calculated_metrics(df, metrics_data)
 
-        # Calculate grand totals for percentage calculations
+        # Calculate grand totals for percentage calculations (includes ALL rows, even NULL dimensions)
         grand_totals = self._calculate_totals(df, metrics_data)
 
-        # Build response rows
+        # Build response rows (include all rows, NULL/empty dimensions displayed as "(null)"/"(empty)")
         rows = []
         for idx, row in df.iterrows():
-            row_data = self._build_pivot_row(row, dimensions, metrics_data, grand_totals)
+            row_data = self._build_pivot_row(row, dimensions, metrics_data, grand_totals, custom_metric_ids)
             rows.append(row_data)
 
-        # Build the total row (aggregated totals for footer)
-        total_row = self._build_total_row(df, dimensions, metrics_data)
+        # Build the total row (aggregated totals for footer - includes all data)
+        total_row = self._build_total_row(df, dimensions, metrics_data, custom_metric_ids)
 
         # Get total count (unless skipped) - use same table as main query
         total_count = len(df) if skip_count else self._get_total_count(dimensions, filters, table_path)
@@ -152,7 +264,8 @@ class DataService:
         filters: Dict,
         limit: int = 1000,
         require_rollup: bool = True,
-        pivot_dimensions: Optional[List[str]] = None
+        pivot_dimensions: Optional[List[str]] = None,
+        search: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Get distinct values for a dimension.
@@ -164,10 +277,16 @@ class DataService:
             require_rollup: If True, require rollup (error if not available).
                            Defaults to True - always use rollups.
             pivot_dimensions: List of dimensions in current pivot context
+            search: Optional search string to filter values (case-insensitive)
 
         Returns:
             Dict with 'values' key containing list of strings, or 'error' key if rollup not found
         """
+        # Check if this is a joined dimension - if so, query the lookup table directly
+        joined_dim_info = self._get_joined_dimension_info(dimension)
+        if joined_dim_info:
+            return self._get_joined_dimension_values(joined_dim_info, limit, search)
+
         # Build the full list of dimensions needed for routing:
         # - The dimension we're querying for distinct values
         # - Plus any pivot context dimensions (e.g., if pivot has "query" as row dimension)
@@ -219,10 +338,93 @@ class DataService:
             dimension=dimension,
             filters=filters,
             limit=limit,
-            table_path=table_path
+            table_path=table_path,
+            search=search
         )
 
         return {'values': values}
+
+    def _get_joined_dimension_info(self, dimension_id: str) -> Optional[Dict]:
+        """Check if a dimension is a joined dimension and return its info."""
+        try:
+            from apps.schemas.models import SchemaConfig, JoinedDimensionStatus
+
+            schema_config = SchemaConfig.objects.filter(
+                bigquery_table=self.bigquery_table
+            ).first()
+
+            if not schema_config:
+                return None
+
+            # Search for this dimension in joined dimension sources
+            for source in schema_config.joined_dimension_sources.filter(
+                status=JoinedDimensionStatus.READY
+            ).prefetch_related('columns'):
+                for col in source.columns.all():
+                    if col.dimension_id == dimension_id:
+                        return {
+                            'column': col,
+                            'source': source,
+                            'lookup_table_path': source.bq_table_path,
+                            'source_column_name': col.source_column_name
+                        }
+
+            return None
+        except Exception as e:
+            logger.warning(f"Error checking for joined dimension: {e}")
+            return None
+
+    def _get_joined_dimension_values(
+        self, joined_info: Dict, limit: int = 1000, search: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Get distinct values for a joined dimension from its lookup table.
+
+        Args:
+            joined_info: Dict with column, source, lookup_table_path, source_column_name
+            limit: Max values to return
+            search: Optional search string to filter values (case-insensitive LIKE)
+        """
+        try:
+            lookup_table = joined_info['lookup_table_path']
+            column_name = joined_info['source_column_name']
+
+            # Build WHERE clause
+            where_clauses = [f"{column_name} IS NOT NULL"]
+
+            # Add search filter if provided
+            if search and search.strip():
+                # Escape special characters in search string
+                escaped_search = search.replace("'", "''").replace("\\", "\\\\")
+                # Use LOWER for case-insensitive search
+                where_clauses.append(
+                    f"LOWER(CAST({column_name} AS STRING)) LIKE LOWER('%{escaped_search}%')"
+                )
+
+            where_clause = " AND ".join(where_clauses)
+
+            query = f"""
+                SELECT DISTINCT {column_name} as value
+                FROM `{lookup_table}`
+                WHERE {where_clause}
+                ORDER BY value
+                LIMIT {limit}
+            """
+
+            df = self.bq_service.execute_query(
+                query=query,
+                query_type='joined_dimension_values',
+                endpoint=f'/api/pivot/dimension/{joined_info["column"].dimension_id}/values',
+                filters={}
+            )
+
+            values = df['value'].tolist() if not df.empty else []
+            return {'values': [str(v) for v in values]}
+        except Exception as e:
+            logger.error(f"Error fetching joined dimension values: {e}")
+            return {
+                'values': [],
+                'error': f"Failed to fetch joined dimension values: {str(e)}"
+            }
 
     def _get_metrics_config(self) -> Dict[str, Any]:
         """Load metrics configuration from schema."""
@@ -247,6 +449,104 @@ class DataService:
             logger.warning(f"Could not load metrics config: {e}")
             return {'calculated_metrics': [], 'all_metric_ids': []}
 
+    def _calculate_num_days(self, filters: Dict[str, Any]) -> int:
+        """
+        Calculate the number of days in the date range.
+
+        Args:
+            filters: Filter parameters with start_date and end_date
+
+        Returns:
+            Number of days in the range (inclusive), minimum 1
+        """
+        from datetime import datetime
+
+        start_date = filters.get('start_date')
+        end_date = filters.get('end_date')
+
+        if not start_date or not end_date:
+            return 1
+
+        try:
+            start = datetime.strptime(start_date, '%Y-%m-%d')
+            end = datetime.strptime(end_date, '%Y-%m-%d')
+            num_days = (end - start).days + 1  # +1 for inclusive
+            return max(1, num_days)
+        except (ValueError, TypeError):
+            return 1
+
+    def _apply_post_processing(
+        self,
+        df: pd.DataFrame,
+        metrics_data: Dict[str, Any],
+        dimensions: List[str],
+        custom_dimension_id: Optional[str] = None,
+        custom_metric_ids: Optional[List[str]] = None,
+        num_days: int = 1
+    ) -> Tuple[pd.DataFrame, Optional[str]]:
+        """
+        Apply custom dimensions and metrics as post-processing transformations.
+
+        Args:
+            df: Input DataFrame from BigQuery
+            metrics_data: Metrics configuration dict
+            dimensions: Current query dimensions
+            custom_dimension_id: ID of custom dimension to apply (for bucketing)
+            custom_metric_ids: List of custom metric IDs to apply (for re-aggregation)
+            num_days: Number of days in the date range (for avg_per_day calculation)
+
+        Returns:
+            Tuple of (transformed DataFrame, custom dimension column name if grouped)
+        """
+        schema_config = metrics_data.get('schema_config')
+        if not schema_config:
+            logger.warning("No schema config found for post-processing")
+            return df, None
+
+        post_processor = PostProcessingService()
+        custom_dim_col = None
+
+        # Apply custom dimensions (bucketing)
+        if custom_dimension_id:
+            from apps.schemas.models import CustomDimension
+            try:
+                custom_dims = list(schema_config.custom_dimensions.filter(
+                    id=custom_dimension_id
+                ))
+                if custom_dims:
+                    df, custom_dim_col = post_processor.apply_custom_dimensions(
+                        df=df,
+                        custom_dimensions=custom_dims,
+                        group_by_custom_id=custom_dimension_id,
+                        existing_dimensions=dimensions
+                    )
+                    logger.info(
+                        f"Applied custom dimension {custom_dimension_id}, "
+                        f"result col: {custom_dim_col}"
+                    )
+            except Exception as e:
+                logger.error(f"Error applying custom dimension: {e}")
+
+        # Apply custom metrics (re-aggregation)
+        if custom_metric_ids:
+            from apps.schemas.models import CustomMetric
+            try:
+                custom_metrics = list(schema_config.custom_metrics.filter(
+                    metric_id__in=custom_metric_ids
+                ))
+                if custom_metrics:
+                    df = post_processor.apply_custom_metrics(
+                        df=df,
+                        custom_metrics=custom_metrics,
+                        current_dimensions=dimensions,
+                        num_days=num_days
+                    )
+                    logger.info(f"Applied custom metrics: {custom_metric_ids} (num_days={num_days})")
+            except Exception as e:
+                logger.error(f"Error applying custom metrics: {e}")
+
+        return df, custom_dim_col
+
     def _calculate_totals(
         self,
         df: pd.DataFrame,
@@ -266,20 +566,25 @@ class DataService:
         row: pd.Series,
         dimensions: List[str],
         metrics_data: Dict[str, Any],
-        totals: Dict[str, float]
+        totals: Dict[str, float],
+        custom_metric_ids: Optional[List[str]] = None
     ) -> Dict[str, Any]:
         """Build a pivot row response dict matching frontend PivotRow interface."""
         # Create combined dimension value string (e.g., "Channel A - Country B")
+        # Keep raw values: NULL becomes "__NULL__" (converted to IS NULL in queries),
+        # empty strings stay as '' (matches directly in queries)
         dim_parts = []
         for dim in dimensions:
             if dim in row.index:
                 val = row[dim]
-                if pd.notna(val):
-                    dim_parts.append(str(val))
+                if pd.isna(val):
+                    dim_parts.append("__NULL__")
+                else:
+                    dim_parts.append(str(val))  # Empty strings stay as ''
         dimension_value = " - ".join(dim_parts) if dim_parts else "All"
 
-        # Extract metrics
-        metrics = self._extract_metrics(row, metrics_data, totals)
+        # Extract metrics (including custom metrics if provided)
+        metrics = self._extract_metrics(row, metrics_data, totals, custom_metric_ids)
 
         # Calculate percentage of total based on first volume metric
         percentage_of_total = 0.0
@@ -300,7 +605,8 @@ class DataService:
         self,
         df: pd.DataFrame,
         dimensions: List[str],
-        metrics_data: Dict[str, Any]
+        metrics_data: Dict[str, Any],
+        custom_metric_ids: Optional[List[str]] = None
     ) -> Dict[str, Any]:
         """Build the total row with aggregated metrics for footer."""
         if df.empty:
@@ -312,13 +618,18 @@ class DataService:
                 'has_children': False,
             }
 
+        # Build list of all metric IDs (schema metrics + custom metrics)
+        all_metric_ids = list(metrics_data.get('all_metric_ids', []))
+        if custom_metric_ids:
+            all_metric_ids.extend(custom_metric_ids)
+
         # Calculate totals by summing all rows
         total_metrics = {}
-        for metric_id in metrics_data.get('all_metric_ids', []):
+        for metric_id in all_metric_ids:
             if metric_id in df.columns:
                 total_metrics[metric_id] = safe_float(df[metric_id].sum())
 
-        # Add percentage metrics (all should be 100% for the total row)
+        # Add percentage metrics (all should be 100% for the total row) - only for schema metrics
         for metric_id in metrics_data.get('all_metric_ids', []):
             if metric_id in total_metrics:
                 pct_key = f"{metric_id}_pct"
@@ -335,7 +646,7 @@ class DataService:
     def _get_available_dimensions(self) -> List[str]:
         """Get list of available dimension IDs from schema."""
         try:
-            from apps.schemas.models import SchemaConfig
+            from apps.schemas.models import SchemaConfig, JoinedDimensionStatus
 
             schema_config = SchemaConfig.objects.filter(
                 bigquery_table=self.bigquery_table
@@ -344,7 +655,15 @@ class DataService:
             if not schema_config:
                 return []
 
-            return [d.dimension_id for d in schema_config.dimensions.filter(is_groupable=True)]
+            # Get regular dimensions
+            dims = [d.dimension_id for d in schema_config.dimensions.filter(is_groupable=True)]
+
+            # Get joined dimensions from ready sources
+            for source in schema_config.joined_dimension_sources.filter(status=JoinedDimensionStatus.READY):
+                for col in source.columns.filter(is_groupable=True):
+                    dims.append(col.dimension_id)
+
+            return dims
         except Exception as e:
             logger.warning(f"Could not get available dimensions: {e}")
             return []
@@ -353,13 +672,19 @@ class DataService:
         self,
         row: pd.Series,
         metrics_data: Dict[str, Any],
-        totals: Dict[str, float]
+        totals: Dict[str, float],
+        custom_metric_ids: Optional[List[str]] = None
     ) -> Dict[str, Any]:
         """Extract metric values from a row."""
         metrics = {}
 
+        # Build list of all metric IDs to extract (schema metrics + custom metrics)
+        all_metric_ids = list(metrics_data.get('all_metric_ids', []))
+        if custom_metric_ids:
+            all_metric_ids.extend(custom_metric_ids)
+
         # Extract all metric values
-        for metric_id in metrics_data.get('all_metric_ids', []):
+        for metric_id in all_metric_ids:
             if metric_id in row.index:
                 value = row[metric_id]
                 if pd.isna(value):
@@ -369,7 +694,7 @@ class DataService:
                 else:
                     metrics[metric_id] = safe_float(value)
 
-        # Add percentage metrics
+        # Add percentage metrics (only for schema metrics, not custom)
         for metric_id in metrics_data.get('all_metric_ids', []):
             if metric_id in metrics:
                 pct_key = f"{metric_id}_pct"

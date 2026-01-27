@@ -38,6 +38,7 @@ urlpatterns = [
     path('api/significance/', include('apps.analytics.significance_urls')),
     path('api/cache/', include('apps.analytics.cache_urls')),
     path('api/custom-dimensions/', include('apps.schemas.custom_dimension_urls')),
+    path('api/custom-metrics/', include('apps.schemas.custom_metric_urls')),
 ]
 
 # Serve static files in development mode

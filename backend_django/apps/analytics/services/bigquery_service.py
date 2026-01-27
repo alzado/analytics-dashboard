@@ -229,45 +229,44 @@ class BigQueryService:
                 if not values:
                     continue
 
-                # Handle special __NULL__ marker
+                # Handle special __NULL__ and __EMPTY__ markers
                 null_marker = "__NULL__"
+                empty_marker = "__EMPTY__"
                 has_null = null_marker in values
-                non_null_values = [v for v in values if v != null_marker]
+                has_empty = empty_marker in values
+                non_special_values = [v for v in values if v not in (null_marker, empty_marker)]
 
                 filter_parts = []
 
                 # Determine data type from schema (default to STRING)
-                data_type = "STRING"
-                if self.schema_config:
-                    try:
-                        dim = self.schema_config.dimensions.get(dimension_id=dim_id)
-                        data_type = dim.data_type
-                    except Exception:
-                        pass  # Use default STRING type
+                data_type = self._get_dimension_data_type(dim_id)
 
                 # Numeric types don't need quotes
                 is_numeric = data_type in ("INTEGER", "INT64", "FLOAT", "FLOAT64", "NUMERIC", "BIGNUMERIC", "BOOLEAN", "BOOL")
 
-                if non_null_values:
+                if non_special_values:
                     if is_numeric:
                         # For numeric types, don't quote values
-                        if len(non_null_values) == 1:
-                            filter_parts.append(f"{dim_id} = {non_null_values[0]}")
+                        if len(non_special_values) == 1:
+                            filter_parts.append(f"{dim_id} = {non_special_values[0]}")
                         else:
-                            values_str = ", ".join(non_null_values)
+                            values_str = ", ".join(non_special_values)
                             filter_parts.append(f"{dim_id} IN ({values_str})")
                     else:
                         # For string types, quote values
-                        if len(non_null_values) == 1:
-                            escaped_value = non_null_values[0].replace("'", "''")
+                        if len(non_special_values) == 1:
+                            escaped_value = non_special_values[0].replace("'", "''")
                             filter_parts.append(f"{dim_id} = '{escaped_value}'")
                         else:
-                            escaped_values = [v.replace("'", "''") for v in non_null_values]
+                            escaped_values = [v.replace("'", "''") for v in non_special_values]
                             values_str = "', '".join(escaped_values)
                             filter_parts.append(f"{dim_id} IN ('{values_str}')")
 
                 if has_null:
                     filter_parts.append(f"{dim_id} IS NULL")
+
+                if has_empty:
+                    filter_parts.append(f"{dim_id} = ''")
 
                 if filter_parts:
                     if len(filter_parts) == 1:
@@ -278,6 +277,36 @@ class BigQueryService:
         if conditions:
             return "WHERE " + " AND ".join(conditions)
         return ""
+
+    def _get_dimension_data_type(self, dim_id: str) -> str:
+        """Get the data type for a dimension, including joined dimensions."""
+        if not self.schema_config:
+            logger.warning(f"_get_dimension_data_type: no schema_config for dim_id={dim_id}")
+            return "STRING"
+
+        # First check regular dimensions
+        try:
+            dim = self.schema_config.dimensions.get(dimension_id=dim_id)
+            logger.debug(f"_get_dimension_data_type: found regular dim {dim_id} -> {dim.data_type}")
+            return dim.data_type
+        except Exception:
+            pass
+
+        # Check joined dimensions
+        try:
+            from apps.schemas.models import JoinedDimensionStatus
+            for source in self.schema_config.joined_dimension_sources.filter(
+                status=JoinedDimensionStatus.READY
+            ).prefetch_related('columns'):
+                for col in source.columns.all():
+                    if col.dimension_id == dim_id:
+                        logger.info(f"_get_dimension_data_type: found joined dim {dim_id} -> {col.data_type}")
+                        return col.data_type
+        except Exception as e:
+            logger.error(f"_get_dimension_data_type: error checking joined dims: {e}")
+
+        logger.warning(f"_get_dimension_data_type: dim_id={dim_id} not found, defaulting to STRING")
+        return "STRING"
 
     def _resolve_relative_dates(
         self,
@@ -427,7 +456,9 @@ class BigQueryService:
         offset: int = 0,
         metrics: Optional[List[str]] = None,
         table_path: Optional[str] = None,
-        dimension_values: Optional[List[str]] = None
+        dimension_values: Optional[List[str]] = None,
+        custom_dimension: Optional[Dict] = None,
+        custom_metrics: Optional[List[Dict]] = None
     ) -> pd.DataFrame:
         """
         Query pivot table data grouped by dimensions.
@@ -441,6 +472,10 @@ class BigQueryService:
             table_path: Override table path (for rollup queries). Defaults to base table.
             dimension_values: Specific dimension values to fetch (for multi-table matching).
                              When provided, returns only rows matching these values without LIMIT/OFFSET.
+            custom_dimension: Optional dict with custom dimension info for metric_condition bucketing.
+                             Format: {'id': uuid, 'metric': 'queries', 'conditions': [...]}
+            custom_metrics: Optional list of custom metric dicts to compute in BigQuery.
+                           Format: [{'metric_id': 'test', 'source_metric': 'queries', 'aggregation_type': 'avg_per_day'}]
 
         Returns:
             DataFrame with aggregated data
@@ -466,11 +501,41 @@ class BigQueryService:
         else:
             metric_select = self._build_metric_select_clause()
 
+        # Build custom metrics SELECT expressions (e.g., avg_per_day)
+        custom_metric_select = ""
+        if custom_metrics:
+            custom_metric_exprs = self._build_custom_metrics_select(
+                custom_metrics,
+                filters.get('start_date'),
+                filters.get('end_date'),
+                is_rollup_query
+            )
+            if custom_metric_exprs:
+                custom_metric_select = custom_metric_exprs
+
+        # Build custom dimension CASE WHEN expression (for metric_condition bucketing in SQL)
+        custom_dim_select = ""
+        custom_dim_alias = ""
+        if custom_dimension:
+            # Use backticks for alias since UUID contains dashes
+            custom_dim_alias = f"`custom_{custom_dimension['id']}`"
+            custom_dim_select = self._build_custom_dimension_case_when(
+                custom_dimension,
+                is_rollup_query
+            )
+            if custom_dim_select:
+                custom_dim_select = f"{custom_dim_select} AS {custom_dim_alias},"
+
         # Build GROUP BY
-        if dimensions:
-            dim_columns = ", ".join(dimensions)
+        if dimensions or custom_dim_alias:
+            dim_parts = list(dimensions) if dimensions else []
+            if custom_dim_alias:
+                dim_parts.append(custom_dim_alias)
+            dim_columns = ", ".join(dim_parts)
             group_by = f"GROUP BY {dim_columns}"
-            select_dims = f"{dim_columns},"
+            # For SELECT, use the actual column names (not the CASE WHEN for custom dim)
+            select_dim_parts = list(dimensions) if dimensions else []
+            select_dims = ", ".join(select_dim_parts) + "," if select_dim_parts else ""
         else:
             dim_columns = ""
             group_by = ""
@@ -516,14 +581,8 @@ class BigQueryService:
 
                 filter_parts = []
 
-                # Determine data type from schema (default to STRING)
-                data_type = "STRING"
-                if self.schema_config:
-                    try:
-                        dim = self.schema_config.dimensions.get(dimension_id=dim_col)
-                        data_type = dim.data_type
-                    except Exception:
-                        pass  # Use default STRING type
+                # Determine data type from schema (including joined dimensions)
+                data_type = self._get_dimension_data_type(dim_col)
 
                 # Numeric types don't need quotes
                 is_numeric = data_type in ("INTEGER", "INT64", "FLOAT", "FLOAT64", "NUMERIC", "BIGNUMERIC", "BOOLEAN", "BOOL")
@@ -551,8 +610,55 @@ class BigQueryService:
                     else:
                         dimension_values_filter = f"{connector} ({' OR '.join(filter_parts)})"
 
-        # Build query - different structure depending on whether dimension_values is provided
-        if dimension_values and len(dimension_values) > 0:
+        # Build query - different structure depending on custom dimension and dimension_values
+        if custom_dimension and custom_dim_select:
+            # Custom dimension requires subquery: first aggregate by base dimensions,
+            # then apply bucket CASE WHEN, then re-aggregate by bucket only
+            # Use use_aggregation=False since the subquery already aggregates the metrics
+            case_when_expr = self._build_custom_dimension_case_when(
+                custom_dimension, is_rollup_query, use_aggregation=False
+            )
+            inner_group_by = f"GROUP BY {', '.join(dimensions)}" if dimensions else ""
+
+            # Build inner SELECT with base dimensions
+            inner_select_dims = ", ".join(dimensions) + "," if dimensions else ""
+
+            # Outer query re-aggregates by the bucket label only
+            outer_metric_select = ", ".join([f"SUM({m.metric_id}) as {m.metric_id}"
+                for m in self.schema_config.calculated_metrics.filter(category='volume')]) if self.schema_config else metric_select
+
+            # Build outer SELECT for custom metrics (re-aggregate computed values)
+            outer_custom_metric_select = ""
+            if custom_metrics:
+                outer_cm_exprs = []
+                for cm in custom_metrics:
+                    metric_id = cm.get('metric_id')
+                    if metric_id:
+                        outer_cm_exprs.append(f"SUM({metric_id}) as {metric_id}")
+                if outer_cm_exprs:
+                    outer_custom_metric_select = ", " + ", ".join(outer_cm_exprs)
+
+            query = f"""
+                SELECT
+                    {case_when_expr} AS {custom_dim_alias},
+                    {outer_metric_select}
+                    {outer_custom_metric_select}
+                FROM (
+                    SELECT
+                        {inner_select_dims}
+                        {metric_select}
+                        {custom_metric_select}
+                    FROM `{query_table}`
+                    {where_clause}
+                    {inner_group_by}
+                ) sub
+                GROUP BY {custom_dim_alias}
+                {order_by}
+                LIMIT {limit}
+                OFFSET {offset}
+            """
+            logger.info(f"Custom dimension query SQL:\n{query}")
+        elif dimension_values and len(dimension_values) > 0:
             # When filtering by specific values, don't use LIMIT/OFFSET
             # Sort by dimension value for consistent ordering across columns
             # Only add ORDER BY if we have dimensions to sort by
@@ -561,6 +667,7 @@ class BigQueryService:
                 SELECT
                     {select_dims}
                     {metric_select}
+                    {custom_metric_select}
                 FROM `{query_table}`
                 {where_clause}
                 {dimension_values_filter}
@@ -573,6 +680,7 @@ class BigQueryService:
                 SELECT
                     {select_dims}
                     {metric_select}
+                    {custom_metric_select}
                 FROM `{query_table}`
                 {where_clause}
                 {group_by}
@@ -587,6 +695,175 @@ class BigQueryService:
             endpoint='/api/pivot',
             filters=filters
         )
+
+    def _build_custom_metrics_select(
+        self,
+        custom_metrics: List[Dict],
+        start_date: Optional[str],
+        end_date: Optional[str],
+        is_rollup_query: bool
+    ) -> str:
+        """
+        Build SELECT expressions for custom metrics to be computed in BigQuery.
+
+        Args:
+            custom_metrics: List of custom metric dicts with keys:
+                - metric_id: The output column name
+                - source_metric: The base metric to aggregate
+                - aggregation_type: sum, avg, avg_per_day, max, min, count
+            start_date: Start date for calculating num_days (for avg_per_day)
+            end_date: End date for calculating num_days (for avg_per_day)
+            is_rollup_query: Whether querying a rollup table
+
+        Returns:
+            SQL SELECT expressions for custom metrics, comma-separated
+        """
+        if not custom_metrics:
+            return ""
+
+        # Calculate num_days for avg_per_day metrics
+        num_days = 1
+        if start_date and end_date:
+            try:
+                from datetime import datetime
+                start = datetime.strptime(start_date, '%Y-%m-%d')
+                end = datetime.strptime(end_date, '%Y-%m-%d')
+                num_days = max(1, (end - start).days + 1)
+            except (ValueError, TypeError):
+                num_days = 1
+
+        expressions = []
+        for cm in custom_metrics:
+            metric_id = cm.get('metric_id')
+            source_metric = cm.get('source_metric')
+            agg_type = cm.get('aggregation_type', 'sum')
+
+            if not metric_id or not source_metric:
+                continue
+
+            # Get the source metric expression
+            # For rollup queries: use SUM(source_metric) since rollup has pre-computed columns
+            # For non-rollup queries: need to use the actual SQL expression
+            if is_rollup_query:
+                source_expr = f"SUM({source_metric})"
+            else:
+                # Look up the SQL expression for the source metric from schema
+                source_expr = None
+                if self.schema_config:
+                    try:
+                        calc_metric = self.schema_config.calculated_metrics.get(metric_id=source_metric)
+                        # Wrap the SQL expression in parentheses for safety
+                        source_expr = f"({calc_metric.sql_expression})"
+                    except Exception:
+                        pass
+                # Fallback to SUM if not found (might be a base column)
+                if not source_expr:
+                    source_expr = f"SUM({source_metric})"
+
+            # Build the custom metric expression
+            if agg_type == 'sum':
+                expr = f"{source_expr} as {metric_id}"
+            elif agg_type == 'avg':
+                # For avg, we'd need COUNT which is more complex, use SUM for now
+                expr = f"{source_expr} as {metric_id}"
+            elif agg_type == 'avg_per_day':
+                # Divide by number of days in the date range
+                expr = f"({source_expr}) / {num_days} as {metric_id}"
+            elif agg_type == 'max':
+                # MAX doesn't make sense for aggregated expressions, fallback to value
+                expr = f"{source_expr} as {metric_id}"
+            elif agg_type == 'min':
+                # MIN doesn't make sense for aggregated expressions, fallback to value
+                expr = f"{source_expr} as {metric_id}"
+            elif agg_type == 'count':
+                # COUNT doesn't make sense here, fallback
+                expr = f"{source_expr} as {metric_id}"
+            else:
+                expr = f"{source_expr} as {metric_id}"
+
+            expressions.append(expr)
+
+        return ", " + ", ".join(expressions) if expressions else ""
+
+    def _build_custom_dimension_case_when(
+        self,
+        custom_dimension: Dict,
+        is_rollup_query: bool,
+        use_aggregation: bool = True
+    ) -> str:
+        """
+        Build a CASE WHEN expression for custom dimension bucketing in SQL.
+
+        Args:
+            custom_dimension: Dict with 'id', 'metric', 'conditions' (list of condition sets)
+            is_rollup_query: Whether this is a rollup query (affects metric reference)
+            use_aggregation: Whether to wrap metric in SUM(). Set to False when
+                            referencing already-aggregated columns from a subquery.
+
+        Returns:
+            CASE WHEN expression string, or empty string if invalid
+        """
+        metric = custom_dimension.get('metric')
+        conditions = custom_dimension.get('conditions', [])
+
+        if not metric or not conditions:
+            return ""
+
+        # Determine metric expression based on context
+        if use_aggregation:
+            # Use SUM when we're aggregating (direct GROUP BY query)
+            metric_expr = f"SUM({metric})"
+        else:
+            # Reference the raw column (already aggregated in subquery)
+            metric_expr = metric
+
+        case_parts = []
+        for condition_set in conditions:
+            label = condition_set.get('label', 'Unknown')
+            conds = condition_set.get('conditions', [])
+
+            if not conds:
+                continue
+
+            # Build the WHEN clause
+            when_parts = []
+            for cond in conds:
+                operator = cond.get('operator', '>')
+                value = cond.get('value')
+                value_max = cond.get('value_max')
+
+                if value is None and operator not in ('is_null', 'is_not_null'):
+                    continue
+
+                if operator == '>':
+                    when_parts.append(f"{metric_expr} > {value}")
+                elif operator == '>=':
+                    when_parts.append(f"{metric_expr} >= {value}")
+                elif operator == '<':
+                    when_parts.append(f"{metric_expr} < {value}")
+                elif operator == '<=':
+                    when_parts.append(f"{metric_expr} <= {value}")
+                elif operator == '=':
+                    when_parts.append(f"{metric_expr} = {value}")
+                elif operator in ('!=', '<>'):
+                    when_parts.append(f"{metric_expr} != {value}")
+                elif operator == 'between' and value_max is not None:
+                    when_parts.append(f"{metric_expr} BETWEEN {value} AND {value_max}")
+                elif operator == 'is_null':
+                    when_parts.append(f"{metric_expr} IS NULL")
+                elif operator == 'is_not_null':
+                    when_parts.append(f"{metric_expr} IS NOT NULL")
+
+            if when_parts:
+                when_clause = " AND ".join(when_parts)
+                # Escape single quotes in label
+                safe_label = label.replace("'", "''")
+                case_parts.append(f"WHEN {when_clause} THEN '{safe_label}'")
+
+        if not case_parts:
+            return ""
+
+        return f"CASE {' '.join(case_parts)} ELSE 'Other' END"
 
     def _build_rollup_metric_select_clause(self) -> str:
         """
@@ -618,7 +895,8 @@ class BigQueryService:
         filters: Dict,
         limit: int = 1000,
         table_path: Optional[str] = None,
-        sort_by_metric: Optional[str] = None
+        sort_by_metric: Optional[str] = None,
+        search: Optional[str] = None
     ) -> List[str]:
         """
         Get distinct values for a dimension.
@@ -630,6 +908,7 @@ class BigQueryService:
             table_path: Optional table path override (for rollup tables)
             sort_by_metric: Optional metric to sort by (descending). If not provided,
                            uses schema's primary_sort_metric if available.
+            search: Optional search string to filter values (case-insensitive LIKE)
 
         Returns:
             List of distinct values, sorted by metric if available
@@ -645,8 +924,14 @@ class BigQueryService:
             relative_date_preset=filters.get('relative_date_preset')
         )
 
-        # Build NOT NULL condition - use WHERE if no other filters, AND otherwise
-        not_null_clause = f"WHERE {dimension} IS NOT NULL" if not where_clause else f"AND {dimension} IS NOT NULL"
+        # Add search filter if provided
+        search_clause = ""
+        if search and search.strip():
+            # Escape special characters in search string
+            escaped_search = search.replace("'", "''").replace("\\", "\\\\")
+            # Use LOWER for case-insensitive search
+            search_connector = "AND" if where_clause else "WHERE"
+            search_clause = f" {search_connector} LOWER(CAST({dimension} AS STRING)) LIKE LOWER('%{escaped_search}%')"
 
         # Determine sort metric: use provided, or fall back to schema's primary_sort_metric
         # Note: Metric sorting only works on rollup tables which have pre-aggregated metrics
@@ -658,13 +943,13 @@ class BigQueryService:
                 effective_sort_metric = self.schema_config.primary_sort_metric
 
         # Build query - with or without metric sorting
+        # Note: We include NULL and empty values (removed IS NOT NULL filter)
         if effective_sort_metric and is_rollup_query:
             # Sort by metric (descending) - shows highest-volume values first
             query = f"""
                 SELECT {dimension} as value, SUM({effective_sort_metric}) as sort_metric
                 FROM `{query_table}`
-                {where_clause}
-                {not_null_clause}
+                {where_clause}{search_clause}
                 GROUP BY {dimension}
                 ORDER BY sort_metric DESC
                 LIMIT {limit}
@@ -674,8 +959,7 @@ class BigQueryService:
             query = f"""
                 SELECT DISTINCT {dimension} as value
                 FROM `{query_table}`
-                {where_clause}
-                {not_null_clause}
+                {where_clause}{search_clause}
                 ORDER BY value
                 LIMIT {limit}
             """
@@ -687,7 +971,13 @@ class BigQueryService:
             filters=filters
         )
 
-        return [str(val) for val in df['value'].tolist() if pd.notna(val)]
+        # Convert NULL to marker, keep empty strings as-is for query compatibility
+        def format_dimension_value(val):
+            if pd.isna(val):
+                return "__NULL__"
+            return str(val)  # Empty strings stay as ''
+
+        return [format_dimension_value(val) for val in df['value'].tolist()]
 
     def _build_dimension_columns(self) -> List[str]:
         """

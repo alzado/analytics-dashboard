@@ -193,7 +193,6 @@ export function useSignificance({
       return calculateSignificance(fetchedRequest, tableId)
     },
     enabled: enabled && testRequested && fetchedRequest !== null,
-    staleTime: Infinity, // Don't refetch automatically
     retry: false
   })
 

@@ -8,6 +8,7 @@ import { usePivotMetrics } from '@/hooks/use-pivot-metrics'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { fetchTables, copySchema, applySchemaTemplate } from '@/lib/api'
 import { FormulaBuilderModal } from '@/components/modals/formula-builder-modal'
+import JoinedDimensionModal from '@/components/modals/joined-dimension-modal'
 import { RollupManagementSection } from '@/components/sections/rollup-management-section'
 import type {
   CalculatedMetric,
@@ -16,6 +17,7 @@ import type {
   DimensionCreate,
   DimensionUpdate,
   CalculatedMetricUpdate,
+  JoinedDimensionSource,
 } from '@/lib/types'
 
 interface SchemaSectionProps {
@@ -36,6 +38,7 @@ export function SchemaSection({ tableId }: SchemaSectionProps) {
   // Create modal state
   const [isCreateCalculatedMetricModalOpen, setIsCreateCalculatedMetricModalOpen] = useState(false)
   const [isCreateDimensionModalOpen, setIsCreateDimensionModalOpen] = useState(false)
+  const [isJoinedDimensionModalOpen, setIsJoinedDimensionModalOpen] = useState(false)
 
   // Pivot config state
   const [primarySortMetric, setPrimarySortMetric] = useState<string>('')
@@ -123,6 +126,9 @@ export function SchemaSection({ tableId }: SchemaSectionProps) {
     schema,
     updatePivotConfig,
     isUpdatingPivotConfig,
+    joinedDimensionSources,
+    isLoadingJoinedDimensionSources,
+    deleteJoinedDimensionSource,
   } = useSchema(tableId)
 
   const { metrics } = usePivotMetrics(tableId)
@@ -545,6 +551,10 @@ export function SchemaSection({ tableId }: SchemaSectionProps) {
               onEdit={handleEditDimension}
               onDelete={handleDeleteDimension}
               onCreate={() => setIsCreateDimensionModalOpen(true)}
+              joinedDimensionSources={joinedDimensionSources}
+              isLoadingJoinedDimensionSources={isLoadingJoinedDimensionSources}
+              onDeleteJoinedSource={deleteJoinedDimensionSource}
+              onCreateJoinedDimension={() => setIsJoinedDimensionModalOpen(true)}
             />
           )}
           {schemaTab === 'rollups' && (
@@ -597,6 +607,18 @@ export function SchemaSection({ tableId }: SchemaSectionProps) {
           onClose={() => setIsCreateDimensionModalOpen(false)}
         />
       )}
+
+      {/* Joined Dimension Modal */}
+      <JoinedDimensionModal
+        isOpen={isJoinedDimensionModalOpen}
+        onClose={() => setIsJoinedDimensionModalOpen(false)}
+        onSave={() => {
+          queryClient.invalidateQueries({ queryKey: ['joined-dimension-sources', tableId] })
+          setIsJoinedDimensionModalOpen(false)
+        }}
+        tableId={tableId}
+        existingDimensions={dimensions || []}
+      />
     </div>
   )
 }
@@ -742,9 +764,23 @@ interface DimensionsTabProps {
   onEdit: (dimension: DimensionDef) => void
   onDelete: (id: string) => void
   onCreate: () => void
+  joinedDimensionSources: JoinedDimensionSource[]
+  isLoadingJoinedDimensionSources: boolean
+  onDeleteJoinedSource: (id: string) => Promise<{ success: boolean; message: string }>
+  onCreateJoinedDimension: () => void
 }
 
-function DimensionsTab({ dimensions, isLoading, onEdit, onDelete, onCreate }: DimensionsTabProps) {
+function DimensionsTab({
+  dimensions,
+  isLoading,
+  onEdit,
+  onDelete,
+  onCreate,
+  joinedDimensionSources,
+  isLoadingJoinedDimensionSources,
+  onDeleteJoinedSource,
+  onCreateJoinedDimension,
+}: DimensionsTabProps) {
   const [searchTerm, setSearchTerm] = useState('')
 
   const filteredDimensions = (dimensions?.filter((dimension) => {
@@ -767,12 +803,20 @@ function DimensionsTab({ dimensions, isLoading, onEdit, onDelete, onCreate }: Di
       <div className="text-center py-8">
         <p className="text-gray-500">No dimensions defined yet.</p>
         <p className="text-sm text-gray-400 mt-2">Use Auto-Detect to discover dimensions from your BigQuery table or create them manually.</p>
-        <button
-          onClick={onCreate}
-          className="mt-4 px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700"
-        >
-          Create Dimension
-        </button>
+        <div className="mt-4 flex gap-2 justify-center">
+          <button
+            onClick={onCreate}
+            className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700"
+          >
+            Create Dimension
+          </button>
+          <button
+            onClick={onCreateJoinedDimension}
+            className="px-4 py-2 bg-indigo-600 text-white rounded-md hover:bg-indigo-700"
+          >
+            Join External Data (CSV/Excel)
+          </button>
+        </div>
       </div>
     )
   }
@@ -786,13 +830,68 @@ function DimensionsTab({ dimensions, isLoading, onEdit, onDelete, onCreate }: Di
           onChange={setSearchTerm}
           className="w-64"
         />
-        <button
-          onClick={onCreate}
-          className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700"
-        >
-          Create Dimension
-        </button>
+        <div className="flex gap-2">
+          <button
+            onClick={onCreate}
+            className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700"
+          >
+            Create Dimension
+          </button>
+          <button
+            onClick={onCreateJoinedDimension}
+            className="px-4 py-2 bg-indigo-600 text-white rounded-md hover:bg-indigo-700"
+          >
+            Join External Data (CSV/Excel)
+          </button>
+        </div>
       </div>
+
+      {/* Joined Dimension Sources */}
+      {joinedDimensionSources.length > 0 && (
+        <div className="mb-6 bg-indigo-50 rounded-lg p-4">
+          <h4 className="text-sm font-semibold text-indigo-900 mb-3">Joined Dimension Sources (External Files)</h4>
+          <div className="space-y-2">
+            {joinedDimensionSources.map((source) => (
+              <div
+                key={source.id}
+                className="flex items-center justify-between bg-white rounded-md p-3 border border-indigo-200"
+              >
+                <div className="flex-1">
+                  <div className="font-medium text-gray-900">{source.name}</div>
+                  <div className="text-sm text-gray-500">
+                    {source.columns.length} dimension{source.columns.length !== 1 ? 's' : ''} •
+                    Joined on <span className="font-mono text-indigo-600">{source.target_dimension_id}</span> •
+                    Status: <span className={source.status === 'ready' ? 'text-green-600' : source.status === 'error' ? 'text-red-600' : 'text-yellow-600'}>
+                      {source.status}
+                    </span>
+                  </div>
+                  {source.columns.length > 0 && (
+                    <div className="mt-1 flex flex-wrap gap-1">
+                      {source.columns.map((col) => (
+                        <span key={col.id} className="px-2 py-0.5 bg-indigo-100 text-indigo-700 rounded text-xs">
+                          {col.display_name}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                <button
+                  onClick={() => {
+                    if (confirm('Delete this joined dimension source? This will remove the BigQuery lookup table.')) {
+                      onDeleteJoinedSource(source.id)
+                    }
+                  }}
+                  className="p-2 text-red-600 hover:bg-red-50 rounded transition-colors"
+                  title="Delete source"
+                >
+                  <Trash2 className="h-4 w-4" />
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       <div className="overflow-x-auto">
         <table className="min-w-full divide-y divide-gray-200">
           <thead>

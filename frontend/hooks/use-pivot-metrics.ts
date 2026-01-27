@@ -1,6 +1,8 @@
 import { useMemo } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import { useSchema } from './use-schema'
-import type { CalculatedMetric, DimensionDef } from '@/lib/types'
+import { fetchCustomMetrics } from '@/lib/api'
+import type { CalculatedMetric, DimensionDef, CustomMetric } from '@/lib/types'
 
 export type MetricFormat = 'number' | 'currency' | 'percent'
 
@@ -67,6 +69,18 @@ function transformDimension(dimension: DimensionDef): DimensionDefinition {
   }
 }
 
+// Transform CustomMetric to MetricDefinition
+function transformCustomMetric(metric: CustomMetric): MetricDefinition {
+  return {
+    id: metric.metric_id,
+    label: metric.name,
+    format: mapFormatType(metric.format_type || 'number'),
+    description: metric.description || `Re-aggregated: ${metric.aggregation_type}(${metric.source_metric}) excluding ${metric.exclude_dimensions.join(', ')}`,
+    category: 'other',
+    decimalPlaces: metric.decimal_places,
+  }
+}
+
 export function usePivotMetrics(tableId?: string): UsePivotMetricsReturn {
   const {
     calculatedMetrics,
@@ -76,9 +90,15 @@ export function usePivotMetrics(tableId?: string): UsePivotMetricsReturn {
     isLoadingDimensions,
   } = useSchema(tableId)
 
-  const isLoading = isLoadingCalculatedMetrics || isLoadingDimensions
+  // Fetch custom metrics
+  const { data: customMetrics, isLoading: isLoadingCustomMetrics } = useQuery({
+    queryKey: ['custom-metrics'],
+    queryFn: fetchCustomMetrics,
+  })
 
-  // Transform calculated metrics
+  const isLoading = isLoadingCalculatedMetrics || isLoadingDimensions || isLoadingCustomMetrics
+
+  // Transform calculated metrics and custom metrics
   const metrics = useMemo(() => {
     const allMetrics: MetricDefinition[] = []
 
@@ -101,8 +121,13 @@ export function usePivotMetrics(tableId?: string): UsePivotMetricsReturn {
       })
     }
 
+    // Add custom metrics (re-aggregation metrics)
+    if (customMetrics) {
+      allMetrics.push(...customMetrics.map(transformCustomMetric))
+    }
+
     return allMetrics
-  }, [calculatedMetrics])
+  }, [calculatedMetrics, customMetrics])
 
   // Transform all dimensions (not just groupable ones)
   const transformedDimensions = useMemo(() => {

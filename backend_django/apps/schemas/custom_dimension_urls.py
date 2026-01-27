@@ -9,7 +9,11 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework import status
 
 from .models import CustomDimension
-from .serializers import CustomDimensionSerializer, CustomDimensionCreateSerializer
+from .serializers import (
+    CustomDimensionSerializer,
+    CustomDimensionCreateSerializer,
+    CustomDimensionUpdateSerializer
+)
 
 
 class RootCustomDimensionListView(APIView):
@@ -84,10 +88,10 @@ class RootCustomDimensionDetailView(APIView):
                 status=status.HTTP_404_NOT_FOUND
             )
 
-        serializer = CustomDimensionSerializer(custom_dim, data=request.data, partial=True)
+        serializer = CustomDimensionUpdateSerializer(custom_dim, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
         serializer.save()
-        return Response(serializer.data)
+        return Response(CustomDimensionSerializer(custom_dim).data)
 
     def delete(self, request, dimension_id):
         """Delete a custom dimension."""
@@ -133,7 +137,8 @@ class RootCustomDimensionDuplicateView(APIView):
             schema_config=custom_dim.schema_config,
             name=f"{custom_dim.name} (Copy)",
             dimension_type=custom_dim.dimension_type,
-            config=custom_dim.config.copy() if custom_dim.config else {}
+            metric=custom_dim.metric,
+            values_json=custom_dim.values_json.copy() if custom_dim.values_json else []
         )
 
         return Response(

@@ -22,7 +22,8 @@ from django.utils import timezone
 
 from apps.schemas.models import (
     OptimizedSourceConfig, OptimizedSourceStatus,
-    SchemaConfig, CalculatedMetric, Dimension
+    SchemaConfig, CalculatedMetric, Dimension,
+    JoinedDimensionSource, JoinedDimensionStatus
 )
 
 if TYPE_CHECKING:
@@ -198,71 +199,416 @@ class OptimizedSourceService:
             return [d.column_name for d in groupable_dims[:max_columns]]
 
     def _build_key_select_expression(self, columns: List[str]) -> str:
-        """Build SQL expression for a composite key column."""
-        parts = [f"COALESCE(CAST({col} AS STRING), '')" for col in columns]
-        return f"CONCAT({', '.join(parts)})"
+        """Build SQL expression for a composite key column using CONCAT.
+
+        Creates a string key by concatenating columns with COALESCE for null handling.
+        This matches the pattern used elsewhere in the codebase for composite keys.
+        """
+        coalesce_parts = [f"COALESCE(CAST({col} AS STRING), '')" for col in columns]
+        return f"CONCAT({', '.join(coalesce_parts)})"
+
+    def _extract_columns_from_expression(self, expr: str) -> Set[str]:
+        """Extract column references from SQL expression.
+
+        Handles patterns like:
+        - SUM(column_name)
+        - COUNT(DISTINCT column_name)
+        - {column_name} (placeholder syntax)
+        - column_name / other_column
+        """
+        columns = set()
+
+        # Pattern for aggregate functions: SUM(col), COUNT(DISTINCT col), AVG(col), etc.
+        agg_pattern = r'\b(?:SUM|COUNT|AVG|MAX|MIN)\s*\(\s*(?:DISTINCT\s+)?([a-zA-Z_][a-zA-Z0-9_]*)'
+        for match in re.finditer(agg_pattern, expr, re.IGNORECASE):
+            columns.add(match.group(1).lower())
+
+        # Pattern for placeholder syntax: {column_name}
+        placeholder_pattern = r'\{([a-zA-Z_][a-zA-Z0-9_]*)\}'
+        for match in re.finditer(placeholder_pattern, expr):
+            columns.add(match.group(1).lower())
+
+        # Exclude SQL keywords and functions
+        sql_keywords = {
+            'sum', 'count', 'avg', 'max', 'min', 'distinct', 'as', 'cast',
+            'coalesce', 'concat', 'ifnull', 'nullif', 'case', 'when', 'then',
+            'else', 'end', 'and', 'or', 'not', 'in', 'is', 'null', 'true', 'false'
+        }
+        return {c for c in columns if c not in sql_keywords}
+
+    def _get_required_columns(self, schema_config: SchemaConfig) -> Set[str]:
+        """Get columns actually needed from source table.
+
+        Collects columns from:
+        - Partition column (date)
+        - All dimensions
+        - Columns referenced in calculated metrics (from sql_expression and depends_on_base)
+        - Columns used in composite keys
+        """
+        columns = set()
+
+        # Always include partition column
+        columns.add('date')
+
+        # Add dimension columns
+        for dim in schema_config.dimensions.all():
+            columns.add(dim.column_name.lower())
+
+        # Extract columns from calculated metrics
+        for calc in schema_config.calculated_metrics.all():
+            # Get columns from SQL expression
+            if calc.sql_expression:
+                columns.update(self._extract_columns_from_expression(calc.sql_expression))
+            # Also include depends_on_base columns (these are the base column names)
+            if calc.depends_on_base:
+                columns.update(col.lower() for col in calc.depends_on_base)
+
+        return columns
+
+    def _get_joined_dimension_sources(
+        self,
+        schema_config: SchemaConfig
+    ) -> List[JoinedDimensionSource]:
+        """Get all ready joined dimension sources for this table's schema."""
+        return list(
+            schema_config.joined_dimension_sources.filter(
+                status=JoinedDimensionStatus.READY
+            ).prefetch_related('columns')
+        )
+
+    def _build_joined_dimension_sql(
+        self,
+        source_alias: str,
+        joined_sources: List[JoinedDimensionSource]
+    ) -> Tuple[str, str]:
+        """
+        Build SQL fragments for joined dimensions.
+
+        Args:
+            source_alias: Alias for the source table (e.g., 'src')
+            joined_sources: List of ready JoinedDimensionSource objects
+
+        Returns:
+            Tuple of (join_clauses, select_columns)
+        """
+        join_clauses = []
+        select_columns = []
+
+        for idx, source in enumerate(joined_sources):
+            alias = f"jd{idx}"
+            lookup_table_path = source.bq_table_path
+
+            # Get the target dimension's column name and data type
+            # The target_dimension_id references an existing dimension in the schema
+            source_data_type = 'STRING'  # Default fallback
+            try:
+                target_dim = source.schema_config.dimensions.get(
+                    dimension_id=source.target_dimension_id
+                )
+                source_join_column = target_dim.column_name
+                source_data_type = target_dim.data_type
+            except Dimension.DoesNotExist:
+                # Fall back to using target_dimension_id as column name
+                source_join_column = source.target_dimension_id
+
+            # Build LEFT JOIN clause
+            # No casting needed - lookup table join key is created with matching type
+            join_clause = f"""
+LEFT JOIN `{lookup_table_path}` AS {alias}
+    ON {source_alias}.{source_join_column} = {alias}.{source.join_key_column}"""
+
+            join_clauses.append(join_clause)
+
+            # Build SELECT columns for each dimension from this source
+            for col in source.columns.all():
+                select_columns.append(
+                    f"    {alias}.{col.source_column_name} AS {col.dimension_id}"
+                )
+
+        return ''.join(join_clauses), ',\n'.join(select_columns)
 
     def generate_create_sql(
         self,
         source_table_path: str,
-        config: OptimizedSourceConfig
+        config: OptimizedSourceConfig,
+        schema_config: Optional[SchemaConfig] = None
     ) -> str:
         """Generate CREATE TABLE SQL for optimized source table."""
         target_path = config.optimized_table_path
 
         # Build composite key SELECT expressions
         key_expressions = []
+        composite_key_columns = set()
         for mapping in config.composite_key_mappings:
             expr = self._build_key_select_expression(mapping['source_columns'])
             key_expressions.append(f"    {expr} AS {mapping['key_column_name']}")
+            # Track columns used in composite keys
+            composite_key_columns.update(c.lower() for c in mapping['source_columns'])
 
         # Build clustering clause
         cluster_clause = ""
+        clustering_columns = set()
         if config.clustering and config.clustering.get('columns'):
             cluster_clause = f"\nCLUSTER BY {', '.join(config.clustering['columns'])}"
+            clustering_columns.update(c.lower() for c in config.clustering['columns'])
 
-        # Build SQL
+        # Build SQL for composite keys
         key_select = ""
         if key_expressions:
             key_select = ",\n" + ",\n".join(key_expressions)
 
-        sql = f"""CREATE OR REPLACE TABLE `{target_path}`
+        # Build SQL for joined dimensions
+        join_clause = ""
+        joined_select = ""
+        join_key_columns = set()
+        if schema_config:
+            joined_sources = self._get_joined_dimension_sources(schema_config)
+            if joined_sources:
+                join_clause, joined_select = self._build_joined_dimension_sql(
+                    'src', joined_sources
+                )
+                if joined_select:
+                    joined_select = ",\n" + joined_select
+                # Track join key columns
+                for source in joined_sources:
+                    try:
+                        target_dim = schema_config.dimensions.get(
+                            dimension_id=source.target_dimension_id
+                        )
+                        join_key_columns.add(target_dim.column_name.lower())
+                    except Dimension.DoesNotExist:
+                        join_key_columns.add(source.target_dimension_id.lower())
+
+        # Determine columns to select
+        if schema_config:
+            # Get required columns from schema (dimensions, metrics)
+            required_cols = self._get_required_columns(schema_config)
+            # Add composite key columns, clustering columns, and join key columns
+            required_cols.update(composite_key_columns)
+            required_cols.update(clustering_columns)
+            required_cols.update(join_key_columns)
+            # Add partition column
+            required_cols.add(config.partition_column.lower())
+            # Build explicit column select
+            col_select = ',\n    '.join([f'src.{col}' for col in sorted(required_cols)])
+            logger.info(f"Selecting {len(required_cols)} columns instead of all: {sorted(required_cols)}")
+        else:
+            # Fallback to all columns if no schema
+            col_select = 'src.*'
+
+        # Build final SQL with or without JOINs
+        if join_clause:
+            sql = f"""CREATE OR REPLACE TABLE `{target_path}`
 PARTITION BY {config.partition_column}{cluster_clause}
 AS
 SELECT
-    *{key_select}
-FROM `{source_table_path}`"""
+    {col_select}{key_select}{joined_select}
+FROM `{source_table_path}` AS src{join_clause}"""
+        else:
+            sql = f"""CREATE OR REPLACE TABLE `{target_path}`
+PARTITION BY {config.partition_column}{cluster_clause}
+AS
+SELECT
+    {col_select}{key_select}
+FROM `{source_table_path}` AS src"""
 
         return sql
+
+    def generate_staged_create_sql(
+        self,
+        source_table_path: str,
+        config: OptimizedSourceConfig,
+        schema_config: Optional[SchemaConfig] = None
+    ) -> List[str]:
+        """
+        Generate staged CREATE TABLE SQL statements for optimized source table.
+
+        Instead of one big query with all JOINs, this creates:
+        1. Base table with source columns + composite keys (no joins)
+        2. For each joined dimension: UPDATE the table by joining with lookup
+
+        This is faster for large tables because each step processes less data.
+
+        Returns:
+            List of SQL statements to execute in order
+        """
+        target_path = config.optimized_table_path
+        statements = []
+
+        # Build composite key SELECT expressions
+        key_expressions = []
+        composite_key_columns = set()
+        for mapping in config.composite_key_mappings:
+            expr = self._build_key_select_expression(mapping['source_columns'])
+            key_expressions.append(f"    {expr} AS {mapping['key_column_name']}")
+            composite_key_columns.update(c.lower() for c in mapping['source_columns'])
+
+        # Build clustering clause
+        cluster_clause = ""
+        clustering_columns = set()
+        if config.clustering and config.clustering.get('columns'):
+            cluster_clause = f"\nCLUSTER BY {', '.join(config.clustering['columns'])}"
+            clustering_columns.update(c.lower() for c in config.clustering['columns'])
+
+        # Build SQL for composite keys
+        key_select = ""
+        if key_expressions:
+            key_select = ",\n" + ",\n".join(key_expressions)
+
+        # Get joined dimension sources
+        joined_sources = []
+        join_key_columns = set()
+        if schema_config:
+            joined_sources = self._get_joined_dimension_sources(schema_config)
+            for source in joined_sources:
+                try:
+                    target_dim = schema_config.dimensions.get(
+                        dimension_id=source.target_dimension_id
+                    )
+                    join_key_columns.add(target_dim.column_name.lower())
+                except Dimension.DoesNotExist:
+                    join_key_columns.add(source.target_dimension_id.lower())
+
+        # Determine base columns to select (without joined columns)
+        if schema_config:
+            required_cols = self._get_required_columns(schema_config)
+            required_cols.update(composite_key_columns)
+            required_cols.update(clustering_columns)
+            required_cols.update(join_key_columns)
+            required_cols.add(config.partition_column.lower())
+            col_select = ',\n    '.join([f'src.{col}' for col in sorted(required_cols)])
+            logger.info(f"Stage 1: Selecting {len(required_cols)} base columns: {sorted(required_cols)}")
+        else:
+            col_select = 'src.*'
+
+        has_joins = len(joined_sources) > 0
+
+        # STAGE 1: Create base table from source with partition/cluster
+        base_sql = f"""CREATE OR REPLACE TABLE `{target_path}`
+PARTITION BY {config.partition_column}{cluster_clause}
+AS
+SELECT
+    {col_select}{key_select}
+FROM `{source_table_path}` AS src"""
+        statements.append(('Base table with composite keys', base_sql))
+
+        # STAGE 2+: Add joined dimensions using ALTER TABLE + UPDATE
+        # This is MUCH faster than rewriting the entire table
+        for idx, source in enumerate(joined_sources):
+            # Get join details
+            try:
+                target_dim = schema_config.dimensions.get(
+                    dimension_id=source.target_dimension_id
+                )
+                source_join_column = target_dim.column_name
+            except Dimension.DoesNotExist:
+                source_join_column = source.target_dimension_id
+
+            lookup_table_path = source.bq_table_path
+
+            # For each column in this joined source
+            for col in source.columns.all():
+                # Determine BigQuery data type
+                bq_type = 'STRING'  # Default
+                if col.data_type in ('INTEGER', 'INT64'):
+                    bq_type = 'INT64'
+                elif col.data_type in ('FLOAT', 'FLOAT64'):
+                    bq_type = 'FLOAT64'
+                elif col.data_type == 'BOOLEAN':
+                    bq_type = 'BOOL'
+
+                # ALTER TABLE to add the column
+                alter_sql = f"ALTER TABLE `{target_path}` ADD COLUMN IF NOT EXISTS {col.dimension_id} {bq_type}"
+                statements.append((f'Add column {col.dimension_id}', alter_sql))
+
+                # UPDATE to populate values from lookup (handle duplicates with ANY_VALUE)
+                update_sql = f"""UPDATE `{target_path}` t
+SET t.{col.dimension_id} = lkp.val
+FROM (
+    SELECT {source.join_key_column}, ANY_VALUE({col.source_column_name}) as val
+    FROM `{lookup_table_path}`
+    GROUP BY {source.join_key_column}
+) lkp
+WHERE t.{source_join_column} = lkp.{source.join_key_column}"""
+                statements.append((f'Populate {col.dimension_id}', update_sql))
+
+        return statements
 
     def generate_incremental_insert_sql(
         self,
         source_table_path: str,
         config: OptimizedSourceConfig,
-        missing_dates: List[str]
+        missing_dates: List[str],
+        schema_config: Optional[SchemaConfig] = None
     ) -> str:
         """Generate INSERT SQL for new dates only."""
         target_path = config.optimized_table_path
 
         # Build composite key SELECT expressions
         key_expressions = []
+        composite_key_columns = set()
         for mapping in config.composite_key_mappings:
             expr = self._build_key_select_expression(mapping['source_columns'])
             key_expressions.append(f"    {expr} AS {mapping['key_column_name']}")
+            composite_key_columns.update(c.lower() for c in mapping['source_columns'])
 
         # Format dates
         date_list = ", ".join([f"'{d}'" for d in missing_dates])
 
-        # Build SQL
+        # Build SQL for composite keys
         key_select = ""
         if key_expressions:
             key_select = ",\n" + ",\n".join(key_expressions)
 
-        sql = f"""INSERT INTO `{target_path}`
+        # Build SQL for joined dimensions
+        join_clause = ""
+        joined_select = ""
+        join_key_columns = set()
+        if schema_config:
+            joined_sources = self._get_joined_dimension_sources(schema_config)
+            if joined_sources:
+                join_clause, joined_select = self._build_joined_dimension_sql(
+                    'src', joined_sources
+                )
+                if joined_select:
+                    joined_select = ",\n" + joined_select
+                # Track join key columns
+                for source in joined_sources:
+                    try:
+                        target_dim = schema_config.dimensions.get(
+                            dimension_id=source.target_dimension_id
+                        )
+                        join_key_columns.add(target_dim.column_name.lower())
+                    except Dimension.DoesNotExist:
+                        join_key_columns.add(source.target_dimension_id.lower())
+
+        # Determine columns to select
+        if schema_config:
+            # Get required columns from schema
+            required_cols = self._get_required_columns(schema_config)
+            required_cols.update(composite_key_columns)
+            required_cols.update(join_key_columns)
+            # Add clustering columns if any
+            if config.clustering and config.clustering.get('columns'):
+                required_cols.update(c.lower() for c in config.clustering['columns'])
+            required_cols.add(config.partition_column.lower())
+            col_select = ',\n    '.join([f'src.{col}' for col in sorted(required_cols)])
+        else:
+            col_select = 'src.*'
+
+        # Build final SQL with or without JOINs
+        if join_clause:
+            sql = f"""INSERT INTO `{target_path}`
 SELECT
-    *{key_select}
-FROM `{source_table_path}`
-WHERE date IN ({date_list})"""
+    {col_select}{key_select}{joined_select}
+FROM `{source_table_path}` AS src{join_clause}
+WHERE src.date IN ({date_list})"""
+        else:
+            sql = f"""INSERT INTO `{target_path}`
+SELECT
+    {col_select}{key_select}
+FROM `{source_table_path}` AS src
+WHERE src.date IN ({date_list})"""
 
         return sql
 
@@ -295,22 +641,37 @@ WHERE date IN ({date_list})"""
         optimized_path = config.optimized_table_path
         if optimized_path:
             try:
-                query = f"""
-                SELECT
-                    (SELECT MAX(date) FROM `{source_table_path}`) as source_max,
-                    (SELECT MAX(date) FROM `{optimized_path}`) as optimized_max
+                # First check if optimized table exists
+                table_exists_query = f"""
+                SELECT COUNT(*) as cnt
+                FROM `{config.target_project}.{config.target_dataset}.INFORMATION_SCHEMA.TABLES`
+                WHERE table_name = '{config.optimized_table_name}'
                 """
-                result = list(self.client.query(query).result())[0]
+                exists_result = list(self.client.query(table_exists_query).result())[0]
 
-                if result.source_max and result.optimized_max:
-                    if result.source_max > result.optimized_max:
-                        stale_reasons.append(
-                            f"New dates in source: source max={result.source_max}, "
-                            f"optimized max={result.optimized_max}"
-                        )
+                if exists_result.cnt == 0:
+                    stale_reasons.append("Optimized table does not exist in BigQuery")
+                else:
+                    # Table exists, check for date staleness
+                    query = f"""
+                    SELECT
+                        (SELECT MAX(date) FROM `{source_table_path}`) as source_max,
+                        (SELECT MAX(date) FROM `{optimized_path}`) as optimized_max
+                    """
+                    result = list(self.client.query(query).result())[0]
+
+                    if result.source_max and result.optimized_max:
+                        if result.source_max > result.optimized_max:
+                            stale_reasons.append(
+                                f"New dates in source: source max={result.source_max}, "
+                                f"optimized max={result.optimized_max}"
+                            )
             except Exception as e:
+                logger.warning(f"Error checking staleness: {e}")
                 if "Not found" in str(e):
                     stale_reasons.append("Optimized table does not exist in BigQuery")
+                else:
+                    stale_reasons.append(f"Error checking staleness: {str(e)}")
 
         return len(stale_reasons) > 0, stale_reasons, missing_keys
 
@@ -379,7 +740,7 @@ WHERE date IN ({date_list})"""
             } if clustering_cols else None
         )
 
-        sql = self.generate_create_sql(source_table_path, config)
+        sql = self.generate_create_sql(source_table_path, config, schema_config)
 
         return {
             'sql': sql,
@@ -499,18 +860,30 @@ WHERE date IN ({date_list})"""
                 if "Not found" not in str(e):
                     logger.warning(f"Could not drop existing table: {e}")
 
-            # Generate and execute SQL (use CREATE TABLE instead of CREATE OR REPLACE)
-            sql = self.generate_create_sql(source_table_path, config)
+            # Use staged approach:
+            # 1. Create base table from source (cross-project transfer, but no JOINs)
+            # 2. Add JOINs one at a time (same project = fast)
+            staged_statements = self.generate_staged_create_sql(
+                source_table_path, config, schema_config
+            )
 
             start_time = time.time()
+            total_bytes_processed = 0
 
-            job = self.client.query(sql)
-            job.result()  # Wait for completion
+            for stage_name, sql in staged_statements:
+                logger.info(f"Executing stage: {stage_name}")
+                stage_start = time.time()
+
+                job = self.client.query(sql)
+                job.result()  # Wait for completion
+
+                stage_time_ms = int((time.time() - stage_start) * 1000)
+                stage_bytes = job.total_bytes_processed or 0
+                total_bytes_processed += stage_bytes
+                logger.info(f"Stage '{stage_name}' completed in {stage_time_ms}ms, {stage_bytes:,} bytes")
 
             execution_time_ms = int((time.time() - start_time) * 1000)
-
-            # Get job stats
-            bytes_processed = job.total_bytes_processed or 0
+            bytes_processed = total_bytes_processed
 
             # Get row count from created table
             target_path = config.optimized_table_path
@@ -533,7 +906,7 @@ WHERE date IN ({date_list})"""
                 'optimized_table_path': target_path,
                 'composite_keys_created': [k['key_column_name'] for k in composite_keys],
                 'clustering_columns': clustering_cols,
-                'bytes_processed': bytes_processed,
+                'bytes_processed': total_bytes_processed,
                 'row_count': row_count,
                 'execution_time_ms': execution_time_ms
             }
@@ -575,49 +948,89 @@ WHERE date IN ({date_list})"""
             }
 
         try:
+            use_staged = False
+
             if not incremental:
-                # Full refresh - regenerate everything
+                # Full refresh - regenerate everything using staged approach
                 new_keys = self.analyze_schema_for_composite_keys(schema_config)
                 config.composite_key_mappings = new_keys
                 config.status = OptimizedSourceStatus.BUILDING
                 config.save()
-
-                sql = self.generate_create_sql(source_table_path, config)
+                use_staged = True
             else:
                 # Incremental - find missing dates
                 target_path = config.optimized_table_path
 
-                query = f"""
-                SELECT DISTINCT date
-                FROM `{source_table_path}`
-                WHERE date NOT IN (
-                    SELECT DISTINCT date FROM `{target_path}`
-                )
-                ORDER BY date
+                # First check if optimized table exists
+                table_exists_query = f"""
+                SELECT COUNT(*) as cnt
+                FROM `{config.target_project}.{config.target_dataset}.INFORMATION_SCHEMA.TABLES`
+                WHERE table_name = '{config.optimized_table_name}'
                 """
+                exists_result = list(self.client.query(table_exists_query).result())[0]
 
-                result = self.client.query(query).result()
-                missing_dates = [str(row.date) for row in result]
+                if exists_result.cnt == 0:
+                    # Table doesn't exist, do full refresh with staged approach
+                    logger.info(f"Optimized table {target_path} doesn't exist, falling back to full refresh")
+                    new_keys = self.analyze_schema_for_composite_keys(schema_config)
+                    config.composite_key_mappings = new_keys
+                    config.status = OptimizedSourceStatus.BUILDING
+                    config.save()
+                    use_staged = True
+                else:
+                    query = f"""
+                    SELECT DISTINCT date
+                    FROM `{source_table_path}`
+                    WHERE date NOT IN (
+                        SELECT DISTINCT date FROM `{target_path}`
+                    )
+                    ORDER BY date
+                    """
 
-                if not missing_dates:
-                    return {
-                        'success': True,
-                        'message': "Optimized source is already up to date",
-                        'optimized_table_path': target_path
-                    }
+                    result = self.client.query(query).result()
+                    missing_dates = [str(row.date) for row in result]
 
-                sql = self.generate_incremental_insert_sql(
-                    source_table_path, config, missing_dates
-                )
+                    if not missing_dates:
+                        return {
+                            'success': True,
+                            'message': "Optimized source is already up to date",
+                            'optimized_table_path': target_path
+                        }
+
+                    sql = self.generate_incremental_insert_sql(
+                        source_table_path, config, missing_dates, schema_config
+                    )
 
             # Execute SQL
             start_time = time.time()
 
-            job = self.client.query(sql)
-            job.result()
+            if use_staged:
+                # Full refresh with staged approach
+                staged_statements = self.generate_staged_create_sql(
+                    source_table_path, config, schema_config
+                )
+                total_bytes_processed = 0
+
+                for stage_name, sql in staged_statements:
+                    logger.info(f"Executing stage: {stage_name}")
+                    stage_start = time.time()
+
+                    job = self.client.query(sql)
+                    job.result()
+
+                    stage_time_ms = int((time.time() - stage_start) * 1000)
+                    stage_bytes = job.total_bytes_processed or 0
+                    total_bytes_processed += stage_bytes
+                    logger.info(f"Stage '{stage_name}' completed in {stage_time_ms}ms")
+
+                bytes_processed = total_bytes_processed
+            else:
+                # Incremental insert
+                job = self.client.query(sql)
+                job.result()
+                bytes_processed = job.total_bytes_processed or 0
 
             execution_time_ms = int((time.time() - start_time) * 1000)
-            bytes_processed = job.total_bytes_processed or 0
 
             # Get updated row count
             target_path = config.optimized_table_path

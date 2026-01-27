@@ -7,6 +7,8 @@ The schema endpoints are nested under tables:
 /api/tables/{table_id}/dimensions/
 /api/tables/{table_id}/calculated-dimensions/
 /api/tables/{table_id}/custom-dimensions/
+/api/tables/{table_id}/custom-metrics/
+/api/tables/{table_id}/joined-dimensions/
 """
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
@@ -16,7 +18,9 @@ from .views import (
     CalculatedMetricViewSet,
     DimensionViewSet,
     CalculatedDimensionViewSet,
-    CustomDimensionViewSet
+    CustomDimensionViewSet,
+    CustomMetricViewSet,
+    JoinedDimensionSourceViewSet
 )
 
 
@@ -33,6 +37,16 @@ table_router.register(
     r'custom-dimensions',
     CustomDimensionViewSet,
     basename='custom-dimension'
+)
+table_router.register(
+    r'custom-metrics',
+    CustomMetricViewSet,
+    basename='custom-metric'
+)
+table_router.register(
+    r'joined-dimensions',
+    JoinedDimensionSourceViewSet,
+    basename='joined-dimension'
 )
 
 

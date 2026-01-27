@@ -37,6 +37,8 @@ def parse_dimension_filters(request) -> dict:
         'dimensions', 'dimension_values', 'start_date', 'end_date',
         'date_range_type', 'relative_date_preset', 'limit', 'offset',
         'table_id', 'skip_count', 'metrics', 'require_rollup', 'pivot_dimensions',
+        'custom_dimension', 'custom_metrics',  # Custom dimension/metric params
+        'search',  # Search parameter for dimension values
         '_t', '_'  # Cache-busting parameters
     }
 
@@ -86,6 +88,8 @@ class PivotView(APIView):
         - skip_count: Skip count query (default False)
         - metrics: List of metric IDs to calculate
         - require_rollup: Require rollup availability (default True)
+        - custom_dimension: ID of custom dimension for bucketing
+        - custom_metrics: List of custom metric IDs for re-aggregation
         - Dynamic dimension filters: ?country=USA&channel=Web
         """
         table, data_service, error = get_table_and_service(request)
@@ -106,6 +110,10 @@ class PivotView(APIView):
             metrics = request.query_params.getlist('metrics') or None
             require_rollup = request.query_params.get('require_rollup', '').lower() != 'false'
 
+            # Parse custom dimension/metric parameters
+            custom_dimension_id = request.query_params.get('custom_dimension')
+            custom_metric_ids = request.query_params.getlist('custom_metrics') or None
+
             # Parse dimension filters
             dimension_filters = parse_dimension_filters(request)
 
@@ -125,7 +133,9 @@ class PivotView(APIView):
                 dimension_values=dimension_values if dimension_values else None,
                 skip_count=skip_count,
                 metrics=metrics,
-                require_rollup=require_rollup
+                require_rollup=require_rollup,
+                custom_dimension_id=custom_dimension_id,
+                custom_metric_ids=custom_metric_ids
             )
 
             serializer = PivotResponseSerializer(result)
@@ -179,6 +189,7 @@ class DimensionValuesView(APIView):
         Query params:
         - table_id: BigQuery table ID
         - pivot_dimensions: List of dimensions in current pivot context (for rollup routing)
+        - search: Optional search string to filter values (case-insensitive)
         - Filters: start_date, end_date, date_range_type, relative_date_preset
         - Dynamic dimension filters
         """
@@ -195,6 +206,9 @@ class DimensionValuesView(APIView):
             # Get pivot context dimensions (for rollup routing)
             pivot_dimensions = request.query_params.getlist('pivot_dimensions', [])
 
+            # Get search parameter for filtering values
+            search = request.query_params.get('search')
+
             dimension_filters = parse_dimension_filters(request)
 
             filters = {
@@ -209,7 +223,8 @@ class DimensionValuesView(APIView):
                 dimension=dimension,
                 filters=filters,
                 pivot_dimensions=pivot_dimensions,
-                require_rollup=False  # Dimension values are simple SELECT DISTINCT - don't need rollups
+                require_rollup=False,  # Dimension values are simple SELECT DISTINCT - don't need rollups
+                search=search
             )
 
             # If there's an error (no rollup found), return the full error response

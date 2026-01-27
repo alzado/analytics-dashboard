@@ -10,7 +10,8 @@ Key design principles:
 import re
 import time
 import logging
-from typing import List, Dict, Optional, Tuple, TYPE_CHECKING
+from dataclasses import dataclass
+from typing import List, Dict, Optional, Tuple, TYPE_CHECKING, Any
 from datetime import datetime
 
 from google.cloud import bigquery
@@ -18,12 +19,25 @@ from google.cloud.exceptions import NotFound
 from django.utils import timezone
 
 from .models import Rollup, RollupStatus, RollupConfig
-from apps.schemas.models import SchemaConfig, CalculatedMetric, Dimension, OptimizedSourceConfig
+from apps.schemas.models import (
+    SchemaConfig, CalculatedMetric, Dimension, OptimizedSourceConfig,
+    JoinedDimensionSource, JoinedDimensionColumn, JoinedDimensionStatus
+)
 
 if TYPE_CHECKING:
     from apps.tables.models import BigQueryTable
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class DimensionInfo:
+    """Unified dimension info for both regular and joined dimensions."""
+    dimension_id: str
+    column_name: str
+    is_joined: bool
+    data_type: str = "STRING"
+    source: Optional[Any] = None  # JoinedDimensionSource if is_joined
 
 
 def generate_key_column_name(columns: List[str]) -> str:
@@ -109,9 +123,113 @@ class RollupService:
         """Get all volume-category metrics from the schema."""
         return list(schema_config.calculated_metrics.filter(category='volume'))
 
-    def get_all_dimensions(self, schema_config: SchemaConfig) -> Dict[str, Dimension]:
-        """Get all dimensions as a dict keyed by dimension_id."""
-        return {d.dimension_id: d for d in schema_config.dimensions.all()}
+    def get_all_dimensions(self, schema_config: SchemaConfig) -> Dict[str, 'DimensionInfo']:
+        """Get all dimensions (regular and joined) as a dict keyed by dimension_id."""
+        result = {}
+
+        # Regular dimensions
+        for d in schema_config.dimensions.all():
+            result[d.dimension_id] = DimensionInfo(
+                dimension_id=d.dimension_id,
+                column_name=d.column_name,
+                is_joined=False,
+                data_type=d.data_type,
+                source=None
+            )
+
+        # Joined dimensions
+        for source in schema_config.joined_dimension_sources.filter(
+            status=JoinedDimensionStatus.READY
+        ).prefetch_related('columns'):
+            for col in source.columns.all():
+                result[col.dimension_id] = DimensionInfo(
+                    dimension_id=col.dimension_id,
+                    column_name=col.source_column_name,
+                    is_joined=True,
+                    data_type=col.data_type,
+                    source=source
+                )
+
+        return result
+
+    def _get_joined_sources_for_dims(
+        self,
+        schema_config: SchemaConfig,
+        dim_ids: List[str]
+    ) -> List[JoinedDimensionSource]:
+        """Get the joined dimension sources needed for the given dimension IDs."""
+        needed_sources = set()
+        for source in schema_config.joined_dimension_sources.filter(
+            status=JoinedDimensionStatus.READY
+        ).prefetch_related('columns'):
+            for col in source.columns.all():
+                if col.dimension_id in dim_ids:
+                    needed_sources.add(source)
+                    break
+        return list(needed_sources)
+
+    def _build_join_clauses(
+        self,
+        schema_config: SchemaConfig,
+        source_alias: str,
+        joined_sources: List[JoinedDimensionSource]
+    ) -> str:
+        """Build LEFT JOIN clauses for joined dimension sources."""
+        if not joined_sources:
+            return ""
+
+        join_clauses = []
+        for idx, source in enumerate(joined_sources):
+            alias = f"jd{idx}"
+            lookup_table_path = source.bq_table_path
+
+            # Get the target dimension's column name and data type
+            source_data_type = 'STRING'  # Default fallback
+            try:
+                target_dim = schema_config.dimensions.get(
+                    dimension_id=source.target_dimension_id
+                )
+                source_join_column = target_dim.column_name
+                source_data_type = target_dim.data_type
+            except Dimension.DoesNotExist:
+                logger.warning(f"Target dimension {source.target_dimension_id} not found")
+                continue
+
+            # Build LEFT JOIN clause
+            # No casting needed - lookup table join key is created with matching type
+            join_clause = f"""
+LEFT JOIN `{lookup_table_path}` AS {alias}
+    ON {source_alias}.{source_join_column} = {alias}.{source.join_key_column}"""
+
+            join_clauses.append(join_clause)
+
+        return "".join(join_clauses)
+
+    def _get_dim_select_expression(
+        self,
+        dim_info: 'DimensionInfo',
+        source_alias: str,
+        joined_sources: List[JoinedDimensionSource],
+        use_optimized_source: bool = False
+    ) -> str:
+        """Get the SELECT expression for a dimension, handling joined dimensions."""
+        if not dim_info.is_joined:
+            return f"{source_alias}.{dim_info.column_name}"
+
+        # If using optimized source table, joined columns are already there
+        # Reference them directly by dimension_id (that's the column name in optimized table)
+        if use_optimized_source:
+            return f"{source_alias}.{dim_info.dimension_id}"
+
+        # Find the alias for this joined dimension's source
+        for idx, source in enumerate(joined_sources):
+            if source.id == dim_info.source.id:
+                alias = f"jd{idx}"
+                return f"{alias}.{dim_info.column_name}"
+
+        # Fallback (shouldn't happen)
+        logger.warning(f"Could not find source for joined dimension {dim_info.dimension_id}")
+        return dim_info.column_name
 
     def _build_aggregation_sql(
         self,
@@ -132,21 +250,36 @@ class RollupService:
         """Generate CREATE TABLE AS SELECT SQL for a rollup."""
         # Check for optimized source table
         actual_source_path, key_column_mapping = self._get_optimized_source_info()
+        use_optimized_source = key_column_mapping is not None
 
         target_path = rollup.full_rollup_path
+        source_alias = "src"
 
         # Get volume metrics from schema
         volume_metrics = self.get_volume_metrics(schema_config)
         dims_by_id = self.get_all_dimensions(schema_config)
+
+        # Get joined sources needed for this rollup's dimensions
+        joined_sources = self._get_joined_sources_for_dims(schema_config, rollup.dimensions)
+
+        # Build JOIN clause only if NOT using optimized source
+        # (optimized source already has joined columns)
+        if use_optimized_source:
+            join_clause = ""
+        else:
+            join_clause = self._build_join_clauses(schema_config, source_alias, joined_sources)
 
         # Build SELECT parts
         select_parts = []
 
         # Add dimensions
         for dim_id in rollup.dimensions:
-            dim = dims_by_id.get(dim_id)
-            if dim:
-                select_parts.append(f"    {dim.column_name} AS {dim_id}")
+            dim_info = dims_by_id.get(dim_id)
+            if dim_info:
+                select_expr = self._get_dim_select_expression(
+                    dim_info, source_alias, joined_sources, use_optimized_source
+                )
+                select_parts.append(f"    {select_expr} AS {dim_id}")
 
         # Add volume metrics
         for metric in volume_metrics:
@@ -157,18 +290,22 @@ class RollupService:
         if not volume_metrics:
             select_parts.append("    COUNT(*) AS row_count")
 
-        # Build GROUP BY
+        # Build GROUP BY using the same expressions as SELECT
         group_by_parts = []
         for dim_id in rollup.dimensions:
-            dim = dims_by_id.get(dim_id)
-            if dim:
-                group_by_parts.append(dim.column_name)
+            dim_info = dims_by_id.get(dim_id)
+            if dim_info:
+                select_expr = self._get_dim_select_expression(
+                    dim_info, source_alias, joined_sources, use_optimized_source
+                )
+                group_by_parts.append(select_expr)
 
         select_clause = ',\n'.join(select_parts)
         group_by_clause = ', '.join(group_by_parts)
 
         # Determine clustering columns (non-date dimensions, up to 4)
-        non_date_dims = [d for d in rollup.dimensions if d != 'date']
+        # Use dimension IDs as column names since we SELECT ... AS dim_id
+        non_date_dims = [d for d in rollup.dimensions if d != 'date' and d in dims_by_id]
         cluster_columns = non_date_dims[:4]
         cluster_clause = f"\nCLUSTER BY {', '.join(cluster_columns)}" if cluster_columns else ""
 
@@ -178,7 +315,7 @@ PARTITION BY date{cluster_clause}
 AS
 SELECT
 {select_clause}
-FROM `{actual_source_path}`
+FROM `{actual_source_path}` AS {source_alias}{join_clause}
 GROUP BY {group_by_clause}"""
 
         return sql, target_path
@@ -191,18 +328,32 @@ GROUP BY {group_by_clause}"""
     ) -> str:
         """Generate INSERT statement for missing dates only."""
         actual_source_path, key_column_mapping = self._get_optimized_source_info()
+        use_optimized_source = key_column_mapping is not None
         target_path = rollup.full_rollup_path
+        source_alias = "src"
 
         volume_metrics = self.get_volume_metrics(schema_config)
         dims_by_id = self.get_all_dimensions(schema_config)
+
+        # Get joined sources needed for this rollup's dimensions
+        joined_sources = self._get_joined_sources_for_dims(schema_config, rollup.dimensions)
+
+        # Build JOIN clause only if NOT using optimized source
+        if use_optimized_source:
+            join_clause = ""
+        else:
+            join_clause = self._build_join_clauses(schema_config, source_alias, joined_sources)
 
         # Build SELECT parts
         select_parts = []
 
         for dim_id in rollup.dimensions:
-            dim = dims_by_id.get(dim_id)
-            if dim:
-                select_parts.append(f"    {dim.column_name} AS {dim_id}")
+            dim_info = dims_by_id.get(dim_id)
+            if dim_info:
+                select_expr = self._get_dim_select_expression(
+                    dim_info, source_alias, joined_sources, use_optimized_source
+                )
+                select_parts.append(f"    {select_expr} AS {dim_id}")
 
         for metric in volume_metrics:
             agg_sql = self._build_aggregation_sql(metric, key_column_mapping)
@@ -211,11 +362,15 @@ GROUP BY {group_by_clause}"""
         if not volume_metrics:
             select_parts.append("    COUNT(*) AS row_count")
 
+        # Build GROUP BY using the same expressions as SELECT
         group_by_parts = []
         for dim_id in rollup.dimensions:
-            dim = dims_by_id.get(dim_id)
-            if dim:
-                group_by_parts.append(dim.column_name)
+            dim_info = dims_by_id.get(dim_id)
+            if dim_info:
+                select_expr = self._get_dim_select_expression(
+                    dim_info, source_alias, joined_sources, use_optimized_source
+                )
+                group_by_parts.append(select_expr)
 
         date_list = ", ".join([f"'{d}'" for d in missing_dates])
 
@@ -225,8 +380,8 @@ GROUP BY {group_by_clause}"""
         sql = f"""INSERT INTO `{target_path}`
 SELECT
 {select_clause}
-FROM `{actual_source_path}`
-WHERE date IN ({date_list})
+FROM `{actual_source_path}` AS {source_alias}{join_clause}
+WHERE {source_alias}.date IN ({date_list})
 GROUP BY {group_by_clause}"""
 
         return sql
@@ -510,9 +665,9 @@ GROUP BY {group_by_clause}"""
 
         # Add dimension columns
         for dim_id in rollup.dimensions:
-            dim = dims_by_id.get(dim_id)
-            if dim:
-                bq_type = self._get_bq_type(dim.data_type)
+            dim_info = dims_by_id.get(dim_id)
+            if dim_info:
+                bq_type = self._get_bq_type(dim_info.data_type)
                 column_defs.append(f"    {dim_id} {bq_type}")
 
         # Add volume metric columns
@@ -524,7 +679,8 @@ GROUP BY {group_by_clause}"""
 
         columns_clause = ',\n'.join(column_defs)
 
-        non_date_dims = [d for d in rollup.dimensions if d != 'date']
+        # Only use dimensions that exist in dims_by_id for clustering
+        non_date_dims = [d for d in rollup.dimensions if d != 'date' and d in dims_by_id]
         cluster_columns = non_date_dims[:4]
         cluster_clause = f"\nCLUSTER BY {', '.join(cluster_columns)}" if cluster_columns else ""
 

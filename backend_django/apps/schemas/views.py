@@ -1,17 +1,21 @@
 """
 Schema views for metrics and dimensions management.
 """
+import json
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
+from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from django.shortcuts import get_object_or_404
+from google.cloud import bigquery
 
 from apps.tables.models import BigQueryTable
 from apps.core.permissions import IsTableOwnerOrOrganizationMember
 from .models import (
     SchemaConfig, CalculatedMetric, Dimension,
-    CalculatedDimension, CustomDimension
+    CalculatedDimension, CustomDimension, CustomMetric,
+    JoinedDimensionSource, JoinedDimensionStatus
 )
 from .serializers import (
     SchemaConfigSerializer, SchemaConfigUpdateSerializer,
@@ -22,10 +26,14 @@ from .serializers import (
     CalculatedDimensionSerializer, CalculatedDimensionCreateSerializer,
     CalculatedDimensionUpdateSerializer,
     CustomDimensionSerializer, CustomDimensionCreateSerializer,
+    CustomDimensionUpdateSerializer,
+    CustomMetricSerializer, CustomMetricCreateSerializer, CustomMetricUpdateSerializer,
     FormulaValidationRequestSerializer, FormulaValidationResponseSerializer,
-    SchemaDetectionResponseSerializer
+    SchemaDetectionResponseSerializer,
+    JoinedDimensionSourceSerializer, JoinedDimensionSourceCreateSerializer,
+    FilePreviewSerializer
 )
-from .services import SchemaService, MetricService, DimensionService
+from .services import SchemaService, MetricService, DimensionService, JoinedDimensionService
 
 
 class SchemaConfigViewSet(viewsets.ModelViewSet):
@@ -330,6 +338,47 @@ class DimensionViewSet(viewsets.ModelViewSet):
             return DimensionListSerializer
         return DimensionSerializer
 
+    def _get_joined_dimensions_as_dicts(self, schema_config, is_filterable=None, is_groupable=None):
+        """Get joined dimensions formatted as dimension dicts."""
+        joined_dims = []
+        for source in schema_config.joined_dimension_sources.filter(
+            status=JoinedDimensionStatus.READY
+        ).prefetch_related('columns'):
+            for col in source.columns.all():
+                # Apply filters if specified
+                if is_filterable is not None and col.is_filterable != is_filterable:
+                    continue
+                if is_groupable is not None and col.is_groupable != is_groupable:
+                    continue
+
+                joined_dims.append({
+                    'id': col.dimension_id,
+                    'column_name': col.source_column_name,
+                    'display_name': col.display_name,
+                    'data_type': col.data_type,
+                    'is_filterable': col.is_filterable,
+                    'is_groupable': col.is_groupable,
+                    'filter_type': col.filter_type,
+                    'is_joined': True,
+                    'source_id': str(source.id),
+                    'source_name': source.name,
+                })
+        return joined_dims
+
+    def list(self, request, *args, **kwargs):
+        """List all dimensions including joined dimensions."""
+        # Get regular dimensions
+        queryset = self.filter_queryset(self.get_queryset())
+        serializer = DimensionListSerializer(queryset, many=True)
+        regular_dims = serializer.data
+
+        # Get joined dimensions
+        schema_config = self.get_schema_config()
+        joined_dims = self._get_joined_dimensions_as_dicts(schema_config)
+
+        # Combine and return
+        return Response(regular_dims + joined_dims)
+
     def get_schema_config(self):
         """Get or create schema config for the table."""
         table_id = self.kwargs.get('table_id')
@@ -419,10 +468,15 @@ class DimensionViewSet(viewsets.ModelViewSet):
         schema_config = self.get_schema_config()
         dimension_service = DimensionService(schema_config)
 
+        # Get regular filterable dimensions
         dimensions = dimension_service.list_filterable_dimensions()
         serializer = DimensionListSerializer(dimensions, many=True)
+        regular_dims = serializer.data
 
-        return Response(serializer.data)
+        # Get joined filterable dimensions
+        joined_dims = self._get_joined_dimensions_as_dicts(schema_config, is_filterable=True)
+
+        return Response(regular_dims + joined_dims)
 
     @action(detail=False, methods=['get'])
     def groupable(self, request, *args, **kwargs):
@@ -430,10 +484,15 @@ class DimensionViewSet(viewsets.ModelViewSet):
         schema_config = self.get_schema_config()
         dimension_service = DimensionService(schema_config)
 
+        # Get regular groupable dimensions
         dimensions = dimension_service.list_groupable_dimensions()
         serializer = DimensionListSerializer(dimensions, many=True)
+        regular_dims = serializer.data
 
-        return Response(serializer.data)
+        # Get joined groupable dimensions
+        joined_dims = self._get_joined_dimensions_as_dicts(schema_config, is_groupable=True)
+
+        return Response(regular_dims + joined_dims)
 
 
 class CalculatedDimensionViewSet(viewsets.ModelViewSet):
@@ -574,6 +633,8 @@ class CustomDimensionViewSet(viewsets.ModelViewSet):
     def get_serializer_class(self):
         if self.action == 'create':
             return CustomDimensionCreateSerializer
+        elif self.action in ['update', 'partial_update']:
+            return CustomDimensionUpdateSerializer
         return CustomDimensionSerializer
 
     def get_schema_config(self):
@@ -587,3 +648,262 @@ class CustomDimensionViewSet(viewsets.ModelViewSet):
         """Create custom dimension with schema config."""
         schema_config = self.get_schema_config()
         serializer.save(schema_config=schema_config)
+
+
+class CustomMetricViewSet(viewsets.ModelViewSet):
+    """ViewSet for custom metrics (re-aggregation metrics)."""
+    permission_classes = []
+    serializer_class = CustomMetricSerializer
+    lookup_field = 'id'
+    pagination_class = None  # Disable pagination - return plain array
+
+    def get_queryset(self):
+        """Filter custom metrics by table."""
+        table_id = self.kwargs.get('table_id')
+        if table_id:
+            return CustomMetric.objects.filter(
+                schema_config__bigquery_table_id=table_id
+            ).order_by('name')
+        return CustomMetric.objects.none()
+
+    def get_serializer_class(self):
+        if self.action == 'create':
+            return CustomMetricCreateSerializer
+        elif self.action in ['update', 'partial_update']:
+            return CustomMetricUpdateSerializer
+        return CustomMetricSerializer
+
+    def get_schema_config(self):
+        """Get or create schema config for the table."""
+        table_id = self.kwargs.get('table_id')
+        table = get_object_or_404(BigQueryTable, id=table_id)
+        schema_service = SchemaService(table)
+        return schema_service.get_or_create_schema()
+
+    def get_serializer_context(self):
+        """Add schema_config to serializer context for validation."""
+        context = super().get_serializer_context()
+        table_id = self.kwargs.get('table_id')
+        if table_id:
+            table = get_object_or_404(BigQueryTable, id=table_id)
+            schema_service = SchemaService(table)
+            context['schema_config'] = schema_service.get_or_create_schema()
+        return context
+
+    def perform_create(self, serializer):
+        """Create custom metric with schema config."""
+        schema_config = self.get_schema_config()
+        serializer.save(schema_config=schema_config)
+
+
+class JoinedDimensionSourceViewSet(viewsets.ModelViewSet):
+    """ViewSet for joined dimension sources (file uploads)."""
+    permission_classes = []
+    serializer_class = JoinedDimensionSourceSerializer
+    lookup_field = 'id'
+    pagination_class = None
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+
+    def get_queryset(self):
+        """Filter joined dimension sources by table."""
+        table_id = self.kwargs.get('table_id')
+        if table_id:
+            return JoinedDimensionSource.objects.filter(
+                schema_config__bigquery_table_id=table_id
+            ).prefetch_related('columns').order_by('name')
+        return JoinedDimensionSource.objects.none()
+
+    def get_table(self):
+        """Get the BigQuery table for this request."""
+        table_id = self.kwargs.get('table_id')
+        return get_object_or_404(BigQueryTable, id=table_id)
+
+    def get_schema_config(self):
+        """Get or create schema config for the table."""
+        table = self.get_table()
+        schema_service = SchemaService(table)
+        return schema_service.get_or_create_schema()
+
+    def get_bigquery_client(self, project: str = None):
+        """Get BigQuery client for the current user."""
+        user = self.request.user
+        credentials = None
+
+        # Try user's OAuth credentials
+        if user and user.is_authenticated:
+            from apps.users.gcp_oauth_service import GCPOAuthService
+            credentials = GCPOAuthService.get_valid_credentials(user)
+
+        if credentials:
+            return bigquery.Client(project=project, credentials=credentials)
+        else:
+            # Fall back to ADC
+            return bigquery.Client(project=project)
+
+    def create(self, request, *args, **kwargs):
+        """Handle file upload and data processing."""
+        # Get file from request
+        file = request.FILES.get('file')
+        if not file:
+            return Response(
+                {'error': 'File is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Validate file type
+        filename = file.name.lower()
+        if not (filename.endswith('.csv') or filename.endswith('.xlsx') or filename.endswith('.xls')):
+            return Response(
+                {'error': 'File must be CSV (.csv) or Excel (.xlsx)'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Parse JSON data from form
+        try:
+            name = request.data.get('name')
+            join_key_column = request.data.get('join_key_column')
+            target_dimension_id = request.data.get('target_dimension_id')
+            bq_project = request.data.get('bq_project')
+            bq_dataset = request.data.get('bq_dataset')
+
+            # Parse columns JSON
+            columns_data = request.data.get('columns')
+            if isinstance(columns_data, str):
+                columns = json.loads(columns_data)
+            else:
+                columns = columns_data
+
+        except (json.JSONDecodeError, TypeError) as e:
+            return Response(
+                {'error': f'Invalid JSON data: {str(e)}'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Validate required fields
+        if not all([name, join_key_column, target_dimension_id, bq_project, bq_dataset, columns]):
+            return Response(
+                {'error': 'Missing required fields: name, join_key_column, target_dimension_id, bq_project, bq_dataset, columns'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Get schema config and BigQuery client
+        schema_config = self.get_schema_config()
+        client = self.get_bigquery_client(project=bq_project)
+
+        # Process the upload
+        service = JoinedDimensionService(client, schema_config)
+
+        try:
+            source = service.process_upload(
+                file=file,
+                name=name,
+                join_key_column=join_key_column,
+                target_dimension_id=target_dimension_id,
+                columns=columns,
+                bq_project=bq_project,
+                bq_dataset=bq_dataset
+            )
+
+            return Response(
+                JoinedDimensionSourceSerializer(source).data,
+                status=status.HTTP_201_CREATED
+            )
+        except ValueError as e:
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        except Exception as e:
+            return Response(
+                {'error': f'Upload failed: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+    def destroy(self, request, *args, **kwargs):
+        """Delete joined dimension source and BigQuery table."""
+        source = self.get_object()
+        client = self.get_bigquery_client(project=source.bq_project)
+        service = JoinedDimensionService(client, source.schema_config)
+
+        try:
+            service.delete_source(source)
+            return Response(
+                {'success': True, 'message': 'Joined dimension source deleted'},
+                status=status.HTTP_200_OK
+            )
+        except Exception as e:
+            return Response(
+                {'error': f'Delete failed: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+    @action(detail=True, methods=['post'])
+    def reupload(self, request, *args, **kwargs):
+        """Re-upload file data (replaces existing data)."""
+        source = self.get_object()
+
+        file = request.FILES.get('file')
+        if not file:
+            return Response(
+                {'error': 'File is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        client = self.get_bigquery_client(project=source.bq_project)
+        service = JoinedDimensionService(client, source.schema_config)
+
+        try:
+            result = service.reupload(source, file)
+            return Response(JoinedDimensionSourceSerializer(result).data)
+        except ValueError as e:
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        except Exception as e:
+            return Response(
+                {'error': f'Reupload failed: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+    @action(detail=True, methods=['get'])
+    def preview(self, request, *args, **kwargs):
+        """Preview data rows from BigQuery lookup table."""
+        source = self.get_object()
+        limit = int(request.query_params.get('limit', 10))
+
+        client = self.get_bigquery_client(project=source.bq_project)
+        service = JoinedDimensionService(client, source.schema_config)
+
+        result = service.get_preview_data(source, limit)
+        return Response(result)
+
+    @action(detail=False, methods=['post'])
+    def parse_preview(self, request, *args, **kwargs):
+        """Parse uploaded file and return column preview (before committing)."""
+        file = request.FILES.get('file')
+        if not file:
+            return Response(
+                {'error': 'File is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Validate file type
+        filename = file.name.lower()
+        if not (filename.endswith('.csv') or filename.endswith('.xlsx') or filename.endswith('.xls')):
+            return Response(
+                {'error': 'File must be CSV (.csv) or Excel (.xlsx)'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Parse file locally - no BigQuery client needed
+        service = JoinedDimensionService()
+
+        try:
+            preview = service.parse_file_preview(file)
+            return Response(FilePreviewSerializer(preview).data)
+        except Exception as e:
+            return Response(
+                {'error': f'Failed to parse file: {str(e)}'},
+                status=status.HTTP_400_BAD_REQUEST
+            )

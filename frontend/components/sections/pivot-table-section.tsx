@@ -2,7 +2,7 @@
 
 import React, { useState, useMemo, useEffect, useCallback, useRef } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { fetchPivotData, fetchPivotChildren, fetchDimensionValues, fetchCustomDimensions, fetchTables, updateWidget, createRollup, refreshRollup } from '@/lib/api'
+import { fetchPivotData, fetchPivotChildren, fetchDimensionValues, fetchCustomDimensions, fetchCustomMetrics, fetchTables, updateWidget, createRollup, refreshRollup } from '@/lib/api'
 import type { PivotRow, PivotChildRow, PivotResponse, CustomDimension, DateRangeType, RelativeDatePreset } from '@/lib/types'
 import { ChevronRight, ChevronDown, Settings2, ArrowUp, ArrowDown, Database, Save, GripVertical, Download, Calendar, BarChart3 } from 'lucide-react'
 import { usePivotConfig } from '@/hooks/use-pivot-config'
@@ -21,6 +21,14 @@ import { WidgetSelectorModal, type WidgetSelection } from '@/components/modals/w
 import ExportModal, { type ExportFormat, type ExportData, type ExportOptions } from '@/components/modals/export-modal'
 import type { WidgetCreateRequest } from '@/lib/api'
 import html2canvas from 'html2canvas'
+
+// Helper function to format dimension value markers for display
+// Keeps raw values for API compatibility but shows friendly names for special cases
+function formatDimensionValueForDisplay(value: string): string {
+  if (value === '__NULL__') return '(null)'
+  if (value === '') return '(empty)'
+  return value
+}
 
 // Sort Dropdown Component for cleaner headers
 interface SortDropdownProps {
@@ -214,7 +222,7 @@ function MultiPivotTableCard({ headerLabel, filters, rowDimensions, metricId, li
             <tbody className="divide-y divide-gray-200">
               {data.rows.map((row: any, idx: number) => (
                 <tr key={idx} className="hover:bg-gray-50">
-                  <td className="px-2 py-1 text-gray-700">{row.dimension_value}</td>
+                  <td className="px-2 py-1 text-gray-700">{formatDimensionValueForDisplay(row.dimension_value)}</td>
                   <td className="px-2 py-1 text-right text-gray-900 font-medium">
                     {formatMetricValue(row.metrics?.[metricId])}
                   </td>
@@ -513,6 +521,12 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
     queryFn: fetchCustomDimensions,
   })
 
+  // Fetch custom metrics
+  const { data: customMetrics } = useQuery({
+    queryKey: ['custom-metrics'],
+    queryFn: fetchCustomMetrics,
+  })
+
   // Helper function to get dimension label (handles both standard and custom dimensions)
   const getDimensionLabel = (dimensionId: string): string => {
     // First check standard dimensions
@@ -552,6 +566,13 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
   const fetchedTableDimensions = fetchedConfig?.selectedTableDimensions || []
   const fetchedMetrics = fetchedConfig?.selectedMetrics || []
   const fetchedTable = fetchedConfig?.selectedTable || null
+
+  // Identify which selected metrics are custom metrics (for post-processing)
+  const fetchedCustomMetricIds = useMemo(() => {
+    if (!customMetrics || fetchedMetrics.length === 0) return []
+    const customMetricIdSet = new Set(customMetrics.map(cm => cm.metric_id))
+    return fetchedMetrics.filter(metricId => customMetricIdSet.has(metricId))
+  }, [customMetrics, fetchedMetrics])
 
   // Build filters from fetched config (for stable query keys)
   const fetchedFilters = useMemo(() => {
@@ -725,7 +746,9 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
         undefined, // no dimension_values filter for primary column
         fetchedTable || undefined,
         true,
-        fetchedMetrics
+        fetchedMetrics,
+        undefined,
+        fetchedCustomMetricIds
       )
 
       results[primaryColIndex] = primaryData
@@ -749,7 +772,9 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
               dimensionValues, // Filter to primary column's dimension values
               fetchedTable || undefined,
               true,
-              fetchedMetrics
+              fetchedMetrics,
+              undefined,
+              fetchedCustomMetricIds
             )
           }
         })
@@ -773,12 +798,12 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
 
   // Main pivot data query - uses fetchedConfig values for stable query keys
   const { data: pivotData, isLoading, error } = useQuery({
-    queryKey: ['pivot', allFetchedDimensions, fetchedFilters, fetchedTable, fetchedMetrics],
+    queryKey: ['pivot', allFetchedDimensions, fetchedFilters, fetchedTable, fetchedMetrics, fetchedCustomMetricIds],
     queryFn: (): Promise<PivotResponse> => {
       if (!fetchedFilters) return Promise.resolve({ rows: [], total: {} as PivotRow, available_dimensions: [] })
       // If no dimensions, create a single "All Data" row manually
       if (fetchedDimensions.length === 0) {
-        return fetchPivotData([], fetchedFilters, 1, 0, undefined, fetchedTable || undefined, true, fetchedMetrics).then(data => {
+        return fetchPivotData([], fetchedFilters, 1, 0, undefined, fetchedTable || undefined, true, fetchedMetrics, undefined, fetchedCustomMetricIds).then(data => {
           // Return single row representing all data
           return {
             ...data,
@@ -793,7 +818,7 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
         })
       }
       // Pass all dimensions for combined row display
-      return fetchPivotData(allFetchedDimensions, fetchedFilters, 100, 0, undefined, fetchedTable || undefined, true, fetchedMetrics)
+      return fetchPivotData(allFetchedDimensions, fetchedFilters, 100, 0, undefined, fetchedTable || undefined, true, fetchedMetrics, undefined, fetchedCustomMetricIds)
     },
     enabled: fetchRequested && isConfigured, // Only fetch when data source and date range are configured AND fetch is requested
   })
@@ -1028,104 +1053,103 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
             const combination = tableCombinations[colIndex]
             const pageKey = `${key}:col_${colIndex}:0`
 
-            if (!childrenCache[pageKey]) {
-              // Start with base filters
-              const columnFilters: Record<string, any> = { ...filters }
+            // Always fetch fresh data (no cache check)
+            // Start with base filters
+            const columnFilters: Record<string, any> = { ...filters }
 
-              // Handle combination values and custom dimensions
-              Object.entries(combination).forEach(([dimKey, value]) => {
-                // Check if this is a custom dimension
-                if (dimKey.startsWith('custom_') && customDimensions) {
-                  const customDimId = dimKey.replace('custom_', '')
-                  const customDim = customDimensions.find(d => d.id === customDimId)
-                  if (customDim && customDim.values) {
-                    // Find the value with this label
-                    const dimValue = customDim.values.find(v => v.label === value)
-                    if (dimValue) {
-                      // Override the date range with this custom dimension's date range
-                      columnFilters.start_date = dimValue.start_date
-                      columnFilters.end_date = dimValue.end_date
-                    }
-                  }
-                } else {
-                  // Handle standard dimensions
-                  if (dimKey === 'n_words_normalized' || dimKey === 'n_attributes') {
-                    columnFilters[dimKey] = parseInt(value as string, 10)
-                  } else {
-                    columnFilters[dimKey] = value
+            // Handle combination values and custom dimensions
+            Object.entries(combination).forEach(([dimKey, value]) => {
+              // Check if this is a custom dimension
+              if (dimKey.startsWith('custom_') && customDimensions) {
+                const customDimId = dimKey.replace('custom_', '')
+                const customDim = customDimensions.find(d => d.id === customDimId)
+                if (customDim && customDim.values) {
+                  // Find the value with this label
+                  const dimValue = customDim.values.find(v => v.label === value)
+                  if (dimValue) {
+                    // Override the date range with this custom dimension's date range
+                    columnFilters.start_date = dimValue.start_date
+                    columnFilters.end_date = dimValue.end_date
                   }
                 }
-              })
-
-              // Extract the dimension value from the path
-              const pathParts = dimensionPath.split(' - ')
-              const dimensionValue = pathParts[pathParts.length - 1]
-              const dimension = selectedDimensions[depth]
-
-              // For first column, fetch the page size. For others, fetch a large limit to ensure we get all matching terms
-              const fetchLimit = colIndex === firstColIndex ? CHILDREN_PAGE_SIZE : 1000
-
-              // Fetch children with the combined filters
-              const children = await fetchPivotChildren(dimension, dimensionValue, columnFilters, fetchLimit, 0)
-              setChildrenCache(prev => ({ ...prev, [pageKey]: children }))
-
-              // Store cumulative percentage only for first column
-              if (colIndex === firstColIndex) {
-                const cumulative = children.reduce((sum, child) => sum + (child.percentage_of_total || 0), 0)
-                setCumulativePercentageCache(prev => ({ ...prev, [key]: cumulative }))
+              } else {
+                // Handle standard dimensions
+                if (dimKey === 'n_words_normalized' || dimKey === 'n_attributes') {
+                  columnFilters[dimKey] = parseInt(value as string, 10)
+                } else {
+                  columnFilters[dimKey] = value
+                }
               }
+            })
+
+            // Extract the dimension value from the path
+            const pathParts = dimensionPath.split(' - ')
+            const dimensionValue = pathParts[pathParts.length - 1]
+            const dimension = selectedDimensions[depth]
+
+            // For first column, fetch the page size. For others, fetch a large limit to ensure we get all matching terms
+            const fetchLimit = colIndex === firstColIndex ? CHILDREN_PAGE_SIZE : 1000
+
+            // Fetch children with the combined filters
+            const children = await fetchPivotChildren(dimension, dimensionValue, columnFilters, fetchLimit, 0)
+            setChildrenCache(prev => ({ ...prev, [pageKey]: children }))
+
+            // Store cumulative percentage only for first column
+            if (colIndex === firstColIndex) {
+              const cumulative = children.reduce((sum, child) => sum + (child.percentage_of_total || 0), 0)
+              setCumulativePercentageCache(prev => ({ ...prev, [key]: cumulative }))
             }
           }
           setCurrentPage(prev => ({ ...prev, [key]: 0 }))
         } else {
           // Single-table mode (original logic)
           const pageKey = `${key}:0`
-          if (!childrenCache[pageKey]) {
-            // Special case: No dimensions selected, fetch all search terms
-            if (selectedDimensions.length === 0) {
-              const children = await fetchPivotChildren('', '', filters, CHILDREN_PAGE_SIZE, 0)
+          // Always fetch fresh data (no cache check)
+          // Special case: No dimensions selected, fetch all search terms
+          if (selectedDimensions.length === 0) {
+            const children = await fetchPivotChildren('', '', filters, CHILDREN_PAGE_SIZE, 0)
+            setChildrenCache(prev => ({ ...prev, [pageKey]: children }))
+            // Store cumulative percentage at end of this page
+            const cumulative = children.reduce((sum, child) => sum + (child.percentage_of_total || 0), 0)
+            setCumulativePercentageCache(prev => ({ ...prev, [key]: cumulative }))
+          } else {
+            // Check if there are more dimensions to drill into
+            const nextDepth = depth + 1
+            if (nextDepth < selectedDimensions.length) {
+              // Fetch next dimension level
+              const dimensionsToFetch = selectedDimensions.slice(0, nextDepth + 1)
+              // Identify custom metrics in current selection
+              const customMetricIdSet = new Set((customMetrics || []).map(cm => cm.metric_id))
+              const selectedCustomMetricIds = selectedMetrics.filter(id => customMetricIdSet.has(id))
+              const pivotChildren = await fetchPivotData(dimensionsToFetch, filters, 1000, 0, undefined, selectedTable || undefined, true, selectedMetrics, undefined, selectedCustomMetricIds)
+
+              // Filter to only children of this parent
+              const prefix = `${dimensionPath} - `
+              const childRows = pivotChildren.rows.filter(row => row.dimension_value.startsWith(prefix))
+
+              // Calculate percentage relative to grand total (whole dataset)
+              const filteredChildren = childRows.map(row => ({
+                search_term: row.dimension_value.replace(prefix, ''),
+                metrics: row.metrics,
+                percentage_of_total: grandTotal > 0 ? ((row.metrics?.[primarySortMetric] || 0) / grandTotal) : 0,
+              }))
+
+              setChildrenCache(prev => ({ ...prev, [pageKey]: filteredChildren }))
+            } else {
+              // No more dimensions - fetch search terms
+              // Extract the value at each depth level from the path
+              const pathParts = dimensionPath.split(' - ')
+              const dimensionValue = pathParts[pathParts.length - 1]
+              const dimension = selectedDimensions[depth]
+
+              const children = await fetchPivotChildren(dimension, dimensionValue, filters, CHILDREN_PAGE_SIZE, 0)
               setChildrenCache(prev => ({ ...prev, [pageKey]: children }))
               // Store cumulative percentage at end of this page
               const cumulative = children.reduce((sum, child) => sum + (child.percentage_of_total || 0), 0)
               setCumulativePercentageCache(prev => ({ ...prev, [key]: cumulative }))
-            } else {
-              // Check if there are more dimensions to drill into
-              const nextDepth = depth + 1
-              if (nextDepth < selectedDimensions.length) {
-                // Fetch next dimension level
-                const dimensionsToFetch = selectedDimensions.slice(0, nextDepth + 1)
-                const pivotChildren = await fetchPivotData(dimensionsToFetch, filters, 1000, 0, undefined, selectedTable || undefined, true, selectedMetrics)
-
-                // Filter to only children of this parent
-                const prefix = `${dimensionPath} - `
-                const childRows = pivotChildren.rows.filter(row => row.dimension_value.startsWith(prefix))
-
-                // Calculate percentage relative to grand total (whole dataset)
-                const filteredChildren = childRows.map(row => ({
-                  search_term: row.dimension_value.replace(prefix, ''),
-                  metrics: row.metrics,
-                  percentage_of_total: grandTotal > 0 ? ((row.metrics?.[primarySortMetric] || 0) / grandTotal) : 0,
-                }))
-
-                setChildrenCache(prev => ({ ...prev, [pageKey]: filteredChildren }))
-              } else {
-                // No more dimensions - fetch search terms
-                // Extract the value at each depth level from the path
-                const pathParts = dimensionPath.split(' - ')
-                const dimensionValue = pathParts[pathParts.length - 1]
-                const dimension = selectedDimensions[depth]
-
-                const children = await fetchPivotChildren(dimension, dimensionValue, filters, CHILDREN_PAGE_SIZE, 0)
-                setChildrenCache(prev => ({ ...prev, [pageKey]: children }))
-                // Store cumulative percentage at end of this page
-                const cumulative = children.reduce((sum, child) => sum + (child.percentage_of_total || 0), 0)
-                setCumulativePercentageCache(prev => ({ ...prev, [key]: cumulative }))
-              }
             }
-            setCurrentPage(prev => ({ ...prev, [key]: 0 }))
-          } else {
-            setCurrentPage(prev => ({ ...prev, [key]: 0 }))
           }
+          setCurrentPage(prev => ({ ...prev, [key]: 0 }))
         }
       } catch (error) {
         console.error('Failed to fetch children:', error)
@@ -1160,97 +1184,95 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
         for (let colIndex = 0; colIndex < tableCombinations.length; colIndex++) {
           const colPageKey = `${key}:col_${colIndex}:${page}`
 
-          if (!childrenCache[colPageKey]) {
-            const combination = tableCombinations[colIndex]
+          // Always fetch fresh data (no cache check)
+          const combination = tableCombinations[colIndex]
 
-            // Start with base filters
-            const columnFilters: Record<string, any> = { ...filters }
+          // Start with base filters
+          const columnFilters: Record<string, any> = { ...filters }
 
-            // Handle combination values and custom dimensions
-            Object.entries(combination).forEach(([dimKey, value]) => {
-              // Check if this is a custom dimension
-              if (dimKey.startsWith('custom_') && customDimensions) {
-                const customDimId = dimKey.replace('custom_', '')
-                const customDim = customDimensions.find(d => d.id === customDimId)
-                if (customDim && customDim.values) {
-                  // Find the value with this label
-                  const dimValue = customDim.values.find(v => v.label === value)
-                  if (dimValue) {
-                    // Override the date range with this custom dimension's date range
-                    columnFilters.start_date = dimValue.start_date
-                    columnFilters.end_date = dimValue.end_date
-                  }
-                }
-              } else {
-                // Handle standard dimensions
-                if (dimKey === 'n_words_normalized' || dimKey === 'n_attributes') {
-                  columnFilters[dimKey] = parseInt(value as string, 10)
-                } else {
-                  columnFilters[dimKey] = value
+          // Handle combination values and custom dimensions
+          Object.entries(combination).forEach(([dimKey, value]) => {
+            // Check if this is a custom dimension
+            if (dimKey.startsWith('custom_') && customDimensions) {
+              const customDimId = dimKey.replace('custom_', '')
+              const customDim = customDimensions.find(d => d.id === customDimId)
+              if (customDim && customDim.values) {
+                // Find the value with this label
+                const dimValue = customDim.values.find(v => v.label === value)
+                if (dimValue) {
+                  // Override the date range with this custom dimension's date range
+                  columnFilters.start_date = dimValue.start_date
+                  columnFilters.end_date = dimValue.end_date
                 }
               }
-            })
+            } else {
+              // Handle standard dimensions
+              if (dimKey === 'n_words_normalized' || dimKey === 'n_attributes') {
+                columnFilters[dimKey] = parseInt(value as string, 10)
+              } else {
+                columnFilters[dimKey] = value
+              }
+            }
+          })
 
-            // Extract the dimension value from the path
-            const pathParts = dimensionPath.split(' - ')
-            const dimensionValue = pathParts[pathParts.length - 1]
-            const dimension = selectedDimensions[depth]
+          // Extract the dimension value from the path
+          const pathParts = dimensionPath.split(' - ')
+          const dimensionValue = pathParts[pathParts.length - 1]
+          const dimension = selectedDimensions[depth]
 
-            // For first column, fetch the page size. For others, fetch from offset 0 with large limit to ensure we get all matching terms
-            const fetchLimit = colIndex === firstColIndex ? CHILDREN_PAGE_SIZE : 1000
-            const fetchOffset = colIndex === firstColIndex ? offset : 0
+          // For first column, fetch the page size. For others, fetch from offset 0 with large limit to ensure we get all matching terms
+          const fetchLimit = colIndex === firstColIndex ? CHILDREN_PAGE_SIZE : 1000
+          const fetchOffset = colIndex === firstColIndex ? offset : 0
 
-            // Fetch children with the combined filters
-            const children = await fetchPivotChildren(dimension, dimensionValue, columnFilters, fetchLimit, fetchOffset)
-            setChildrenCache(prev => ({ ...prev, [colPageKey]: children }))
-          }
+          // Fetch children with the combined filters
+          const children = await fetchPivotChildren(dimension, dimensionValue, columnFilters, fetchLimit, fetchOffset)
+          setChildrenCache(prev => ({ ...prev, [colPageKey]: children }))
         }
       } else {
         // Single-table mode
         const pageKey = `${key}:${page}`
 
-        if (!childrenCache[pageKey]) {
-          // Special case: No dimensions selected, fetch all search terms
-          if (selectedDimensions.length === 0) {
-            const children = await fetchPivotChildren('', '', filters, CHILDREN_PAGE_SIZE, offset)
-            setChildrenCache(prev => ({ ...prev, [pageKey]: children }))
+        // Always fetch fresh data (no cache check)
+        // Special case: No dimensions selected, fetch all search terms
+        if (selectedDimensions.length === 0) {
+          const children = await fetchPivotChildren('', '', filters, CHILDREN_PAGE_SIZE, offset)
+          setChildrenCache(prev => ({ ...prev, [pageKey]: children }))
 
-            // Calculate cumulative percentage including previous pages
-            let previousCumulative = 0
-            if (page > 0) {
-              // Sum up cumulative percentages from all previous pages
-              for (let p = 0; p < page; p++) {
-                const prevPageKey = `${key}:${p}`
-                const prevChildren = childrenCache[prevPageKey] || []
-                previousCumulative += prevChildren.reduce((sum, child) => sum + (child.percentage_of_total || 0), 0)
-              }
+          // Calculate cumulative percentage including previous pages
+          let previousCumulative = 0
+          if (page > 0) {
+            // Sum up cumulative percentages from all previous pages
+            for (let p = 0; p < page; p++) {
+              const prevPageKey = `${key}:${p}`
+              const prevChildren = childrenCache[prevPageKey] || []
+              previousCumulative += prevChildren.reduce((sum, child) => sum + (child.percentage_of_total || 0), 0)
             }
-            const currentPageTotal = children.reduce((sum, child) => sum + (child.percentage_of_total || 0), 0)
-            const totalCumulative = previousCumulative + currentPageTotal
-            setCumulativePercentageCache(prev => ({ ...prev, [key]: totalCumulative }))
-          } else {
-            // Extract the value at the current depth level from the path
-            const pathParts = dimensionPath.split(' - ')
-            const dimensionValue = pathParts[pathParts.length - 1]
-            const dimension = selectedDimensions[depth]
-
-            const children = await fetchPivotChildren(dimension, dimensionValue, filters, CHILDREN_PAGE_SIZE, offset)
-            setChildrenCache(prev => ({ ...prev, [pageKey]: children }))
-
-            // Calculate cumulative percentage including previous pages
-            let previousCumulative = 0
-            if (page > 0) {
-              // Sum up cumulative percentages from all previous pages
-              for (let p = 0; p < page; p++) {
-                const prevPageKey = `${key}:${p}`
-                const prevChildren = childrenCache[prevPageKey] || []
-                previousCumulative += prevChildren.reduce((sum, child) => sum + (child.percentage_of_total || 0), 0)
-              }
-            }
-            const currentPageTotal = children.reduce((sum, child) => sum + (child.percentage_of_total || 0), 0)
-            const totalCumulative = previousCumulative + currentPageTotal
-            setCumulativePercentageCache(prev => ({ ...prev, [key]: totalCumulative }))
           }
+          const currentPageTotal = children.reduce((sum, child) => sum + (child.percentage_of_total || 0), 0)
+          const totalCumulative = previousCumulative + currentPageTotal
+          setCumulativePercentageCache(prev => ({ ...prev, [key]: totalCumulative }))
+        } else {
+          // Extract the value at the current depth level from the path
+          const pathParts = dimensionPath.split(' - ')
+          const dimensionValue = pathParts[pathParts.length - 1]
+          const dimension = selectedDimensions[depth]
+
+          const children = await fetchPivotChildren(dimension, dimensionValue, filters, CHILDREN_PAGE_SIZE, offset)
+          setChildrenCache(prev => ({ ...prev, [pageKey]: children }))
+
+          // Calculate cumulative percentage including previous pages
+          let previousCumulative = 0
+          if (page > 0) {
+            // Sum up cumulative percentages from all previous pages
+            for (let p = 0; p < page; p++) {
+              const prevPageKey = `${key}:${p}`
+              const prevChildren = childrenCache[prevPageKey] || []
+              previousCumulative += prevChildren.reduce((sum, child) => sum + (child.percentage_of_total || 0), 0)
+            }
+          }
+          const currentPageTotal = children.reduce((sum, child) => sum + (child.percentage_of_total || 0), 0)
+          const totalCumulative = previousCumulative + currentPageTotal
+          setCumulativePercentageCache(prev => ({ ...prev, [key]: totalCumulative }))
         }
       }
 
@@ -3591,7 +3613,7 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
                                         rowSpan={selectedMetrics.length}
                                         className="px-6 py-2 whitespace-nowrap text-sm font-medium text-gray-900 border-r border-gray-200 align-middle"
                                       >
-                                        {row.dimension_value}
+                                        {formatDimensionValueForDisplay(row.dimension_value)}
                                       </td>
                                     )}
                                     {/* Metric name column */}
@@ -4130,7 +4152,7 @@ export function PivotTableSection(props: PivotTableSectionProps = {}) {
                         }}
                       >
                         <div className="flex items-center gap-2">
-                          <span>{row.dimension_value}</span>
+                          <span>{formatDimensionValueForDisplay(row.dimension_value)}</span>
                         </div>
                       </td>
                       {selectedMetrics.map((metricId) => {

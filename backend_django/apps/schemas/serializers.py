@@ -5,6 +5,7 @@ from rest_framework import serializers
 from .models import (
     SchemaConfig, CalculatedMetric, Dimension,
     CalculatedDimension, CustomDimension,
+    JoinedDimensionSource, JoinedDimensionColumn,
     FormatType, DataType, FilterType
 )
 
@@ -49,7 +50,29 @@ class SchemaConfigSerializer(serializers.ModelSerializer):
 
     def get_dimensions(self, obj):
         from .serializers import DimensionListSerializer
-        return DimensionListSerializer(obj.dimensions.all(), many=True).data
+        from .models import JoinedDimensionStatus
+
+        # Get regular dimensions
+        regular_dims = DimensionListSerializer(obj.dimensions.all(), many=True).data
+
+        # Get joined dimensions from ready sources
+        joined_dims = []
+        for source in obj.joined_dimension_sources.filter(status=JoinedDimensionStatus.READY):
+            for col in source.columns.all():
+                joined_dims.append({
+                    'id': col.dimension_id,
+                    'column_name': col.source_column_name,  # For compatibility
+                    'display_name': col.display_name,
+                    'data_type': col.data_type,
+                    'is_filterable': col.is_filterable,
+                    'is_groupable': col.is_groupable,
+                    'filter_type': col.filter_type,
+                    'is_joined': True,  # Mark as joined dimension
+                    'source_id': str(source.id),
+                    'source_name': source.name,
+                })
+
+        return regular_dims + joined_dims
 
 
 class SchemaConfigUpdateSerializer(serializers.ModelSerializer):
@@ -304,17 +327,19 @@ class MetricDimensionValueSerializer(serializers.Serializer):
 
 class CustomDimensionSerializer(serializers.ModelSerializer):
     """Read serializer for CustomDimension."""
+    # Return dimension_type as 'type' for frontend compatibility
+    type = serializers.CharField(source='dimension_type', read_only=True)
     values = serializers.SerializerMethodField()
     metric_values = serializers.SerializerMethodField()
 
     class Meta:
         model = CustomDimension
         fields = [
-            'id', 'name', 'dimension_type', 'metric',
+            'id', 'name', 'type', 'metric',
             'values', 'metric_values',
             'created_at', 'updated_at'
         ]
-        read_only_fields = ['id', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'type', 'created_at', 'updated_at']
 
     def get_values(self, obj):
         if obj.dimension_type == 'date_range':
@@ -331,10 +356,17 @@ class CustomDimensionCreateSerializer(serializers.ModelSerializer):
     """Create serializer for CustomDimension."""
     values = CustomDimensionValueSerializer(many=True, required=False)
     metric_values = MetricDimensionValueSerializer(many=True, required=False)
+    table_id = serializers.UUIDField(write_only=True, required=False, allow_null=True)
+    # Accept 'type' from frontend, map to 'dimension_type' model field
+    type = serializers.ChoiceField(
+        choices=[('date_range', 'Date Range'), ('metric_condition', 'Metric Condition')],
+        write_only=True,
+        source='dimension_type'
+    )
 
     class Meta:
         model = CustomDimension
-        fields = ['name', 'dimension_type', 'metric', 'values', 'metric_values']
+        fields = ['name', 'type', 'metric', 'values', 'metric_values', 'table_id']
 
     def validate(self, data):
         dimension_type = data.get('dimension_type', 'date_range')
@@ -357,6 +389,25 @@ class CustomDimensionCreateSerializer(serializers.ModelSerializer):
         return data
 
     def create(self, validated_data):
+        table_id = validated_data.pop('table_id', None)
+
+        # Get schema_config from table_id or use the first available
+        if table_id:
+            from apps.tables.models import BigQueryTable
+            try:
+                table = BigQueryTable.objects.get(id=table_id)
+                schema_config = table.schema_config
+            except BigQueryTable.DoesNotExist:
+                raise serializers.ValidationError({'table_id': 'Table not found'})
+        else:
+            schema_config = SchemaConfig.objects.first()
+            if not schema_config:
+                raise serializers.ValidationError(
+                    {'table_id': 'No schema configuration found. Please specify a table_id.'}
+                )
+
+        validated_data['schema_config'] = schema_config
+
         dimension_type = validated_data.get('dimension_type', 'date_range')
 
         if dimension_type == 'date_range':
@@ -367,6 +418,122 @@ class CustomDimensionCreateSerializer(serializers.ModelSerializer):
             validated_data.pop('values', None)
 
         return super().create(validated_data)
+
+
+class CustomDimensionUpdateSerializer(serializers.ModelSerializer):
+    """Update serializer for CustomDimension - allows editing all fields."""
+    values = CustomDimensionValueSerializer(many=True, required=False)
+    metric_values = MetricDimensionValueSerializer(many=True, required=False)
+
+    class Meta:
+        model = CustomDimension
+        fields = ['name', 'metric', 'values', 'metric_values']
+
+    def update(self, instance, validated_data):
+        # Update name if provided
+        if 'name' in validated_data:
+            instance.name = validated_data['name']
+
+        # Update metric if provided (for metric_condition type)
+        if 'metric' in validated_data:
+            instance.metric = validated_data['metric']
+
+        # Update values_json based on dimension type
+        if instance.dimension_type == 'date_range':
+            if 'values' in validated_data:
+                instance.values_json = validated_data['values']
+        elif instance.dimension_type == 'metric_condition':
+            if 'metric_values' in validated_data:
+                instance.values_json = validated_data['metric_values']
+
+        instance.save()
+        return instance
+
+
+# =============================================================================
+# Custom Metric Serializers
+# =============================================================================
+
+class CustomMetricSerializer(serializers.ModelSerializer):
+    """Read serializer for CustomMetric."""
+
+    class Meta:
+        from .models import CustomMetric
+        model = CustomMetric
+        fields = [
+            'id', 'name', 'metric_id', 'source_metric',
+            'aggregation_type', 'exclude_dimensions',
+            'format_type', 'decimal_places', 'description',
+            'created_at', 'updated_at'
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at']
+
+
+class CustomMetricCreateSerializer(serializers.ModelSerializer):
+    """Create serializer for CustomMetric."""
+    table_id = serializers.UUIDField(write_only=True, required=False, allow_null=True)
+
+    class Meta:
+        from .models import CustomMetric
+        model = CustomMetric
+        fields = [
+            'name', 'metric_id', 'source_metric',
+            'aggregation_type', 'exclude_dimensions',
+            'format_type', 'decimal_places', 'description',
+            'table_id'
+        ]
+
+    def validate_metric_id(self, value):
+        """Ensure metric_id is unique within the schema."""
+        schema_config = self.context.get('schema_config')
+        if schema_config:
+            from .models import CustomMetric
+            existing = CustomMetric.objects.filter(
+                schema_config=schema_config,
+                metric_id=value
+            )
+            if self.instance:
+                existing = existing.exclude(pk=self.instance.pk)
+            if existing.exists():
+                raise serializers.ValidationError(
+                    f"Custom metric with ID '{value}' already exists"
+                )
+        return value
+
+    def create(self, validated_data):
+        """Create custom metric with schema_config from table_id."""
+        table_id = validated_data.pop('table_id', None)
+
+        # Get schema_config from table_id or use the first available
+        if table_id:
+            from apps.tables.models import BigQueryTable
+            try:
+                table = BigQueryTable.objects.get(id=table_id)
+                schema_config = table.schema_config
+            except BigQueryTable.DoesNotExist:
+                raise serializers.ValidationError({'table_id': 'Table not found'})
+        else:
+            # Fallback: use the first available schema_config
+            schema_config = SchemaConfig.objects.first()
+            if not schema_config:
+                raise serializers.ValidationError(
+                    {'table_id': 'No schema configuration found. Please specify a table_id.'}
+                )
+
+        validated_data['schema_config'] = schema_config
+        return super().create(validated_data)
+
+
+class CustomMetricUpdateSerializer(serializers.ModelSerializer):
+    """Update serializer for CustomMetric."""
+
+    class Meta:
+        from .models import CustomMetric
+        model = CustomMetric
+        fields = [
+            'name', 'source_metric', 'aggregation_type',
+            'exclude_dimensions', 'format_type', 'decimal_places', 'description'
+        ]
 
 
 # =============================================================================
@@ -411,3 +578,97 @@ class FullSchemaSerializer(serializers.Serializer):
     dimensions = DimensionSerializer(many=True)
     calculated_dimensions = CalculatedDimensionSerializer(many=True)
     custom_dimensions = CustomDimensionSerializer(many=True)
+
+
+# =============================================================================
+# Joined Dimension Serializers
+# =============================================================================
+
+class JoinedDimensionColumnSerializer(serializers.ModelSerializer):
+    """Read serializer for JoinedDimensionColumn."""
+    id = serializers.CharField(source='dimension_id', read_only=True)
+
+    class Meta:
+        model = JoinedDimensionColumn
+        fields = [
+            'id', 'source_column_name', 'display_name', 'data_type',
+            'is_filterable', 'is_groupable', 'filter_type',
+            'sort_order', 'description'
+        ]
+
+
+class JoinedDimensionColumnCreateSerializer(serializers.Serializer):
+    """Create serializer for defining columns during upload."""
+    source_column_name = serializers.CharField(max_length=100)
+    dimension_id = serializers.CharField(max_length=100, required=False, allow_blank=True)
+    display_name = serializers.CharField(max_length=255)
+    data_type = serializers.ChoiceField(
+        choices=['STRING', 'INTEGER', 'FLOAT', 'BOOLEAN'],
+        default='STRING'
+    )
+    is_filterable = serializers.BooleanField(default=True)
+    is_groupable = serializers.BooleanField(default=True)
+    filter_type = serializers.ChoiceField(
+        choices=['single', 'multi', 'boolean'],
+        default='multi'
+    )
+
+
+class JoinedDimensionSourceSerializer(serializers.ModelSerializer):
+    """Read serializer for JoinedDimensionSource with columns."""
+    columns = JoinedDimensionColumnSerializer(many=True, read_only=True)
+    bq_table_path = serializers.CharField(read_only=True)
+
+    class Meta:
+        model = JoinedDimensionSource
+        fields = [
+            'id', 'name', 'original_filename', 'file_type',
+            'join_key_column', 'target_dimension_id',
+            'bq_project', 'bq_dataset', 'bq_table', 'bq_table_path',
+            'status', 'error_message', 'row_count', 'uploaded_at',
+            'columns', 'created_at', 'updated_at'
+        ]
+        read_only_fields = [
+            'id', 'bq_table', 'bq_table_path', 'status', 'error_message',
+            'row_count', 'uploaded_at', 'created_at', 'updated_at'
+        ]
+
+
+class JoinedDimensionSourceCreateSerializer(serializers.Serializer):
+    """Create serializer for file upload and source creation."""
+    name = serializers.CharField(max_length=255)
+    join_key_column = serializers.CharField(max_length=100)
+    target_dimension_id = serializers.CharField(max_length=100)
+    columns = JoinedDimensionColumnCreateSerializer(many=True)
+    bq_project = serializers.CharField(max_length=255)
+    bq_dataset = serializers.CharField(max_length=255)
+
+    def validate_columns(self, value):
+        """Ensure at least one column is provided."""
+        if not value:
+            raise serializers.ValidationError(
+                'At least one dimension column must be selected'
+            )
+        return value
+
+
+class JoinedDimensionSourceUpdateSerializer(serializers.Serializer):
+    """Update serializer for JoinedDimensionSource - allows editing name and columns."""
+    name = serializers.CharField(max_length=255, required=False)
+    columns = JoinedDimensionColumnCreateSerializer(many=True, required=False)
+
+
+class FilePreviewColumnSerializer(serializers.Serializer):
+    """Serializer for column preview data."""
+    name = serializers.CharField()
+    inferred_type = serializers.CharField()
+    sample_values = serializers.ListField(child=serializers.JSONField())
+    null_count = serializers.IntegerField()
+    unique_count = serializers.IntegerField()
+
+
+class FilePreviewSerializer(serializers.Serializer):
+    """Response serializer for file preview."""
+    row_count = serializers.IntegerField()
+    columns = FilePreviewColumnSerializer(many=True)
+    preview_rows = serializers.ListField(child=serializers.DictField())
